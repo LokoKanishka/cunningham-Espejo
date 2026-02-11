@@ -1,0 +1,28 @@
+# Secrets / local config
+.env
+.env.*
+!.env.example
+config/*.local*
+config/*.secret*
+config/*secrets*
+logs/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+ENV/
+.envrc
+
+# Node / JS
+node_modules/
+dist/
+build/
+.cache/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
