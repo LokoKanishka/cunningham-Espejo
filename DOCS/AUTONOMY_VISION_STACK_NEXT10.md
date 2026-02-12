@@ -20,3 +20,13 @@ Extensión del stack original con 10 módulos adicionales, priorizando autonomí
 
 ## Nota de red
 El módulo web puede operar en modo "tool disponible pero red DNS caída" sin marcar error de permisos.
+
+## Extras integrados
+11. Worker de objetivos: `scripts/goals_worker.sh`
+12. Alertas operativas locales: `scripts/ops_alerts.sh`
+13. Investigación web con reporte: `scripts/web_research.sh`
+
+Checks:
+- `./scripts/goals_worker.sh check`
+- `./scripts/ops_alerts.sh check`
+- `./scripts/web_research.sh check`

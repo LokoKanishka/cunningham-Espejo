@@ -12,6 +12,9 @@ scripts=(
   scripts/policy_engine.sh
   scripts/adr_bot.sh
   scripts/ops_dashboard.sh
+  scripts/goals_worker.sh
+  scripts/ops_alerts.sh
+  scripts/web_research.sh
 )
 
 for s in "${scripts[@]}"; do
@@ -28,6 +31,9 @@ done
 ./scripts/runbook.sh check >/dev/null
 ./scripts/policy_engine.sh check >/dev/null
 ./scripts/adr_bot.sh check >/dev/null
+./scripts/goals_worker.sh check >/dev/null
+./scripts/ops_alerts.sh check >/dev/null
+./scripts/web_research.sh check >/dev/null
 
 out="$(./scripts/ops_dashboard.sh)"
 printf "%s\n" "$out" | grep -q '^DASHBOARD_OK:' || { echo "FAIL: dashboard" >&2; exit 1; }

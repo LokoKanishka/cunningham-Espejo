@@ -20,3 +20,4 @@ Laboratorio desde cero para Moltbot upstream + modelos externos + cambio de mode
 ## Stack autonomía+visión (next 10)
 - Documento: `DOCS/AUTONOMY_VISION_STACK_NEXT10.md`
 - Verificación: `./scripts/verify_next10.sh`
+- Extras: `./scripts/goals_worker.sh check`, `./scripts/ops_alerts.sh check`, `./scripts/web_research.sh check`
