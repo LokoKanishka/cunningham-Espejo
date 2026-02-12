@@ -1,0 +1,145 @@
+{
+  "name": "Test_Manos",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "test-manos",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        250,
+        300
+      ],
+      "id": "trigger",
+      "webhookId": "test-manos",
+      "name": "Disparador Manual"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://127.0.0.1:5000/execute",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "code",
+              "value": "import math\nprint(f'Calculando desde el Sandbox: Ra\u00edz de 144 es {math.sqrt(144)}')"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        450,
+        200
+      ],
+      "id": "antigravity",
+      "name": "Antigravity (C\u00e1lculo)"
+    },
+    {
+      "parameters": {
+        "keepOnlySet": true,
+        "values": {
+          "string": [
+            {
+              "name": "message",
+              "value": "NOTIFY: Lucy ha tomado el control del escritorio."
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 2,
+      "position": [
+        450,
+        360
+      ],
+      "id": "ipc-message",
+      "name": "IPC Mensaje"
+    },
+    {
+      "parameters": {
+        "mode": "jsonToBinary",
+        "convertAllData": false,
+        "sourceKey": "message",
+        "destinationKey": "data",
+        "options": {
+          "encoding": "utf8",
+          "mimeType": "text/plain",
+          "fileName": "test_n8n.txt",
+          "useRawData": true
+        }
+      },
+      "type": "n8n-nodes-base.moveBinaryData",
+      "typeVersion": 1,
+      "position": [
+        650,
+        360
+      ],
+      "id": "ipc-to-binary",
+      "name": "IPC a Binario"
+    },
+    {
+      "parameters": {
+        "operation": "write",
+        "fileName": "/data/lucy_ipc/inbox/test_n8n.txt",
+        "dataPropertyName": "data",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [
+        850,
+        360
+      ],
+      "id": "x11-bridge",
+      "name": "X11 Bridge (Notificaci\u00f3n)"
+    }
+  ],
+  "connections": {
+    "Disparador Manual": {
+      "main": [
+        [
+          {
+            "node": "Antigravity (C\u00e1lculo)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "IPC Mensaje",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IPC Mensaje": {
+      "main": [
+        [
+          {
+            "node": "IPC a Binario",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IPC a Binario": {
+      "main": [
+        [
+          {
+            "node": "X11 Bridge (Notificaci\u00f3n)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

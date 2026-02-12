@@ -1,0 +1,96 @@
+{
+  "name": "Cerebro_Voz_Alpha",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "voice-input",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        250,
+        300
+      ],
+      "id": "webhook-trigger",
+      "name": "Oído (Webhook)"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:11434/api/generate",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "model",
+              "value": "gpt-oss:20b"
+            },
+            {
+              "name": "prompt",
+              "value": "={{ $json.body.text }}"
+            },
+            {
+              "name": "stream",
+              "value": false
+            },
+            {
+              "name": "system",
+              "value": "Eres Lucy, una IA asistente concisa y útil. Responde en español rioplatense. Máximo 2 oraciones."
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        450,
+        300
+      ],
+      "id": "ollama-node",
+      "name": "Cortex (Ollama)"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={\n  \"text\": \"{{ $json.response }}\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 2,
+      "position": [
+        650,
+        300
+      ],
+      "id": "format-response",
+      "name": "Formatear Salida"
+    }
+  ],
+  "connections": {
+    "Oído (Webhook)": {
+      "main": [
+        [
+          {
+            "node": "Cortex (Ollama)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cortex (Ollama)": {
+      "main": [
+        [
+          {
+            "node": "Formatear Salida",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

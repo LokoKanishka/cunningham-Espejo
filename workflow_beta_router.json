@@ -1,0 +1,276 @@
+{
+  "name": "Cerebro_Voz_Beta",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "voice-input",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        240,
+        300
+      ],
+      "id": "webhook-trigger",
+      "webhookId": "voice-input",
+      "name": "Oido (Webhook)"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:11434/api/generate",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "model",
+              "value": "gpt-oss:20b"
+            },
+            {
+              "name": "prompt",
+              "value": "={{ $json.body.text }}"
+            },
+            {
+              "name": "stream",
+              "value": false
+            },
+            {
+              "name": "system",
+              "value": "Eres el Gerente Operativo de Lucy. Tu unica funcion es clasificar la intencion del usuario y extraer parametros.\nCategorias:\n- SIMPLE_CHAT: saludos, preguntas filosoficas, charla casual.\n- SYSTEM_CONTROL: comandos para la PC (abrir apps, volumen, notificaciones).\nPara SYSTEM_CONTROL, el campo command debe ser un comando de shell valido en Ubuntu. Ejemplos: gnome-calculator &, firefox &, notify-send 'Lucy' 'mensaje', pactl set-sink-volume @DEFAULT_SINK@ +5%. Para apps GUI, termina el comando con '&' para no bloquear.\nResponde solo en JSON valido con comillas dobles y sin texto extra: {\"intent\":\"CATEGORY\",\"response_text\":\"...\",\"command\":\"...\"}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        460,
+        300
+      ],
+      "id": "manager-node",
+      "name": "Gerente (Ollama)"
+    },
+    {
+      "parameters": {
+        "functionCode": "const raw = $json.response || '';\nlet parsed;\ntry {\n  parsed = JSON.parse(raw);\n} catch (err) {\n  parsed = {\n    intent: 'SIMPLE_CHAT',\n    response_text: raw || 'No entendi.',\n    command: ''\n  };\n}\nreturn [{ json: parsed }];"
+      },
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        680,
+        300
+      ],
+      "id": "parse-json",
+      "name": "Parsear JSON"
+    },
+    {
+      "parameters": {
+        "mode": "expression",
+        "numberOutputs": 2,
+        "output": "={{ $json.intent === 'SYSTEM_CONTROL' ? 0 : 1 }}"
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        900,
+        300
+      ],
+      "id": "if-control",
+      "name": "Es Control?"
+    },
+    {
+      "parameters": {
+        "keepOnlySet": true,
+        "values": {
+          "string": [
+            {
+              "name": "text",
+              "value": "={{ $json.response_text || 'No entendi.' }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        170
+      ],
+      "id": "chat-response",
+      "name": "Responder Chat"
+    },
+    {
+      "parameters": {
+        "keepOnlySet": true,
+        "values": {
+          "string": [
+            {
+              "name": "message",
+              "value": "={{ $json.command ? ('EXEC: ' + $json.command.replace(/\\s*&\\s*$/, '') + ' >/dev/null 2>&1 &') : 'EXEC:' }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        430
+      ],
+      "id": "ipc-message",
+      "name": "IPC Mensaje"
+    },
+    {
+      "parameters": {
+        "mode": "jsonToBinary",
+        "convertAllData": false,
+        "sourceKey": "message",
+        "destinationKey": "data",
+        "options": {
+          "encoding": "utf8",
+          "mimeType": "text/plain",
+          "fileName": "cmd.txt",
+          "useRawData": true
+        }
+      },
+      "type": "n8n-nodes-base.moveBinaryData",
+      "typeVersion": 1,
+      "position": [
+        1320,
+        430
+      ],
+      "id": "ipc-to-binary",
+      "name": "IPC a Binario"
+    },
+    {
+      "parameters": {
+        "operation": "write",
+        "fileName": "={{ '/data/lucy_ipc/inbox/cmd_' + $now.toMillis() + '.txt' }}",
+        "dataPropertyName": "data",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [
+        1520,
+        430
+      ],
+      "id": "x11-bridge",
+      "name": "X11 Bridge (Comando)"
+    },
+    {
+      "parameters": {
+        "keepOnlySet": true,
+        "values": {
+          "string": [
+            {
+              "name": "text",
+              "value": "Entendido, ejecutando accion."
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 2,
+      "position": [
+        1720,
+        430
+      ],
+      "id": "ack-response",
+      "name": "Confirmar Accion"
+    }
+  ],
+  "connections": {
+    "Oido (Webhook)": {
+      "main": [
+        [
+          {
+            "node": "Gerente (Ollama)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gerente (Ollama)": {
+      "main": [
+        [
+          {
+            "node": "Parsear JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parsear JSON": {
+      "main": [
+        [
+          {
+            "node": "Es Control?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Es Control?": {
+      "main": [
+        [
+          {
+            "node": "IPC Mensaje",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Responder Chat",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IPC Mensaje": {
+      "main": [
+        [
+          {
+            "node": "IPC a Binario",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IPC a Binario": {
+      "main": [
+        [
+          {
+            "node": "X11 Bridge (Comando)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "X11 Bridge (Comando)": {
+      "main": [
+        [
+          {
+            "node": "Confirmar Accion",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

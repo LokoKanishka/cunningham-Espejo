@@ -1,3 +1,10 @@
+# Runtime/data mounts
+data/
+ipc/
+workspace/
+_stress/
+backups/
+
 # Secrets / local config
 .env
 .env.*
@@ -7,6 +14,7 @@ config/*.secret*
 config/*secrets*
 logs/
 *.log
+.env.n8n.local
 
 # Python
 __pycache__/
@@ -15,6 +23,7 @@ __pycache__/
 venv/
 ENV/
 .envrc
+.venv-lucy-voz
 
 # Node / JS
 node_modules/
@@ -37,3 +46,6 @@ DOCS/GOALS*.jsonl
 community/mcp/repos/
 community/mcp/top10/
 config/mcporter.json
+
+# local artifacts
+output_playwright_*.png

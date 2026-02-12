@@ -1,0 +1,119 @@
+services:
+  # ----------------------------------------------------------------
+  # CEREBRO: n8n (Orquestador)
+  # Modo: Host (Acceso total a la red del host)
+  # ----------------------------------------------------------------
+  n8n:
+    image: n8nio/n8n:2.4.4
+    container_name: lucy_brain_n8n
+    network_mode: "host" # CLAVE: Elimina overhead de NAT y bridge
+    restart: unless-stopped
+    environment:
+      - N8N_HOST=localhost
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - N8N_TEMPLATES_ENABLED=false
+      - N8N_VERSION_NOTIFICATIONS_ENABLED=false
+      - N8N_DIAGNOSTICS_ENABLED=false
+      - N8N_LISTEN_ADDRESS=127.0.0.1
+      - N8N_DIAGNOSTICS_CONFIG_BACKEND=
+      - N8N_DIAGNOSTICS_CONFIG_FRONTEND=
+      - EXTERNAL_FRONTEND_HOOKS_URLS=
+      - N8N_METRICS=true
+      - QUEUE_HEALTH_CHECK_ACTIVE=true
+      - GENERIC_TIMEZONE=America/Argentina/Buenos_Aires
+      - N8N_RESTRICT_FILE_ACCESS_TO=/data/lucy_ipc;/home/node/.n8n-files
+      # Seguridad: n8n corre como root dentro del container para acceder a archivos del host
+      # (Se puede ajustar PUID/PGID si es necesario, pero host mode simplifica esto)
+    volumes:
+      - ./data/n8n:/home/node/.n8n
+      - ./workspace:/data/workspace:rw # Intercambio con Antigravity
+      - ./ipc:/data/lucy_ipc:rw # RAM Disk para IPC
+      # Acceso a Docker socket para que n8n pueda gestionar otros contenedores si es necesario
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  # ----------------------------------------------------------------
+  # MEMORIA: Qdrant (Base Vectorial)
+  # Modo: Bridge (Accesible vía localhost:6333)
+  # ----------------------------------------------------------------
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: lucy_memory_qdrant
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6333:6333" # Solo expuesto a localhost por seguridad
+    volumes:
+      - ./data/qdrant:/qdrant/storage
+    networks:
+      - lucy_internal
+
+  # ----------------------------------------------------------------
+  # MEMORIA RÁPIDA: Redis (Cola y Estado)
+  # Modo: Bridge
+  # ----------------------------------------------------------------
+  redis:
+    image: redis:alpine
+    container_name: lucy_memory_redis
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - ./data/redis:/data
+    networks:
+      - lucy_internal
+
+  # ----------------------------------------------------------------
+  # OJOS: SearXNG (Búsqueda Privada)
+  # Modo: Bridge
+  # ----------------------------------------------------------------
+  searxng:
+    image: searxng/searxng:latest
+    container_name: lucy_eyes_searxng
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8080/
+    volumes:
+      - ./data/searxng:/etc/searxng
+    networks:
+      - lucy_internal
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+
+  # ----------------------------------------------------------------
+  # MANOS (VIRTUALES): Antigravity (Sandbox de Ejecución)
+  # Modo: Isolated Bridge (Sin internet)
+  # Nota: Usamos una imagen local construida desde ./antigravity
+  # ----------------------------------------------------------------
+  antigravity:
+    build: ./antigravity
+    image: lucy_antigravity:local
+    container_name: lucy_hands_antigravity
+    networks:
+      - antigravity_isolated
+      - antigravity_host
+    ports:
+      - "127.0.0.1:5000:5000" # API accesible solo desde host (n8n)
+    volumes:
+      - ./workspace:/workspace:rw # Volumen compartido para entregar artefactos
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G # Limite estricto para evitar congelamientos
+
+networks:
+  lucy_internal:
+    driver: bridge
+  antigravity_isolated:
+    driver: bridge
+    internal: true # Bloqueo total de salida a internet
+  antigravity_host:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
