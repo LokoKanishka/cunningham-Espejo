@@ -16,3 +16,7 @@ Laboratorio desde cero para Moltbot upstream + modelos externos + cambio de mode
 - Documento: `DOCS/AUTONOMY_VISION_STACK.md`
 - Verificación del stack: `./scripts/verify_stack10.sh`
 - Botón rojo base (estable): `./scripts/verify_all.sh`
+
+## Stack autonomía+visión (next 10)
+- Documento: `DOCS/AUTONOMY_VISION_STACK_NEXT10.md`
+- Verificación: `./scripts/verify_next10.sh`
