@@ -4,6 +4,9 @@ ipc/
 workspace/
 _stress/
 backups/
+.env.n8n.local
+node_modules/
+output_playwright_*.png
 
 # Local envs / caches
 .venv-lucy-voz
