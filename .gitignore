@@ -3,6 +3,7 @@ data/
 ipc/
 workspace/
 _stress/
+backups/
 
 # Local envs / caches
 .venv-lucy-voz
