@@ -11,3 +11,8 @@ Laboratorio desde cero para Moltbot upstream + modelos externos + cambio de mode
 - Botón rojo: `./scripts/verify_all.sh`
 - Modo amplio (más capacidad de tools): `./scripts/mode_full.sh`
 - Modo seguro (allowlist reducida): `./scripts/mode_safe.sh`
+
+## Stack autonomía+visión (10)
+- Documento: `DOCS/AUTONOMY_VISION_STACK.md`
+- Verificación del stack: `./scripts/verify_stack10.sh`
+- Botón rojo base (estable): `./scripts/verify_all.sh`
