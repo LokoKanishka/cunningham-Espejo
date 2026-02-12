@@ -1,0 +1,327 @@
+{
+  "generated_at": "2026-02-12T04:22:58Z",
+  "source": "GitHub API",
+  "count": 20,
+  "repos": [
+    {
+      "name": "github-mcp-server",
+      "full_name": "github/github-mcp-server",
+      "html_url": "https://github.com/github/github-mcp-server",
+      "clone_url": "https://github.com/github/github-mcp-server.git",
+      "description": "GitHub's official MCP Server",
+      "default_branch": "main",
+      "license": "MIT",
+      "stars": 26852,
+      "open_issues": 262,
+      "pushed_at": "2026-02-11T16:31:38Z",
+      "pinned_ref": {
+        "branch": "main",
+        "commit": "bbc675abe9eb4106fe1ba1900ee60209f333f33c"
+      }
+    },
+    {
+      "name": "firecrawl-mcp-server",
+      "full_name": "firecrawl/firecrawl-mcp-server",
+      "html_url": "https://github.com/firecrawl/firecrawl-mcp-server",
+      "clone_url": "https://github.com/firecrawl/firecrawl-mcp-server.git",
+      "description": "🔥 Official Firecrawl MCP Server - Adds powerful web scraping and search to Cursor, Claude and any other LLM clients.",
+      "default_branch": "main",
+      "license": "MIT",
+      "stars": 5476,
+      "open_issues": 65,
+      "pushed_at": "2026-02-05T21:27:48Z",
+      "pinned_ref": {
+        "branch": "main",
+        "commit": "0159dda1b04130e8c212d80c4e620120f9f93bce"
+      }
+    },
+    {
+      "name": "notion-mcp-server",
+      "full_name": "makenotion/notion-mcp-server",
+      "html_url": "https://github.com/makenotion/notion-mcp-server",
+      "clone_url": "https://github.com/makenotion/notion-mcp-server.git",
+      "description": "Official Notion MCP Server",
+      "default_branch": "main",
+      "license": "MIT",
+      "stars": 3868,
+      "open_issues": 103,
+      "pushed_at": "2026-01-31T18:26:02Z",
+      "pinned_ref": {
+        "branch": "main",
+        "commit": "7e254df95e805861db8c052f5c325a1bb77a7560"
+      }
+    },
+    {
+      "name": "exa-mcp-server",
+      "full_name": "exa-labs/exa-mcp-server",
+      "html_url": "https://github.com/exa-labs/exa-mcp-server",
+      "clone_url": "https://github.com/exa-labs/exa-mcp-server.git",
+      "description": "Exa MCP for web search and web crawling!",
+      "default_branch": "main",
+      "license": "MIT",
+      "stars": 3784,
+      "open_issues": 26,
+      "pushed_at": "2026-02-11T23:47:15Z",
+      "pinned_ref": {
+        "branch": "main",
+        "commit": "079848e7381a482b5cbe25e0da941cdc7bcdf555"
+      }
+    },
+    {
+      "name": "mcp-server-cloudflare",
+      "full_name": "cloudflare/mcp-server-cloudflare",
+      "html_url": "https://github.com/cloudflare/mcp-server-cloudflare",
+      "clone_url": "https://github.com/cloudflare/mcp-server-cloudflare.git",
+      "description": "",
+      "default_branch": "main",
+      "license": "Apache-2.0",
+      "stars": 3397,
+      "open_issues": 52,
+      "pushed_at": "2026-01-22T15:36:49Z",
+      "pinned_ref": {
+        "branch": "main",
+        "commit": "eb24e3bba8be7b682aa721d34918ff0954f1254a"
+      }
+    },
+    {
+      "name": "excel-mcp-server",
+      "full_name": "haris-musa/excel-mcp-server",
+      "html_url": "https://github.com/haris-musa/excel-mcp-server",
+      "clone_url": "https://github.com/haris-musa/excel-mcp-server.git",
+      "description": "A Model Context Protocol server for Excel file manipulation",
+      "default_branch": "main",
+      "license": "MIT",
+      "stars": 3322,
+      "open_issues": 40,
+      "pushed_at": "2026-01-19T08:14:42Z",
+      "pinned_ref": {
+        "branch": "main",
+        "commit": "de4dc75f6ba629ccd2e097f5963235846be622e6"
+      }
+    },
+    {
+      "name": "mcp-server-browserbase",
+      "full_name": "browserbase/mcp-server-browserbase",
+      "html_url": "https://github.com/browserbase/mcp-server-browserbase",
+      "clone_url": "https://github.com/browserbase/mcp-server-browserbase.git",
+      "description": "Allow LLMs to control a browser with Browserbase and Stagehand",
+      "default_branch": "main",
+      "license": "Apache-2.0",
+      "stars": 3127,
+      "open_issues": 27,
+      "pushed_at": "2026-01-23T23:24:36Z",
+      "pinned_ref": {
+        "branch": "main",
+        "commit": "51f2175c7956033d7984d77fec311604b2ebaf7c"
+      }
+    },
+    {
+      "name": "arxiv-mcp-server",
+      "full_name": "blazickjp/arxiv-mcp-server",
+      "html_url": "https://github.com/blazickjp/arxiv-mcp-server",
+      "clone_url": "https://github.com/blazickjp/arxiv-mcp-server.git",
+      "description": "A Model Context Protocol server for searching and analyzing arXiv papers",
+      "default_branch": "main",
+      "license": "Apache-2.0",
+      "stars": 2165,
+      "open_issues": 28,
+      "pushed_at": "2026-01-26T23:10:41Z",
+      "pinned_ref": {
+        "branch": "main",
+        "commit": "0065f5abb48f3eb4e011a130dd63fc52b381a1d2"
+      }
+    },
+    {
+      "name": "Office-Word-MCP-Server",
+      "full_name": "GongRzhe/Office-Word-MCP-Server",
+      "html_url": "https://github.com/GongRzhe/Office-Word-MCP-Server",
+      "clone_url": "https://github.com/GongRzhe/Office-Word-MCP-Server.git",
+      "description": "A Model Context Protocol (MCP) server for creating, reading, and manipulating Microsoft Word documents. This server enables AI assistants to work with Word documents through a standardized interface, providing rich document editing capabilities.",
+      "default_branch": "main",
+      "license": "MIT",
+      "stars": 1570,
+      "open_issues": 63,
+      "pushed_at": "2025-12-31T13:23:05Z",
+      "pinned_ref": {
+        "branch": "main",
+        "commit": "a3bbbb6d6167e68cf855d73ef7dc6cd8cfbfedba"
+      }
+    },
+    {
+      "name": "n8n-mcp-server",
+      "full_name": "leonardsellem/n8n-mcp-server",
+      "html_url": "https://github.com/leonardsellem/n8n-mcp-server",
+      "clone_url": "https://github.com/leonardsellem/n8n-mcp-server.git",
+      "description": "MCP server that provides tools and resources for interacting with n8n API",
+      "default_branch": "main",
+      "license": "MIT",
+      "stars": 1563,
+      "open_issues": 29,
+      "pushed_at": "2025-07-09T21:05:08Z",
+      "pinned_ref": {
+        "branch": "main",
+        "commit": "3b97d467ae076564afd2a597a8e986463c227153"
+      }
+    },
+    {
+      "name": "Office-PowerPoint-MCP-Server",
+      "full_name": "GongRzhe/Office-PowerPoint-MCP-Server",
+      "html_url": "https://github.com/GongRzhe/Office-PowerPoint-MCP-Server",
+      "clone_url": "https://github.com/GongRzhe/Office-PowerPoint-MCP-Server.git",
+      "description": "A MCP (Model Context Protocol) server for PowerPoint manipulation using python-pptx. This server provides tools for creating, editing, and manipulating PowerPoint presentations through the MCP protocol.",
+      "default_branch": "main",
+      "license": "MIT",
+      "stars": 1502,
+      "open_issues": 27,
+      "pushed_at": "2025-12-31T13:23:39Z",
+      "pinned_ref": {
+        "branch": "main",
+        "commit": "3631ba2ec0c24504476f78bf74d329c9be11caaa"
+      }
+    },
+    {
+      "name": "mcp-language-server",
+      "full_name": "isaacphi/mcp-language-server",
+      "html_url": "https://github.com/isaacphi/mcp-language-server",
+      "clone_url": "https://github.com/isaacphi/mcp-language-server.git",
+      "description": "mcp-language-server gives MCP enabled clients access semantic tools like get definition, references, rename, and diagnostics.",
+      "default_branch": "main",
+      "license": "BSD-3-Clause",
+      "stars": 1444,
+      "open_issues": 47,
+      "pushed_at": "2026-02-01T23:27:09Z",
+      "pinned_ref": {
+        "branch": "main",
+        "commit": "e4395849a52e18555361abab60a060802c06bf50"
+      }
+    },
+    {
+      "name": "slack-mcp-server",
+      "full_name": "korotovsky/slack-mcp-server",
+      "html_url": "https://github.com/korotovsky/slack-mcp-server",
+      "clone_url": "https://github.com/korotovsky/slack-mcp-server.git",
+      "description": "The most powerful MCP Slack Server with no permission requirements, Apps support, GovSlack, DMs, Group DMs and smart history fetch logic.",
+      "default_branch": "master",
+      "license": "MIT",
+      "stars": 1339,
+      "open_issues": 39,
+      "pushed_at": "2026-02-11T23:04:15Z",
+      "pinned_ref": {
+        "branch": "master",
+        "commit": "6ddc82863ab8b35b2ab73e9258083616532a973d"
+      }
+    },
+    {
+      "name": "mcp-server-kubernetes",
+      "full_name": "Flux159/mcp-server-kubernetes",
+      "html_url": "https://github.com/Flux159/mcp-server-kubernetes",
+      "clone_url": "https://github.com/Flux159/mcp-server-kubernetes.git",
+      "description": "MCP Server for kubernetes management commands",
+      "default_branch": "main",
+      "license": "MIT",
+      "stars": 1304,
+      "open_issues": 14,
+      "pushed_at": "2026-02-07T00:56:51Z",
+      "pinned_ref": {
+        "branch": "main",
+        "commit": "603a87f2d3af7b62ea2123c571f526463365ee59"
+      }
+    },
+    {
+      "name": "terraform-mcp-server",
+      "full_name": "hashicorp/terraform-mcp-server",
+      "html_url": "https://github.com/hashicorp/terraform-mcp-server",
+      "clone_url": "https://github.com/hashicorp/terraform-mcp-server.git",
+      "description": "The Terraform MCP Server provides seamless integration with Terraform ecosystem, enabling advanced automation and interaction capabilities for Infrastructure as Code (IaC) development.",
+      "default_branch": "main",
+      "license": "MPL-2.0",
+      "stars": 1218,
+      "open_issues": 31,
+      "pushed_at": "2026-02-11T20:27:03Z",
+      "pinned_ref": {
+        "branch": "main",
+        "commit": "fdc2e5895813e74560ed5924809420062c5467bc"
+      }
+    },
+    {
+      "name": "mcp-server-qdrant",
+      "full_name": "qdrant/mcp-server-qdrant",
+      "html_url": "https://github.com/qdrant/mcp-server-qdrant",
+      "clone_url": "https://github.com/qdrant/mcp-server-qdrant.git",
+      "description": "An official Qdrant Model Context Protocol (MCP) server implementation",
+      "default_branch": "master",
+      "license": "Apache-2.0",
+      "stars": 1214,
+      "open_issues": 38,
+      "pushed_at": "2026-01-28T20:51:03Z",
+      "pinned_ref": {
+        "branch": "master",
+        "commit": "860ab93a96ca9f5e6cf6fe47e2f5b75d36eaac69"
+      }
+    },
+    {
+      "name": "kubernetes-mcp-server",
+      "full_name": "containers/kubernetes-mcp-server",
+      "html_url": "https://github.com/containers/kubernetes-mcp-server",
+      "clone_url": "https://github.com/containers/kubernetes-mcp-server.git",
+      "description": "Model Context Protocol (MCP) server for Kubernetes and OpenShift",
+      "default_branch": "main",
+      "license": "Apache-2.0",
+      "stars": 1137,
+      "open_issues": 63,
+      "pushed_at": "2026-02-11T21:14:25Z",
+      "pinned_ref": {
+        "branch": "main",
+        "commit": "8a1dfbfd22f7e9aa2e9f830d133b2a0deb1666a4"
+      }
+    },
+    {
+      "name": "mongodb-mcp-server",
+      "full_name": "mongodb-js/mongodb-mcp-server",
+      "html_url": "https://github.com/mongodb-js/mongodb-mcp-server",
+      "clone_url": "https://github.com/mongodb-js/mongodb-mcp-server.git",
+      "description": "A Model Context Protocol server to connect to MongoDB databases and MongoDB Atlas Clusters.",
+      "default_branch": "main",
+      "license": "Apache-2.0",
+      "stars": 916,
+      "open_issues": 22,
+      "pushed_at": "2026-02-10T16:00:07Z",
+      "pinned_ref": {
+        "branch": "main",
+        "commit": "3946e27bb59f6839ddc904d2fc5e4105b86f52fb"
+      }
+    },
+    {
+      "name": "jupyter-mcp-server",
+      "full_name": "datalayer/jupyter-mcp-server",
+      "html_url": "https://github.com/datalayer/jupyter-mcp-server",
+      "clone_url": "https://github.com/datalayer/jupyter-mcp-server.git",
+      "description": "🪐 🔧 Model Context Protocol (MCP) Server for Jupyter.",
+      "default_branch": "main",
+      "license": "BSD-3-Clause",
+      "stars": 895,
+      "open_issues": 19,
+      "pushed_at": "2026-02-06T16:46:33Z",
+      "pinned_ref": {
+        "branch": "main",
+        "commit": "8123f65757fcc557c2288d599523cb0747e27c0f"
+      }
+    },
+    {
+      "name": "brave-search-mcp-server",
+      "full_name": "brave/brave-search-mcp-server",
+      "html_url": "https://github.com/brave/brave-search-mcp-server",
+      "clone_url": "https://github.com/brave/brave-search-mcp-server.git",
+      "description": "",
+      "default_branch": "main",
+      "license": "MIT",
+      "stars": 623,
+      "open_issues": 17,
+      "pushed_at": "2026-02-11T22:08:53Z",
+      "pinned_ref": {
+        "branch": "main",
+        "commit": "6f0c3013af5da5acefe1c1325361373fccc398f4"
+      }
+    }
+  ]
+}

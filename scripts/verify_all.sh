@@ -17,4 +17,7 @@ echo "== verify_codex_subscription ==" >&2
 echo "== verify_security_audit ==" >&2
 ./scripts/verify_security_audit.sh
 
+echo "== verify_community_mcp ==" >&2
+./scripts/community_mcp.sh check 1>&2
+
 echo "ALL_OK" >&2

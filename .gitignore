@@ -34,3 +34,6 @@ build/
 DOCS/ops_dashboard.html
 DOCS/DECISIONS.md
 DOCS/GOALS*.jsonl
+community/mcp/repos/
+community/mcp/top10/
+config/mcporter.json
