@@ -21,3 +21,9 @@ Laboratorio desde cero para Moltbot upstream + modelos externos + cambio de mode
 - Documento: `DOCS/AUTONOMY_VISION_STACK_NEXT10.md`
 - Verificación: `./scripts/verify_next10.sh`
 - Extras: `./scripts/goals_worker.sh check`, `./scripts/ops_alerts.sh check`, `./scripts/web_research.sh check`
+
+## UX (Consola + Español + Voz)
+- Consola pro: `./scripts/console_pro.sh`
+- Modo español persistente: `./scripts/set_spanish_mode.sh`
+- Chat con salida por voz: `./scripts/chat_voice_es.sh "tu pregunta"`
+- Doc: `DOCS/UX_SPANISH_VOICE.md`
