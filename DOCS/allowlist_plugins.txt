@@ -1,7 +1,5 @@
-copilot-
-device-
+copilot-proxy
+llm-task
 lobster
-memory-
-phone-
-talk-
+open-prose
 whatsapp

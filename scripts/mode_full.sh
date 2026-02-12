@@ -46,6 +46,7 @@ main.tools.allow = [
   "web_search",
   "web_fetch",
   "lobster",
+  "llm-task",
   "memory_search",
   "memory_get",
   "whatsapp_login"
@@ -61,4 +62,3 @@ console.error("patched:", cfg);
 console.error("backup :", bak);
 console.log("main.tools.allow =", JSON.stringify(main.tools.allow));
 NODE
-

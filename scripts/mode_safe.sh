@@ -31,7 +31,8 @@ main.tools.allow = [
   "web_search",
   "memory_search",
   "memory_get",
-  "lobster"
+  "lobster",
+  "llm-task"
 ];
 main.tools.deny = [
   "write",
@@ -54,4 +55,3 @@ console.error("patched:", cfg);
 console.error("backup :", bak);
 console.log("main.tools.allow =", JSON.stringify(main.tools.allow));
 NODE
-

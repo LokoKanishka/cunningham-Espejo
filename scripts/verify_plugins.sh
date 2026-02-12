@@ -6,22 +6,43 @@ ALLOW="DOCS/allowlist_plugins.txt"
 [ -f "$ALLOW" ] || { echo "FAIL: missing $ALLOW" >&2; exit 1; }
 
 want="$(sed '/^\s*$/d' "$ALLOW" | sort -u)"
-out="$(openclaw plugins list 2>&1 || true)"
 
-have="$(printf "%s\n" "$out" \
-  | awk -F'│' 'tolower($4) ~ /loaded/ {gsub(/^[ \t]+|[ \t]+$/,"",$3); if($3!="") print $3}' \
-  | sed '/^\s*$/d' | sort -u)"
+# Compare against enabled plugin entries in config (stable IDs).
+enabled="$(jq -r '
+  .plugins.entries
+  | to_entries[]
+  | select(.value.enabled == true)
+  | .key
+' "$HOME/.openclaw/openclaw.json" | sort -u)"
 
-if [ "$have" != "$want" ]; then
-  echo "FAIL: loaded plugins differ from allowlist" >&2
+if [ "$enabled" != "$want" ]; then
+  echo "FAIL: enabled plugin IDs differ from allowlist" >&2
   echo "== want ==" >&2
   printf "%s\n" "$want" >&2
-  echo "== have ==" >&2
-  printf "%s\n" "$have" >&2
+  echo "== enabled ==" >&2
+  printf "%s\n" "$enabled" >&2
   exit 2
 fi
 
-printf "%s\n" "$have" | grep -qx "lobster" || { echo "FAIL: lobster not loaded" >&2; exit 3; }
+# Runtime check: required integrated mods must be loaded by the gateway.
+list_out="$(openclaw plugins list 2>&1 || true)"
+for mod in lobster llm-task open-prose; do
+  case "$mod" in
+    lobster) pattern='extensions/lobster/' ;;
+    llm-task) pattern='extensions/llm-task/' ;;
+    open-prose) pattern='extensions/open-prose/' ;;
+    *) pattern="$mod" ;;
+  esac
+  printf "%s\n" "$list_out" | grep -qi "$pattern" || {
+    echo "FAIL: required plugin '$mod' not present in plugin list output" >&2
+    exit 3
+  }
+  # Best-effort loaded check by row snippet.
+  printf "%s\n" "$list_out" | grep -Eiq "$pattern.*loaded|loaded.*$pattern" || {
+    echo "FAIL: required plugin '$mod' is not loaded" >&2
+    exit 3
+  }
+done
 
 status="$(openclaw status 2>&1 || true)"
 printf "%s\n" "$status" | grep -Eiq 'WhatsApp.*│[[:space:]]*OFF' || {
