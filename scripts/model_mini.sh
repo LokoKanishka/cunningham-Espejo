@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 export PATH="$HOME/.openclaw/bin:$PATH"
-openclaw models set openai-codex/gpt-5.1-codex-mini 1>&2
+m="openai-codex/gpt-5.1-codex-mini"
+openclaw models set "$m" 1>&2
+openclaw agent --agent main --message "/new $m" --json --timeout 120 >/dev/null 2>&1 || true
 openclaw models status 1>&2
