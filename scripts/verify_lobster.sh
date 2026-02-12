@@ -1,65 +1,56 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
 export PATH="$HOME/.openclaw/bin:$PATH"
 
-echo "== verify lobster ==" >&2
-
-lobster_bin="$(command -v lobster || true)"
-if [ -z "$lobster_bin" ]; then
-  echo "FAIL: lobster binary not found in PATH" >&2
-  exit 1
+# Ensure gateway is up (uses repo script if present)
+if [ -x ./scripts/verify_gateway.sh ]; then
+  ./scripts/verify_gateway.sh 1>&2
 fi
 
-echo "lobster_bin=$lobster_bin" >&2
+# Run lobster tool via agent
+out="$(openclaw agent --agent main --json --timeout 60 \
+  --message 'Usá la herramienta lobster. action="run". pipeline="exec --shell \"echo OK\"". Devolveme SOLO el JSON.' \
+  2>&1 || true)"
 
-plugins_out="$(openclaw plugins list 2>&1 || true)"
-printf "%s\n" "$plugins_out" | grep -Eiq 'lobster.*\bloaded\b' || {
-  echo "FAIL: lobster plugin is not loaded" >&2
-  exit 2
-}
-
-# Expect a resumable approval envelope with token.
-run_out="$(lobster run --mode tool 'exec --json --shell "echo [1]" | approve --prompt "verify"' 2>&1 || true)"
-
-printf "%s" "$run_out" | node -e '
+# Parse both layers:
+# 1) outer OpenClaw JSON
+# 2) inner lobster envelope inside payloads[].text
+if printf "%s" "$out" | node -e '
 const fs = require("fs");
-const out = fs.readFileSync(0, "utf8");
-const i = out.indexOf("{");
-const j = out.lastIndexOf("}");
-if (i < 0 || j <= i) {
-  console.error("FAIL: no JSON object found in lobster output");
-  console.error(out.slice(0, 1200));
-  process.exit(3);
-}
-let env;
+const raw = fs.readFileSync(0, "utf8");
+const i = raw.indexOf("{");
+const j = raw.lastIndexOf("}");
+if (i < 0 || j <= i) process.exit(1);
+let outer;
 try {
-  env = JSON.parse(out.slice(i, j + 1));
-} catch (e) {
-  console.error("FAIL: cannot parse lobster envelope");
-  console.error(String(e));
-  process.exit(4);
+  outer = JSON.parse(raw.slice(i, j + 1));
+} catch {
+  process.exit(1);
 }
 
-const ok = env?.ok === true;
-const status = String(env?.status || "");
-const token = String(env?.requiresApproval?.resumeToken || "");
-console.error(`envelope_ok=${ok}`);
-console.error(`status=${status}`);
-console.error(`resumeToken_present=${token.length > 0}`);
+const payloads = Array.isArray(outer?.result?.payloads)
+  ? outer.result.payloads
+  : (Array.isArray(outer?.payloads) ? outer.payloads : []);
+const firstText = String(payloads?.[0]?.text || "");
 
-if (!ok) {
-  console.error("FAIL: lobster envelope not ok");
-  process.exit(5);
+let inner;
+try {
+  inner = JSON.parse(firstText);
+} catch {
+  process.exit(1);
 }
-if (status !== "needs_approval" && status !== "ok") {
-  console.error("FAIL: unexpected lobster status");
-  process.exit(6);
-}
-if (status === "needs_approval" && !token) {
-  console.error("FAIL: needs_approval without resumeToken");
-  process.exit(7);
-}
-'
 
-echo "OK" >&2
+const ok = inner?.ok === true;
+const status = String(inner?.status || "");
+const outArr = Array.isArray(inner?.output) ? inner.output.map(String) : [];
+if (!ok) process.exit(1);
+if (status !== "ok" && status !== "needs_approval") process.exit(1);
+if (!outArr.includes("OK")) process.exit(1);
+'; then
+  echo "LOBSTER_OK"
+  exit 0
+fi
+
+echo "LOBSTER_FAIL" >&2
+echo "$out" >&2
+exit 1
