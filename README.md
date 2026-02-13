@@ -11,6 +11,7 @@ Laboratorio desde cero para Moltbot upstream + modelos externos + cambio de mode
 - Botón rojo: `./scripts/verify_all.sh`
 - Modo amplio (más capacidad de tools): `./scripts/mode_full.sh`
 - Modo seguro (allowlist reducida): `./scripts/mode_safe.sh`
+- UI local opcional del stack (Dockge): `docs/INTERFAZ_STACK_DOCKGE.md`
 
 ## Stack autonomía+visión (10)
 - Documento: `DOCS/AUTONOMY_VISION_STACK.md`

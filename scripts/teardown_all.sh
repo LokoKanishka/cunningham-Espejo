@@ -4,9 +4,9 @@ cd "$(dirname "$0")/.."
 
 WITH_VOLUMES="${WITH_VOLUMES:-false}"
 if [[ "$WITH_VOLUMES" == "true" ]]; then
-  docker compose down -v
+  ./scripts/compose_infra.sh down -v
 else
-  docker compose down
+  ./scripts/compose_infra.sh down
 fi
 
 echo "TEARDOWN=PASS"

@@ -14,12 +14,12 @@ mkdir -p "$WIPE_DIR"
 
 rollback_original_data() {
   echo "[dr] rollback original data"
-  docker compose stop n8n >/dev/null || true
+  ./scripts/compose_infra.sh stop n8n >/dev/null || true
   rm -rf data/n8n
   if [[ -d "$ORIG_DIR" ]]; then
     mv "$ORIG_DIR" data/n8n
   fi
-  docker compose up -d n8n >/dev/null
+  ./scripts/compose_infra.sh up -d n8n >/dev/null
   ./scripts/webhook_smoke.sh || true
 }
 
@@ -34,12 +34,12 @@ if [[ ! -d data/n8n ]]; then
 fi
 
 echo "[dr] step=wipe_simulation"
-docker compose stop n8n >/dev/null
+./scripts/compose_infra.sh stop n8n >/dev/null
 mv data/n8n "$ORIG_DIR"
 mkdir -p data/n8n
 
 echo "[dr] step=start_blank_n8n"
-docker compose up -d n8n >/dev/null
+./scripts/compose_infra.sh up -d n8n >/dev/null
 
 echo "[dr] step=restore"
 if ! BACKUP_DIR="$BACKUP_DIR" TIMEOUT="$RESTORE_TIMEOUT" RUN_SMOKE=true ROLLBACK_ON_FAIL=true ./scripts/n8n_red_button_restore.sh; then

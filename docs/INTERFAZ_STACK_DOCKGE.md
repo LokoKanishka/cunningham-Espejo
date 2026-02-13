@@ -7,8 +7,24 @@ Dockge es una UI opcional para operar stacks Docker Compose en local.
 - Fuente de verdad: scripts + compose del repo (`./scripts/bringup_all.sh`, `./scripts/webhook_smoke.sh`, etc.).
 - Dockge no reemplaza automatizaciones headless.
 - Exposicion local-only: `http://127.0.0.1:5001`.
+- El compose canonico de `infra` es `docker-compose.yml`.
+- `compose.yaml` existe como symlink para que Dockge detecte el stack.
 
-## Levantar / apagar Dockge
+## Comandos UI (comando unico)
+
+```bash
+./scripts/ui_up.sh
+./scripts/ui_status.sh
+./scripts/ui_open.sh
+./scripts/ui_down.sh
+```
+
+- `ui_up`: levanta Dockge y muestra `UI_URL=http://127.0.0.1:5001`
+- `ui_status`: muestra estado de Dockge y servicios clave de `infra`
+- `ui_open`: abre URL con `xdg-open` si existe; si no, solo imprime URL
+- `ui_down`: baja Dockge
+
+## Levantar / apagar Dockge (bajo nivel)
 
 ```bash
 ./scripts/bringup_dockge.sh
@@ -21,6 +37,14 @@ Tambien se puede usar compose directo:
 ```bash
 docker compose --env-file apps/dockge/.env -f apps/dockge/compose.yaml up -d
 docker compose --env-file apps/dockge/.env -f apps/dockge/compose.yaml down
+```
+
+Para compose de `infra`, usar helper y evitar warnings por doble archivo:
+
+```bash
+./scripts/compose_infra.sh ps
+./scripts/compose_infra.sh up -d n8n
+./scripts/compose_infra.sh down
 ```
 
 ## Requisito critico de paths

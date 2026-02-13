@@ -9,8 +9,8 @@ APPLY_GATEWAY_PATCH="${APPLY_GATEWAY_PATCH:-true}"
 echo "[bringup] init IPC layout"
 ./scripts/ipc_layout_init.sh ./ipc
 
-echo "[bringup] docker compose up -d --build ${SERVICES}"
-docker compose up -d --build ${SERVICES}
+echo "[bringup] compose_infra up -d --build ${SERVICES}"
+./scripts/compose_infra.sh up -d --build ${SERVICES}
 
 wait_http() {
   local name="$1"
@@ -37,14 +37,14 @@ if [[ "$APPLY_GATEWAY_PATCH" == "true" ]]; then
   echo "[bringup] applying Lucy Gateway v1 patch"
   ./scripts/n8n_patch_lucy_gateway_v1.sh
   URL_MODE=hardcoded ANTIGRAVITY_TARGET_URL="http://127.0.0.1:5000/execute" ./scripts/n8n_set_antigravity_url.sh >/dev/null || true
-  docker compose restart n8n >/dev/null
+  ./scripts/compose_infra.sh restart n8n >/dev/null
   wait_http "n8n-post-patch" "http://127.0.0.1:5678/healthz"
 fi
 
 echo "[bringup] running webhook smoke"
 if ! ./scripts/webhook_smoke.sh; then
   echo "[bringup] smoke failed, diagnostics:"
-  docker compose ps
+  ./scripts/compose_infra.sh ps
   docker logs --tail 120 lucy_brain_n8n || true
   docker logs --tail 120 lucy_hands_antigravity || true
   exit 1

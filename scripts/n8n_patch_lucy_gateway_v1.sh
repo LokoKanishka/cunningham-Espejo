@@ -19,6 +19,6 @@ docker cp "$PATCHED" "$CONTAINER":/tmp/lucy_gateway_patched.json >/dev/null
 docker exec -u node "$CONTAINER" n8n import:workflow --input=/tmp/lucy_gateway_patched.json >/dev/null
 docker exec -u node "$CONTAINER" n8n update:workflow --id="$WORKFLOW_ID" --active=true >/dev/null
 docker exec -u node "$CONTAINER" n8n publish:workflow --id="$WORKFLOW_ID" >/dev/null
-docker compose restart n8n >/dev/null
+./scripts/compose_infra.sh restart n8n >/dev/null
 
 echo "PATCH_APPLIED workflow_id=$WORKFLOW_ID"
