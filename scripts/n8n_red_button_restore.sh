@@ -42,6 +42,31 @@ restore_from_dir() {
   docker exec -u node "$CONTAINER" n8n import:credentials --separate --input="$tmp_base/credentials"
   docker exec -u node "$CONTAINER" n8n import:workflow --separate --input="$tmp_base/workflows"
   docker exec -u node "$CONTAINER" rm -rf "$tmp_base"
+
+  # Reactivate workflows that were active in the backup set.
+  mapfile -t active_ids < <(python3 - <<'PY' "$restore_dir/workflows"
+import json
+import sys
+from pathlib import Path
+base = Path(sys.argv[1])
+for f in sorted(base.glob('*.json')):
+    try:
+        obj = json.loads(f.read_text(encoding='utf-8'))
+    except Exception:
+        continue
+    if isinstance(obj, list) and obj:
+        obj = obj[0]
+    if isinstance(obj, dict) and obj.get('active') and obj.get('id'):
+        print(obj['id'])
+PY
+  )
+  for wid in "${active_ids[@]:-}"; do
+    [[ -n "$wid" ]] || continue
+    docker exec -u node "$CONTAINER" n8n update:workflow --id="$wid" --active=true >/dev/null || true
+  done
+
+  URL_MODE=hardcoded ANTIGRAVITY_TARGET_URL="http://127.0.0.1:5000/execute" ./scripts/n8n_set_antigravity_url.sh >/dev/null || true
+  docker restart "$CONTAINER" >/dev/null
 }
 
 if [[ -z "$BACKUP_DIR" ]]; then

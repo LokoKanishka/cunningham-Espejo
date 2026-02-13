@@ -10,18 +10,23 @@ OK_RATE_MIN="${OK_RATE_MIN:-0.995}"
 CONTENT_TYPE="${CONTENT_TYPE:-application/json}"
 REQUEST_BODY="${REQUEST_BODY:-}"
 READY_HTTP_CODE="${READY_HTTP_CODE:-200}"
+P95_MAX_S="${P95_MAX_S:-}"
+ENDPOINT_LABEL="${ENDPOINT_LABEL:-}"
 
 OUTDIR="${OUTDIR:-./_stress}"
 mkdir -p "$OUTDIR"
 TS="$(date +%Y%m%d_%H%M%S)"
-RAW="$OUTDIR/raw_${TS}.csv"
-META="$OUTDIR/meta_${TS}.txt"
-SUMMARY="$OUTDIR/summary_${TS}.txt"
-METRICS_BEFORE="$OUTDIR/metrics_before_${TS}.txt"
-METRICS_AFTER="$OUTDIR/metrics_after_${TS}.txt"
-STATS_BEFORE="$OUTDIR/docker_stats_before_${TS}.txt"
-STATS_AFTER="$OUTDIR/docker_stats_after_${TS}.txt"
-LOGS="$OUTDIR/docker_logs_${TS}.txt"
+if [[ -z "$ENDPOINT_LABEL" ]]; then
+  ENDPOINT_LABEL="$(echo "${METHOD}_$(echo "$URL" | sed -E 's#https?://##; s#[^a-zA-Z0-9]+#-#g; s#^-+|-+$##g')" | tr '[:upper:]' '[:lower:]')"
+fi
+RAW="$OUTDIR/raw_${ENDPOINT_LABEL}_${TS}.csv"
+META="$OUTDIR/meta_${ENDPOINT_LABEL}_${TS}.txt"
+SUMMARY="$OUTDIR/summary_${ENDPOINT_LABEL}_${TS}.txt"
+METRICS_BEFORE="$OUTDIR/metrics_before_${ENDPOINT_LABEL}_${TS}.txt"
+METRICS_AFTER="$OUTDIR/metrics_after_${ENDPOINT_LABEL}_${TS}.txt"
+STATS_BEFORE="$OUTDIR/docker_stats_before_${ENDPOINT_LABEL}_${TS}.txt"
+STATS_AFTER="$OUTDIR/docker_stats_after_${ENDPOINT_LABEL}_${TS}.txt"
+LOGS="$OUTDIR/docker_logs_${ENDPOINT_LABEL}_${TS}.txt"
 
 START_ISO="$(date --iso-8601=seconds)"
 
@@ -49,6 +54,8 @@ wait_ready() {
   echo "START_ISO=$START_ISO"
   echo "URL=$URL METHOD=$METHOD"
   echo "N=$N P=$P TIMEOUT=$TIMEOUT OK_RATE_MIN=$OK_RATE_MIN"
+  echo "P95_MAX_S=${P95_MAX_S:-none}"
+  echo "ENDPOINT_LABEL=$ENDPOINT_LABEL"
   echo "READY_HTTP_CODE=$READY_HTTP_CODE"
   echo "CONTENT_TYPE=$CONTENT_TYPE"
   [[ -n "$REQUEST_BODY" ]] && echo "REQUEST_BODY=$REQUEST_BODY"
@@ -117,14 +124,30 @@ print("\n".join(out))
 summary = Path(os.environ["SUMMARY"])
 summary.write_text("\n".join(out) + "\n", encoding="utf-8")
 summary.with_suffix(".okrate").write_text(str(ok_rate), encoding="utf-8")
+p95_val = q(0.95)
+summary.with_suffix(".p95").write_text("" if p95_val is None else str(p95_val), encoding="utf-8")
 PY
 
 OK_RATE="$(cat "${SUMMARY%.txt}.okrate" 2>/dev/null || echo 0)"
+P95_VALUE="$(cat "${SUMMARY%.txt}.p95" 2>/dev/null || true)"
 pass_or_fail="$(python3 - <<PY
 ok=float("$OK_RATE")
 thr=float("$OK_RATE_MIN")
 print("PASS" if ok>=thr else "FAIL", "ok_rate=",f"{ok:.4f}","threshold=",f"{thr:.4f}")
-print("1" if ok>=thr else "0")
+pass_ok = ok>=thr
+p95_raw = """$P95_VALUE""".strip()
+p95_thr = """$P95_MAX_S""".strip()
+if p95_thr:
+    if not p95_raw:
+        pass_ok = False
+        print("P95_CHECK=FAIL missing_p95 threshold=", p95_thr)
+    else:
+        p95 = float(p95_raw)
+        thr95 = float(p95_thr)
+        ok95 = p95 <= thr95
+        print("P95_CHECK=" + ("PASS" if ok95 else "FAIL"), "p95=", f"{p95:.3f}", "threshold=", f"{thr95:.3f}")
+        pass_ok = pass_ok and ok95
+print("1" if pass_ok else "0")
 PY
 )"
 echo "$pass_or_fail" | sed -n '1p'

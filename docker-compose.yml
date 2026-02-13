@@ -24,6 +24,9 @@ services:
       - GENERIC_TIMEZONE=America/Argentina/Buenos_Aires
       - N8N_RESTRICT_FILE_ACCESS_TO=/data/lucy_ipc;/home/node/.n8n-files
       - ANTIGRAVITY_URL=http://127.0.0.1:5000
+      - LUCY_IPC_INBOX=/data/lucy_ipc/inbox
+      - LUCY_IPC_DEADLETTER=/data/lucy_ipc/deadletter
+      - NODE_FUNCTION_ALLOW_BUILTIN=fs,path,crypto
       # Seguridad: n8n corre como root dentro del container para acceder a archivos del host
       # (Se puede ajustar PUID/PGID si es necesario, pero host mode simplifica esto)
     volumes:
@@ -43,7 +46,7 @@ services:
   # Modo: Bridge (Accesible vía localhost:6333)
   # ----------------------------------------------------------------
   qdrant:
-    image: qdrant/qdrant:latest
+    image: qdrant/qdrant@sha256:0425e3e03e7fd9b3dc95c4214546afe19de2eb2e28ca621441a56663ac6e1f46
     container_name: lucy_memory_qdrant
     restart: unless-stopped
     ports:
@@ -58,7 +61,7 @@ services:
   # Modo: Bridge
   # ----------------------------------------------------------------
   redis:
-    image: redis:alpine
+    image: redis@sha256:6cbef353e480a8a6e7f10ec545f13d7d3fa85a212cdcc5ffaf5a1c818b9d3798
     container_name: lucy_memory_redis
     restart: unless-stopped
     ports:
@@ -73,7 +76,7 @@ services:
   # Modo: Bridge
   # ----------------------------------------------------------------
   searxng:
-    image: searxng/searxng:latest
+    image: searxng/searxng@sha256:9c071b8685d6586692072df2eaa48a0adb8e53d13e18cb53e21924837c5803d7
     container_name: lucy_eyes_searxng
     restart: unless-stopped
     ports:
@@ -117,6 +120,20 @@ services:
       interval: 10s
       timeout: 3s
       retries: 12
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    container_name: lucy_obs_prometheus
+    network_mode: "host"
+    restart: unless-stopped
+    profiles: ["observability"]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.listen-address=127.0.0.1:9090
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./data/prometheus:/prometheus
 
 networks:
   lucy_internal:

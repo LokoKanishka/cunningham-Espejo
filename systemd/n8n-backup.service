@@ -4,4 +4,5 @@ Description=Lucy n8n Backup
 [Service]
 Type=oneshot
 WorkingDirectory=%h/Lucy_Workspace/infra
+Environment=RETAIN=14
 ExecStart=%h/Lucy_Workspace/infra/scripts/n8n_backup.sh
