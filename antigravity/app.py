@@ -19,6 +19,11 @@ RUNS_DIR = WORKSPACE_ROOT / "antigravity_runs"
 DEFAULT_TIMEOUT_S = 15
 
 
+@app.get("/healthz")
+def healthz() -> dict:
+    return {"ok": True}
+
+
 class ExecuteRequest(BaseModel):
     code: str = Field(..., description="Python code to execute")
     timeout_s: Optional[int] = Field(

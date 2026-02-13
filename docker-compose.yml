@@ -23,6 +23,7 @@ services:
       - QUEUE_HEALTH_CHECK_ACTIVE=true
       - GENERIC_TIMEZONE=America/Argentina/Buenos_Aires
       - N8N_RESTRICT_FILE_ACCESS_TO=/data/lucy_ipc;/home/node/.n8n-files
+      - ANTIGRAVITY_URL=http://127.0.0.1:5000
       # Seguridad: n8n corre como root dentro del container para acceder a archivos del host
       # (Se puede ajustar PUID/PGID si es necesario, pero host mode simplifica esto)
     volumes:
@@ -31,6 +32,11 @@ services:
       - ./ipc:/data/lucy_ipc:rw # RAM Disk para IPC
       # Acceso a Docker socket para que n8n pueda gestionar otros contenedores si es necesario
       - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:5678/healthz || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
 
   # ----------------------------------------------------------------
   # MEMORIA: Qdrant (Base Vectorial)
@@ -106,6 +112,11 @@ services:
         limits:
           cpus: "2.0"
           memory: 4G # Limite estricto para evitar congelamientos
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:5000/healthz || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
 
 networks:
   lucy_internal:

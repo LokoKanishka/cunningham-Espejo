@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# --- Config ---
 URL="${URL:-http://127.0.0.1:5678/healthz}"
-N="${N:-2000}"           # cantidad de requests
-P="${P:-50}"             # concurrencia (xargs -P)
-TIMEOUT="${TIMEOUT:-5}"  # segundos por request
+METHOD="${METHOD:-GET}"
+N="${N:-2000}"
+P="${P:-50}"
+TIMEOUT="${TIMEOUT:-5}"
 OK_RATE_MIN="${OK_RATE_MIN:-0.995}"
+CONTENT_TYPE="${CONTENT_TYPE:-application/json}"
+REQUEST_BODY="${REQUEST_BODY:-}"
+READY_HTTP_CODE="${READY_HTTP_CODE:-200}"
 
 OUTDIR="${OUTDIR:-./_stress}"
 mkdir -p "$OUTDIR"
@@ -27,21 +30,28 @@ wait_ready() {
   local sleep_s="${2:-1}"
   for i in $(seq 1 "$tries"); do
     local code
-    code="$(curl -sS -o /dev/null -m "$TIMEOUT" -w "%{http_code}" "$URL" 2>/dev/null || true)"
-    if [[ -n "${code:-}" && "$code" != "000" ]]; then
+    if [[ "$METHOD" == "GET" ]]; then
+      code="$(curl -sS -o /dev/null -m "$TIMEOUT" -w "%{http_code}" -X "$METHOD" "$URL" 2>/dev/null || true)"
+    else
+      code="$(curl -sS -o /dev/null -m "$TIMEOUT" -w "%{http_code}" -X "$METHOD" "$URL" -H "content-type: $CONTENT_TYPE" --data "$REQUEST_BODY" 2>/dev/null || true)"
+    fi
+    if [[ "$code" == "$READY_HTTP_CODE" ]]; then
       echo "READY url=$URL http=$code (t=${i}s)"
       return 0
     fi
     sleep "$sleep_s"
   done
-  echo "NOT_READY url=$URL after ${tries}s"
+  echo "NOT_READY url=$URL expected_http=$READY_HTTP_CODE after ${tries}s"
   return 1
 }
 
 {
   echo "START_ISO=$START_ISO"
-  echo "URL=$URL"
+  echo "URL=$URL METHOD=$METHOD"
   echo "N=$N P=$P TIMEOUT=$TIMEOUT OK_RATE_MIN=$OK_RATE_MIN"
+  echo "READY_HTTP_CODE=$READY_HTTP_CODE"
+  echo "CONTENT_TYPE=$CONTENT_TYPE"
+  [[ -n "$REQUEST_BODY" ]] && echo "REQUEST_BODY=$REQUEST_BODY"
   echo
   docker ps -a --filter name=lucy_brain_n8n --format 'Name={{.Names}} Status={{.Status}} Image={{.Image}}'
   echo
@@ -49,17 +59,18 @@ wait_ready() {
 
 wait_ready 30 1
 
-# snapshots antes
 (curl -sS -m "$TIMEOUT" http://127.0.0.1:5678/metrics > "$METRICS_BEFORE" 2>/dev/null) || true
 (docker stats --no-stream lucy_brain_n8n > "$STATS_BEFORE" 2>/dev/null) || true
 
-# disparamos N requests en paralelo y guardamos "http_code,time_total"
-# si curl falla: 000,timeout
-seq 1 "$N" | xargs -P "$P" -I{} sh -c \
-  'curl -sS -o /dev/null -m '"$TIMEOUT"' -w "%{http_code},%{time_total}\n" "'"$URL"'" 2>/dev/null || echo "000,'"${TIMEOUT}.000"'"' \
-  >> "$RAW"
+export URL METHOD TIMEOUT CONTENT_TYPE REQUEST_BODY RAW
+seq 1 "$N" | xargs -P "$P" -I{} sh -c '
+if [ "$METHOD" = "GET" ]; then
+  curl -sS -o /dev/null -m "$TIMEOUT" -w "%{http_code},%{time_total}\n" -X "$METHOD" "$URL" 2>/dev/null || echo "000,$TIMEOUT.000"
+else
+  curl -sS -o /dev/null -m "$TIMEOUT" -w "%{http_code},%{time_total}\n" -X "$METHOD" "$URL" -H "content-type: $CONTENT_TYPE" --data "$REQUEST_BODY" 2>/dev/null || echo "000,$TIMEOUT.000"
+fi
+' >> "$RAW"
 
-# snapshots después
 (curl -sS -m "$TIMEOUT" http://127.0.0.1:5678/metrics > "$METRICS_AFTER" 2>/dev/null) || true
 (docker stats --no-stream lucy_brain_n8n > "$STATS_AFTER" 2>/dev/null) || true
 (docker logs --since "$START_ISO" lucy_brain_n8n > "$LOGS" 2>/dev/null) || true
@@ -103,18 +114,23 @@ if times_sorted:
 out.append(f"CODES_TOP={top}")
 print("\n".join(out))
 
-# exitcode via file marker
 summary = Path(os.environ["SUMMARY"])
 summary.write_text("\n".join(out) + "\n", encoding="utf-8")
 summary.with_suffix(".okrate").write_text(str(ok_rate), encoding="utf-8")
 PY
 
 OK_RATE="$(cat "${SUMMARY%.txt}.okrate" 2>/dev/null || echo 0)"
-python3 - <<PY
+pass_or_fail="$(python3 - <<PY
 ok=float("$OK_RATE")
 thr=float("$OK_RATE_MIN")
 print("PASS" if ok>=thr else "FAIL", "ok_rate=",f"{ok:.4f}","threshold=",f"{thr:.4f}")
+print("1" if ok>=thr else "0")
 PY
+)"
+echo "$pass_or_fail" | sed -n '1p'
+if [[ "$(echo "$pass_or_fail" | tail -n 1)" != "1" ]]; then
+  exit 1
+fi
 
 echo
 echo "Artifacts:"
