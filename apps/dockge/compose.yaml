@@ -1,0 +1,13 @@
+services:
+  dockge:
+    image: louislam/dockge:1
+    container_name: lucy_ui_dockge
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5001:5001"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./data:/app/data
+      - ${WORKSPACE_DIR}:${WORKSPACE_DIR}
+    environment:
+      - DOCKGE_STACKS_DIR=${WORKSPACE_DIR}
