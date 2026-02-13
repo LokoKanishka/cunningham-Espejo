@@ -3,19 +3,21 @@ set -euo pipefail
 
 OUT_DIR="${OUT_DIR:-./_tmp}"
 CONTAINER="${CONTAINER:-lucy_brain_n8n}"
+STRICT_CONFLICTS="${STRICT_CONFLICTS:-false}"
 mkdir -p "$OUT_DIR"
 
 EXPORT_FILE="$OUT_DIR/workflows_export.json"
 docker exec -u node "$CONTAINER" n8n export:workflow --all --output /tmp/workflows_export.json >/dev/null
 docker cp "$CONTAINER":/tmp/workflows_export.json "$EXPORT_FILE" >/dev/null
-export EXPORT_FILE
+export EXPORT_FILE STRICT_CONFLICTS
 
 python3 - <<'PY'
 import json
+import os
 from collections import defaultdict
 from pathlib import Path
 
-p=Path(__import__('os').environ['EXPORT_FILE'])
+p=Path(os.environ['EXPORT_FILE'])
 text=p.read_text(encoding='utf-8', errors='replace')
 obj=json.loads(text)
 workflows=obj['workflows'] if isinstance(obj,dict) and 'workflows' in obj else obj
@@ -49,11 +51,14 @@ for key, vals in by_path.items():
     if len(active_vals) > 1:
         active_conflicts.append((key, active_vals))
 
+strict = os.environ.get('STRICT_CONFLICTS', 'false').lower() == 'true'
 if active_conflicts:
     print('ACTIVE_CONFLICTS=YES')
     for (path, method), vals in active_conflicts:
         names=', '.join(f'{v[4]}({v[3]})' for v in vals)
         print(f'  conflict path={path} method={method} active={names}')
+    if strict:
+        raise SystemExit(1)
 else:
     print('ACTIVE_CONFLICTS=NO')
 PY
