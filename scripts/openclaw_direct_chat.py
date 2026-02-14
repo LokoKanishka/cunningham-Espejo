@@ -6,16 +6,43 @@ import re
 import subprocess
 import sys
 import time
+import unicodedata
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
+from urllib.parse import quote_plus
 from urllib.request import Request, urlopen
 
 
 HISTORY_DIR = Path.home() / ".openclaw" / "direct_chat_histories"
 HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+
+SITE_ALIASES = {
+    "chatgpt": "https://chatgpt.com/",
+    "chat gpt": "https://chatgpt.com/",
+    "gemini": "https://gemini.google.com/app",
+    "youtube": "https://www.youtube.com/",
+    "you tube": "https://www.youtube.com/",
+    "wikipedia": "https://es.wikipedia.org/",
+    "wiki": "https://es.wikipedia.org/",
+    "gmail": "https://mail.google.com/",
+    "mail": "https://mail.google.com/",
+}
+
+SITE_SEARCH_TEMPLATES = {
+    "youtube": "https://www.youtube.com/results?search_query={q}",
+    "wikipedia": "https://es.wikipedia.org/w/index.php?search={q}",
+}
+
+SITE_CANONICAL_TOKENS = {
+    "chatgpt": ["chatgpt", "chat gpt"],
+    "gemini": ["gemini"],
+    "youtube": ["youtube", "you tube"],
+    "wikipedia": ["wikipedia", "wiki"],
+    "gmail": ["gmail", "mail"],
+}
 
 
 HTML = r"""<!doctype html>
@@ -448,6 +475,77 @@ def _extract_url(text: str) -> str | None:
     return None
 
 
+def _normalize_text(value: str) -> str:
+    lowered = value.lower()
+    no_accents = "".join(c for c in unicodedata.normalize("NFKD", lowered) if not unicodedata.combining(c))
+    return re.sub(r"\s+", " ", no_accents).strip()
+
+
+def _extract_topic(message: str) -> str | None:
+    patterns = [
+        r"iniciar (?:una )?conversacion(?: nueva)? sobre ([^.,;:\n]+)",
+        r"conversacion(?: nueva)? sobre ([^.,;:\n]+)",
+        r"chat nuevo sobre ([^.,;:\n]+)",
+        r"sobre ([^.,;:\n]+)",
+    ]
+    text = _normalize_text(message)
+    for pattern in patterns:
+        m = re.search(pattern, text, flags=re.IGNORECASE)
+        if m:
+            topic = m.group(1).strip(" \"'").strip()
+            if topic:
+                return topic[:120]
+    return None
+
+
+def _canonical_site_keys(message: str) -> list[str]:
+    text = _normalize_text(message)
+    found = []
+    for key, tokens in SITE_CANONICAL_TOKENS.items():
+        if any(token in text for token in tokens):
+            found.append(key)
+    return found
+
+
+def _open_firefox_urls(urls: list[str]) -> tuple[list[str], str | None]:
+    opened = []
+    for url in urls:
+        try:
+            subprocess.Popen(
+                ["firefox", "--new-tab", url],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            opened.append(url)
+        except FileNotFoundError:
+            return opened, "No pude abrir Firefox: comando no encontrado en el sistema."
+        except Exception as e:
+            return opened, f"No pude abrir Firefox: {e}"
+    return opened, None
+
+
+def _site_url(site_key: str) -> str:
+    if site_key == "chatgpt":
+        return SITE_ALIASES["chatgpt"]
+    if site_key == "gemini":
+        return SITE_ALIASES["gemini"]
+    if site_key == "youtube":
+        return SITE_ALIASES["youtube"]
+    if site_key == "wikipedia":
+        return SITE_ALIASES["wikipedia"]
+    if site_key == "gmail":
+        return SITE_ALIASES["gmail"]
+    return SITE_ALIASES.get(site_key, "about:blank")
+
+
+def _build_site_search_url(site_key: str, query: str) -> str | None:
+    template = SITE_SEARCH_TEMPLATES.get(site_key)
+    if not template:
+        return None
+    return template.format(q=quote_plus(query))
+
+
 def _safe_session_id(value: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9_-]", "", value)[:64]
     return cleaned or "default"
@@ -482,23 +580,78 @@ def _save_history(session_id: str, history: list) -> None:
 
 def _maybe_handle_local_action(message: str, allowed_tools: set[str]) -> dict | None:
     text = message.lower()
+    normalized = _normalize_text(message)
 
-    if "firefox" in text and any(k in text for k in ("abr", "open", "lanz", "inici")):
+    if "firefox" in text and any(k in normalized for k in ("abr", "open", "lanz", "inici")):
         if "firefox" not in allowed_tools:
             return {"reply": "La herramienta local 'firefox' está deshabilitada en esta sesión."}
         url = _extract_url(message) or "about:blank"
-        try:
-            subprocess.Popen(
-                ["firefox", "--new-tab", url],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
+        opened, error = _open_firefox_urls([url])
+        if error:
+            return {"reply": error}
+        return {"reply": f"Listo, abrí Firefox en: {opened[0]}"}
+
+    site_keys = _canonical_site_keys(message)
+    wants_open = any(k in normalized for k in ("abr", "open", "entra", "entrar", "ir a", "lanz", "inici"))
+    wants_search = ("busc" in normalized) or any(k in normalized for k in ("search", "investiga", "investigar"))
+    wants_new_chat = any(k in normalized for k in ("chat nuevo", "nuevo chat", "iniciar una conversacion", "iniciar conversacion"))
+    topic = _extract_topic(message)
+
+    m_site_search = re.search(r"(?:busca|buscar|search)\s+(.+?)\s+en\s+(youtube|wikipedia)", normalized, flags=re.IGNORECASE)
+    if "firefox" in allowed_tools and m_site_search:
+        query = m_site_search.group(1).strip()
+        site = m_site_search.group(2).strip()
+        url = _build_site_search_url(site, query)
+        if url:
+            opened, error = _open_firefox_urls([url])
+            if error:
+                return {"reply": error}
+            return {"reply": f"Listo, busqué '{query}' en {site} y abrí: {opened[0]}"}
+
+    if "firefox" in allowed_tools and wants_new_chat and topic and ("chatgpt" in site_keys or "gemini" in site_keys):
+        urls = []
+        if "chatgpt" in site_keys:
+            urls.append(_site_url("chatgpt"))
+        if "gemini" in site_keys:
+            urls.append(_site_url("gemini"))
+        if "youtube" in site_keys:
+            yt_url = _build_site_search_url("youtube", topic)
+            if yt_url:
+                urls.append(yt_url)
+        if "wikipedia" in site_keys:
+            wiki_url = _build_site_search_url("wikipedia", topic)
+            if wiki_url:
+                urls.append(wiki_url)
+
+        if urls:
+            opened, error = _open_firefox_urls(urls)
+            if error:
+                return {"reply": error}
+            prompt = (
+                "Prompt sugerido para pegar en ChatGPT/Gemini: "
+                f"'Iniciemos una conversación sobre {topic}. "
+                "Dame contexto geopolítico actual, actores clave, riesgos y escenarios probables.'"
             )
-            return {"reply": f"Listo, abrí Firefox en: {url}"}
-        except FileNotFoundError:
-            return {"reply": "No pude abrir Firefox: comando no encontrado en el sistema."}
-        except Exception as e:
-            return {"reply": f"No pude abrir Firefox: {e}"}
+            return {"reply": f"Abrí recursos para el tema '{topic}': {' | '.join(opened)}\n{prompt}"}
+
+    m_yt_about = re.search(r"(?:video|videos)\s+de\s+youtube\s+sobre\s+(.+)", normalized, flags=re.IGNORECASE)
+    if "firefox" in allowed_tools and m_yt_about:
+        query = m_yt_about.group(1).strip(" .")
+        if query in ("el tema", "ese tema", "este tema") and topic:
+            query = topic
+        url = _build_site_search_url("youtube", query)
+        opened, error = _open_firefox_urls([url]) if url else ([], "No pude construir la búsqueda en YouTube.")
+        if error:
+            return {"reply": error}
+        return {"reply": f"Abrí videos de YouTube sobre '{query}': {opened[0]}"}
+
+    if "firefox" in allowed_tools and site_keys and wants_open and not wants_search and not wants_new_chat:
+        urls = [_site_url(site_key) for site_key in site_keys]
+        opened, error = _open_firefox_urls(urls)
+        if error:
+            return {"reply": error}
+        listing = " | ".join(opened)
+        return {"reply": f"Abrí estos sitios: {listing}"}
 
     wants_desktop = any(k in text for k in ("escritorio", "desktop"))
     asks_dirs = any(k in text for k in ("carpeta", "carpetas", "folder", "folders", "directorio", "directorios"))
