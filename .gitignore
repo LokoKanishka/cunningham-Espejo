@@ -56,3 +56,5 @@ config/mcporter.json
 
 # local artifacts
 output_playwright_*.png
+
+.playwright-cli/
