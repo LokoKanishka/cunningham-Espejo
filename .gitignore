@@ -11,6 +11,7 @@ backups/
 .env.n8n.local
 node_modules/
 output_playwright_*.png
+output/
 
 # Secrets / local config
 .env
