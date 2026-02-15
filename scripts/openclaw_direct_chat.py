@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -43,9 +44,10 @@ SITE_SEARCH_TEMPLATES = {
 }
 
 SITE_CANONICAL_TOKENS = {
-    "chatgpt": ["chatgpt", "chat gpt"],
-    "gemini": ["gemini"],
-    "youtube": ["youtube", "you tube"],
+    # Include common typos so simple "open X" doesn't fall back to the model.
+    "chatgpt": ["chatgpt", "chat gpt", "chatgtp", "chat gtp"],
+    "gemini": ["gemini", "gemni", "geminy"],
+    "youtube": ["youtube", "you tube", "ytube", "yutub", "youtbe", "youtub"],
     "wikipedia": ["wikipedia", "wiki"],
     "gmail": ["gmail", "mail"],
 }
@@ -57,12 +59,173 @@ DEFAULT_BROWSER_PROFILE_CONFIG = {
     "chatgpt": {"browser": "chrome", "profile": "diego"},
     "gemini": {"browser": "chrome", "profile": "diego"},
     "youtube": {"browser": "chrome", "profile": "diego"},
+    "wikipedia": {"browser": "chrome", "profile": "diego"},
+    "gmail": {"browser": "chrome", "profile": "diego"},
 }
 HTML = UI_HTML
 
 
 # NOTE: UI HTML moved to scripts/molbot_direct_chat/ui_html.py
 # Keeping the content embedded here made this file too large to maintain.
+
+BROWSER_WINDOWS_PATH = Path.home() / ".openclaw" / "direct_chat_opened_browser_windows.json"
+BROWSER_WINDOWS_LOCK_PATH = Path.home() / ".openclaw" / ".direct_chat_opened_browser_windows.lock"
+
+
+def _wmctrl_list() -> dict[str, str]:
+    if not shutil.which("wmctrl"):
+        return {}
+    try:
+        proc = subprocess.run(["wmctrl", "-l"], capture_output=True, text=True, timeout=3)
+    except Exception:
+        return {}
+    out: dict[str, str] = {}
+    for line in (proc.stdout or "").splitlines():
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            continue
+        win_id = parts[0].strip()
+        title = parts[3].strip()
+        if win_id and title:
+            out[win_id] = title
+    return out
+
+
+def _wmctrl_current_desktop() -> int | None:
+    if not shutil.which("wmctrl"):
+        return None
+    try:
+        proc = subprocess.run(["wmctrl", "-d"], capture_output=True, text=True, timeout=3)
+    except Exception:
+        return None
+    for line in (proc.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == "*":
+            try:
+                return int(parts[0])
+            except Exception:
+                return None
+    return None
+
+
+def _wmctrl_move_to_desktop(win_id: str, desktop_idx: int) -> bool:
+    if not shutil.which("wmctrl"):
+        return False
+    try:
+        subprocess.run(
+            ["wmctrl", "-i", "-r", win_id, "-t", str(desktop_idx)],
+            timeout=3,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _browser_windows_load() -> dict:
+    BROWSER_WINDOWS_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with BROWSER_WINDOWS_LOCK_PATH.open("a+", encoding="utf-8") as lockf:
+            fcntl.flock(lockf.fileno(), fcntl.LOCK_SH)
+            if BROWSER_WINDOWS_PATH.exists():
+                try:
+                    data = json.loads(BROWSER_WINDOWS_PATH.read_text(encoding="utf-8") or "{}")
+                    return data if isinstance(data, dict) else {}
+                except Exception:
+                    return {}
+            return {}
+    except Exception:
+        return {}
+
+
+def _browser_windows_save(data: dict) -> None:
+    try:
+        BROWSER_WINDOWS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        BROWSER_WINDOWS_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = BROWSER_WINDOWS_PATH.with_suffix(".json.tmp")
+        payload = json.dumps(data, ensure_ascii=False, indent=2)
+        with BROWSER_WINDOWS_LOCK_PATH.open("a+", encoding="utf-8") as lockf:
+            fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
+            tmp.write_text(payload, encoding="utf-8")
+            tmp.replace(BROWSER_WINDOWS_PATH)
+    except Exception:
+        return
+
+
+def _record_browser_windows(session_id: str, items: list[dict]) -> None:
+    data = _browser_windows_load()
+    sess = data.get(session_id)
+    if not isinstance(sess, dict):
+        sess = {"items": []}
+    if not isinstance(sess.get("items"), list):
+        sess["items"] = []
+
+    now = time.time()
+    keep: list[dict] = []
+    for it in sess["items"]:
+        if not isinstance(it, dict):
+            continue
+        ts = float(it.get("ts", 0) or 0)
+        if ts and (now - ts) < 30 * 60:
+            keep.append(it)
+    keep.extend(items)
+
+    seen = set()
+    deduped: list[dict] = []
+    for it in reversed(keep):
+        win_id = str(it.get("win_id", "")).strip()
+        url = str(it.get("url", "")).strip()
+        key = (win_id, url)
+        if not win_id or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(it)
+    sess["items"] = list(reversed(deduped))[-40:]
+    data[session_id] = sess
+    _browser_windows_save(data)
+
+
+def _close_recorded_browser_windows(session_id: str) -> tuple[int, list[str]]:
+    data = _browser_windows_load()
+    sess = data.get(session_id)
+    if not isinstance(sess, dict):
+        return 0, []
+    items = sess.get("items", [])
+    if not isinstance(items, list) or not items:
+        return 0, []
+    if not shutil.which("wmctrl"):
+        return 0, ["wmctrl_missing"]
+
+    closed = 0
+    errors: list[str] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        win_id = str(it.get("win_id", "")).strip()
+        if not win_id:
+            continue
+        try:
+            subprocess.run(["wmctrl", "-ic", win_id], timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            closed += 1
+        except Exception as e:
+            errors.append(str(e))
+
+    data.pop(session_id, None)
+    _browser_windows_save(data)
+    return closed, errors
+
+
+def _reset_recorded_browser_windows(session_id: str) -> None:
+    data = _browser_windows_load()
+    if session_id in data:
+        data.pop(session_id, None)
+        _browser_windows_save(data)
+
+
+def _looks_like_open_request(normalized: str) -> bool:
+    tokens = ("abr", "abri", "abir", "abrir", "open", "entra", "entrar", "ir a", "lanz", "inici")
+    return any(t in normalized for t in tokens)
 
 
 
@@ -159,7 +322,7 @@ def _resolve_chrome_profile_directory(profile_hint: str) -> str:
     return hint
 
 
-def _open_url_with_site_context(url: str, site_key: str | None) -> str | None:
+def _open_url_with_site_context(url: str, site_key: str | None, session_id: str | None = None) -> str | None:
     cfg = _load_browser_profile_config()
     site_cfg = cfg.get(site_key or "", {})
     if not site_cfg:
@@ -172,6 +335,8 @@ def _open_url_with_site_context(url: str, site_key: str | None) -> str | None:
         if not chrome:
             return "No pude abrir Chrome: comando no encontrado en el sistema."
         chrome_user_data = str(Path.home() / ".config" / "google-chrome")
+        before = _wmctrl_list()
+        target_desktop = _wmctrl_current_desktop()
         try:
             subprocess.Popen(
                 [
@@ -185,6 +350,21 @@ def _open_url_with_site_context(url: str, site_key: str | None) -> str | None:
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
+            if before:
+                time.sleep(0.9)
+                after = _wmctrl_list()
+                new_ids = [wid for wid in after.keys() if wid not in before]
+                if new_ids and (target_desktop is not None):
+                    for wid in new_ids:
+                        _wmctrl_move_to_desktop(wid, target_desktop)
+                if session_id and new_ids:
+                    _record_browser_windows(
+                        session_id,
+                        [
+                            {"win_id": wid, "title": after.get(wid, ""), "url": url, "site_key": site_key, "ts": time.time()}
+                            for wid in new_ids
+                        ],
+                    )
             return None
         except Exception as e:
             return f"No pude abrir Chrome perfil '{profile}': {e}"
@@ -203,10 +383,10 @@ def _open_url_with_site_context(url: str, site_key: str | None) -> str | None:
         return f"No pude abrir Firefox: {e}"
 
 
-def _open_site_urls(entries: list[tuple[str | None, str]]) -> tuple[list[str], str | None]:
+def _open_site_urls(entries: list[tuple[str | None, str]], session_id: str | None = None) -> tuple[list[str], str | None]:
     opened = []
     for site_key, url in entries:
-        error = _open_url_with_site_context(url, site_key)
+        error = _open_url_with_site_context(url, site_key, session_id=session_id)
         if error:
             return opened, error
         opened.append(url)
@@ -263,6 +443,20 @@ def _save_history(session_id: str, history: list) -> None:
 def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id: str) -> dict | None:
     text = message.lower()
     normalized = _normalize_text(message)
+
+    # Close browser windows opened by this system (tracked by session).
+    # Examples:
+    # - "cerrá las ventanas web que abriste"
+    # - "reset ventanas web"
+    if any(k in normalized for k in ("web", "navegador", "browser")) and any(k in normalized for k in ("ventan", "windows")):
+        if any(k in normalized for k in ("reset", "reinic", "olvid", "limpia")):
+            _reset_recorded_browser_windows(session_id=session_id)
+            return {"reply": "Listo: limpié el registro de ventanas web abiertas por el sistema para esta sesión."}
+        if any(k in normalized for k in ("cerr", "close", "cierra")):
+            closed, errors = _close_recorded_browser_windows(session_id=session_id)
+            if errors:
+                return {"reply": f"Cerré {closed} ventana(s) web que abrí. Errores: {', '.join(errors)[:260]}"}
+            return {"reply": f"Cerré {closed} ventana(s) web que abrí (solo las registradas por el sistema)."}
 
     # Safe local opens/closes for Desktop items (no deletion).
     # Examples:
@@ -339,13 +533,13 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         if "firefox" not in allowed_tools:
             return {"reply": "La herramienta local 'firefox' está deshabilitada en esta sesión."}
         url = _extract_url(message) or "about:blank"
-        opened, error = _open_site_urls([(None, url)])
+        opened, error = _open_site_urls([(None, url)], session_id=session_id)
         if error:
             return {"reply": error}
         return {"reply": f"Listo, abrí Firefox en: {opened[0]}"}
 
     site_keys = _canonical_site_keys(message)
-    wants_open = any(k in normalized for k in ("abr", "open", "entra", "entrar", "ir a", "lanz", "inici"))
+    wants_open = _looks_like_open_request(normalized)
     wants_search = ("busc" in normalized) or any(k in normalized for k in ("search", "investiga", "investigar"))
     wants_new_chat = any(k in normalized for k in ("chat nuevo", "nuevo chat", "iniciar una conversacion", "iniciar conversacion"))
     topic = _extract_topic(message)
@@ -356,7 +550,7 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         site = m_site_search.group(2).strip()
         url = _build_site_search_url(site, query)
         if url:
-            opened, error = _open_site_urls([(site, url)])
+            opened, error = _open_site_urls([(site, url)], session_id=session_id)
             if error:
                 return {"reply": error}
             return {"reply": f"Listo, busqué '{query}' en {site} y abrí: {opened[0]}"}
@@ -377,7 +571,7 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
                 entries.append(("wikipedia", wiki_url))
 
         if entries:
-            opened, error = _open_site_urls(entries)
+            opened, error = _open_site_urls(entries, session_id=session_id)
             if error:
                 return {"reply": error}
             prompt = (
@@ -393,14 +587,14 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         if query in ("el tema", "ese tema", "este tema") and topic:
             query = topic
         url = _build_site_search_url("youtube", query)
-        opened, error = _open_site_urls([("youtube", url)]) if url else ([], "No pude construir la búsqueda en YouTube.")
+        opened, error = _open_site_urls([("youtube", url)], session_id=session_id) if url else ([], "No pude construir la búsqueda en YouTube.")
         if error:
             return {"reply": error}
         return {"reply": f"Abrí videos de YouTube sobre '{query}': {opened[0]}"}
 
     if "firefox" in allowed_tools and site_keys and wants_open and not wants_search and not wants_new_chat:
         entries = [(site_key, _site_url(site_key)) for site_key in site_keys]
-        opened, error = _open_site_urls(entries)
+        opened, error = _open_site_urls(entries, session_id=session_id)
         if error:
             return {"reply": error}
         listing = " | ".join(opened)
