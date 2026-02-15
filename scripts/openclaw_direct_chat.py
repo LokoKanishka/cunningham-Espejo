@@ -56,6 +56,7 @@ DEFAULT_BROWSER_PROFILE_CONFIG = {
 WEB_ASK_SCRIPT_PATH = Path(__file__).with_name("web_ask_playwright.js")
 WEB_ASK_LOG_PATH = Path.home() / ".openclaw" / "logs" / "web_ask.log"
 WEB_ASK_LOCK_PATH = Path.home() / ".openclaw" / "web_ask_shadow" / ".web_ask.lock"
+WEB_ASK_THREAD_DIR = Path.home() / ".openclaw" / "web_ask_shadow" / "threads"
 
 
 HTML = r"""<!doctype html>
@@ -190,16 +191,17 @@ HTML = r"""<!doctype html>
       </div>
     </div>
 
-    <div class="tools">
-      <span>Herramientas locales:</span>
-      <label><input type="checkbox" id="toolFirefox" checked /> firefox</label>
-      <label><input type="checkbox" id="toolDesktop" checked /> escritorio</label>
-      <label><input type="checkbox" id="toolModel" checked /> modelo</label>
-      <label><input type="checkbox" id="useStream" checked /> streaming</label>
-      <button class="alt" id="btnFirefox">Abrir Firefox</button>
-      <button class="alt" id="btnDesktop">Listar Escritorio</button>
-      <span class="small">Slash: /new /firefox [url] /escritorio /modo [conciso|operativo|investigacion]</span>
-    </div>
+	    <div class="tools">
+	      <span>Herramientas locales:</span>
+	      <label><input type="checkbox" id="toolFirefox" checked /> firefox</label>
+	      <label><input type="checkbox" id="toolWebAsk" checked /> web_ask</label>
+	      <label><input type="checkbox" id="toolDesktop" checked /> escritorio</label>
+	      <label><input type="checkbox" id="toolModel" checked /> modelo</label>
+	      <label><input type="checkbox" id="useStream" checked /> streaming</label>
+	      <button class="alt" id="btnFirefox">Abrir Firefox</button>
+	      <button class="alt" id="btnDesktop">Listar Escritorio</button>
+	      <span class="small">Slash: /new /firefox [url] /escritorio /modo [conciso|operativo|investigacion]</span>
+	    </div>
 
     <div id="chat" class="chat"></div>
 
@@ -224,10 +226,11 @@ HTML = r"""<!doctype html>
     const newSessionEl = document.getElementById("newSession");
     const exportMdEl = document.getElementById("exportMd");
     const exportTxtEl = document.getElementById("exportTxt");
-    const toolFirefoxEl = document.getElementById("toolFirefox");
-    const toolDesktopEl = document.getElementById("toolDesktop");
-    const toolModelEl = document.getElementById("toolModel");
-    const useStreamEl = document.getElementById("useStream");
+	    const toolFirefoxEl = document.getElementById("toolFirefox");
+	    const toolWebAskEl = document.getElementById("toolWebAsk");
+	    const toolDesktopEl = document.getElementById("toolDesktop");
+	    const toolModelEl = document.getElementById("toolModel");
+	    const useStreamEl = document.getElementById("useStream");
     const btnFirefoxEl = document.getElementById("btnFirefox");
     const btnDesktopEl = document.getElementById("btnDesktop");
     const attachEl = document.getElementById("attach");
@@ -240,13 +243,14 @@ HTML = r"""<!doctype html>
     let history = [];
     let pendingAttachments = [];
 
-    function allowedTools() {
-      const out = [];
-      if (toolFirefoxEl.checked) out.push("firefox");
-      if (toolDesktopEl.checked) out.push("desktop");
-      if (toolModelEl.checked) out.push("model");
-      return out;
-    }
+	    function allowedTools() {
+	      const out = [];
+	      if (toolFirefoxEl.checked) out.push("firefox");
+	      if (toolWebAskEl.checked) out.push("web_ask");
+	      if (toolDesktopEl.checked) out.push("desktop");
+	      if (toolModelEl.checked) out.push("model");
+	      return out;
+	    }
 
     async function loadServerHistory() {
       try {
@@ -673,6 +677,23 @@ def _resolve_site_browser_config(site_key: str) -> tuple[str, str]:
     return browser, profile
 
 
+def _list_known_chrome_profiles() -> list[str]:
+    out = []
+    local_state = Path.home() / ".config" / "google-chrome" / "Local State"
+    try:
+        data = json.loads(local_state.read_text(encoding="utf-8"))
+        info = data.get("profile", {}).get("info_cache", {})
+        if isinstance(info, dict):
+            for key in info.keys():
+                if isinstance(key, str) and key not in out:
+                    out.append(key)
+    except Exception:
+        pass
+    if "Default" not in out:
+        out.append("Default")
+    return out
+
+
 def _prepare_shadow_chrome_user_data(profile_dir: str) -> tuple[str, str | None]:
     src_root = Path.home() / ".config" / "google-chrome"
     src_profile = src_root / profile_dir
@@ -759,8 +780,23 @@ def _log_web_ask(event: dict) -> None:
         return
 
 
-def _extract_web_ask_request(message: str) -> tuple[str, str] | None:
+def _extract_web_ask_request(message: str) -> tuple[str, str, str | None] | None:
     msg = message.strip()
+    dialog_patterns = [
+        r"(?:dialoga|dialogá|dialogue|dialogar)\s+(?:con\s+)?(chatgpt|chat gpt|gemini)\s*[:,-]?\s*(.+)$",
+    ]
+    for pattern in dialog_patterns:
+        m = re.search(pattern, msg, flags=re.IGNORECASE | re.DOTALL)
+        if not m:
+            continue
+        provider = m.group(1).strip().lower()
+        prompt = m.group(2).strip().strip("\"'").strip()
+        if not prompt:
+            continue
+        site_key = "chatgpt" if "chat" in provider else "gemini"
+        followup = "En base a tu respuesta anterior, resumila en 1 frase y listá 3 conceptos clave."
+        return site_key, prompt, followup
+
     patterns = [
         r"(?:preguntale|preguntále|preguntale|pregunta|consultale|consúltale|consulta|decile|decirle)\s+(?:a\s+)?(chatgpt|chat gpt|gemini)\s*[:,-]?\s*(.+)$",
         r"^(chatgpt|chat gpt|gemini)\s*[:,-]\s*(.+)$",
@@ -774,11 +810,11 @@ def _extract_web_ask_request(message: str) -> tuple[str, str] | None:
         if not prompt:
             continue
         site_key = "chatgpt" if "chat" in provider else "gemini"
-        return site_key, prompt
+        return site_key, prompt, None
     return None
 
 
-def _run_web_ask(site_key: str, prompt: str, timeout_ms: int = 60000) -> dict:
+def _run_web_ask(site_key: str, prompt: str, timeout_ms: int = 60000, followup: str | None = None) -> dict:
     started = time.time()
     browser, profile = _resolve_site_browser_config(site_key)
     if browser != "chrome":
@@ -808,91 +844,126 @@ def _run_web_ask(site_key: str, prompt: str, timeout_ms: int = 60000) -> dict:
             "timings": {"start": started, "end": time.time(), "duration": 0.0},
         }
 
-    shadow_user_data_dir, shadow_warn = _prepare_shadow_chrome_user_data(profile)
+    # IMPORTANT: user expectation is deterministic behavior in the configured Chrome profile
+    # (e.g. "diego"). Trying other profiles causes confusing cross-account behavior and
+    # can multiply timeouts (N profiles * timeout). Keep fallback off by default.
+    try_all = str(os.environ.get("WEB_ASK_TRY_ALL_PROFILES", "")).strip().lower() in ("1", "true", "yes")
+    fallback_profiles = [profile]
+    if try_all:
+        for p in _list_known_chrome_profiles():
+            if p not in fallback_profiles:
+                fallback_profiles.append(p)
 
-    cmd = [
-        node,
-        str(WEB_ASK_SCRIPT_PATH),
-        "--site",
-        site_key,
-        "--prompt",
-        prompt,
-        "--profile-dir",
-        profile,
-        "--user-data-dir",
-        shadow_user_data_dir,
-        "--timeout-ms",
-        str(timeout_ms),
-        "--headless",
-        "false",
-    ]
-    WEB_ASK_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with WEB_ASK_LOCK_PATH.open("w", encoding="utf-8") as lockf:
-            fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=max(20, int(timeout_ms / 1000) + 20),
-            )
-    except subprocess.TimeoutExpired:
-        result = {
-            "ok": False,
-            "status": "timeout",
-            "text": "",
-            "evidence": "playwright_runner_timeout",
-            "timings": {"start": started, "end": time.time(), "duration": round(time.time() - started, 3)},
-        }
-        _log_web_ask({"ts": time.time(), "site": site_key, "status": result["status"], "prompt": prompt[:220], "result": result})
-        return result
-    except Exception as e:
-        result = {
-            "ok": False,
-            "status": "runner_error",
-            "text": "",
-            "evidence": str(e),
-            "timings": {"start": started, "end": time.time(), "duration": round(time.time() - started, 3)},
-        }
-        _log_web_ask({"ts": time.time(), "site": site_key, "status": result["status"], "prompt": prompt[:220], "result": result})
-        return result
+    WEB_ASK_THREAD_DIR.mkdir(parents=True, exist_ok=True)
+    thread_file = WEB_ASK_THREAD_DIR / f"{site_key}_thread.txt"
 
-    payload = _parse_json_object(proc.stdout) or {}
-    if not payload:
-        payload = {
-            "ok": False,
-            "status": "invalid_output",
-            "text": "",
-            "evidence": (proc.stderr or proc.stdout or "").strip()[:800],
-            "timings": {"start": started, "end": time.time(), "duration": round(time.time() - started, 3)},
-        }
+    last_payload = {
+        "ok": False,
+        "status": "runner_error",
+        "text": "",
+        "evidence": "no_attempt",
+        "timings": {"start": started, "end": time.time(), "duration": 0.0},
+    }
 
-    if "timings" not in payload or not isinstance(payload.get("timings"), dict):
-        payload["timings"] = {"start": started, "end": time.time(), "duration": round(time.time() - started, 3)}
+    for idx, profile_candidate in enumerate(fallback_profiles):
+        shadow_user_data_dir, shadow_warn = _prepare_shadow_chrome_user_data(profile_candidate)
+        cmd = [
+            node,
+            str(WEB_ASK_SCRIPT_PATH),
+            "--site",
+            site_key,
+            "--prompt",
+            prompt,
+            "--profile-dir",
+            profile_candidate,
+            "--user-data-dir",
+            shadow_user_data_dir,
+            "--timeout-ms",
+            str(timeout_ms),
+            "--headless",
+            "false",
+            "--thread-file",
+            str(thread_file),
+        ]
+        if followup:
+            cmd.extend(["--followup", followup])
 
-    payload["ok"] = bool(payload.get("ok", False))
-    payload["status"] = str(payload.get("status", "error"))
-    payload["text"] = str(payload.get("text", ""))
-    payload["evidence"] = str(payload.get("evidence", ""))
-    payload["runner_code"] = proc.returncode
-    if shadow_warn:
-        payload["shadow_warn"] = shadow_warn
+        WEB_ASK_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with WEB_ASK_LOCK_PATH.open("w", encoding="utf-8") as lockf:
+                fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=max(20, int(timeout_ms / 1000) + 20),
+                )
+        except subprocess.TimeoutExpired:
+            last_payload = {
+                "ok": False,
+                "status": "timeout",
+                "text": "",
+                "evidence": "playwright_runner_timeout",
+                "timings": {"start": started, "end": time.time(), "duration": round(time.time() - started, 3)},
+            }
+            continue
+        except Exception as e:
+            last_payload = {
+                "ok": False,
+                "status": "runner_error",
+                "text": "",
+                "evidence": str(e),
+                "timings": {"start": started, "end": time.time(), "duration": round(time.time() - started, 3)},
+            }
+            continue
 
-    _log_web_ask(
-        {
-            "ts": time.time(),
-            "site": site_key,
-            "status": payload["status"],
-            "ok": payload["ok"],
-            "runner_code": proc.returncode,
-            "prompt": prompt[:220],
-            "duration": payload.get("timings", {}).get("duration", None),
-            "evidence": payload.get("evidence", ""),
-            "shadow_user_data_dir": shadow_user_data_dir,
-            "shadow_warn": shadow_warn,
-        }
-    )
-    return payload
+        payload = _parse_json_object(proc.stdout) or {}
+        if not payload:
+            payload = {
+                "ok": False,
+                "status": "invalid_output",
+                "text": "",
+                "evidence": (proc.stderr or proc.stdout or "").strip()[:800],
+                "timings": {"start": started, "end": time.time(), "duration": round(time.time() - started, 3)},
+            }
+
+        if "timings" not in payload or not isinstance(payload.get("timings"), dict):
+            payload["timings"] = {"start": started, "end": time.time(), "duration": round(time.time() - started, 3)}
+
+        payload["ok"] = bool(payload.get("ok", False))
+        payload["status"] = str(payload.get("status", "error"))
+        payload["text"] = str(payload.get("text", ""))
+        payload["evidence"] = str(payload.get("evidence", ""))
+        payload["runner_code"] = proc.returncode
+        payload["profile_used"] = profile_candidate
+        payload["attempt"] = idx + 1
+        if shadow_warn:
+            payload["shadow_warn"] = shadow_warn
+
+        _log_web_ask(
+            {
+                "ts": time.time(),
+                "site": site_key,
+                "status": payload["status"],
+                "ok": payload["ok"],
+                "runner_code": proc.returncode,
+                "prompt": prompt[:220],
+                "duration": payload.get("timings", {}).get("duration", None),
+                "evidence": payload.get("evidence", ""),
+                "shadow_user_data_dir": shadow_user_data_dir,
+                "shadow_warn": shadow_warn,
+                "profile_used": profile_candidate,
+                "attempt": idx + 1,
+            }
+        )
+
+        last_payload = payload
+        if payload.get("ok"):
+            return payload
+        if payload.get("status") not in ("login_required", "profile_locked"):
+            return payload
+
+    return last_payload
 
 
 def _format_web_ask_reply(site_key: str, prompt: str, result: dict) -> str:
@@ -905,7 +976,27 @@ def _format_web_ask_reply(site_key: str, prompt: str, result: dict) -> str:
             text = "(respuesta vacía)"
         if len(text) > 6000:
             text = text[:6000] + "\n\n[...respuesta truncada por longitud...]"
-        return f"{provider} respondió:\n{text}\n\nEstado: ok ({duration}s)."
+        profile_used = str(result.get("profile_used", "")).strip()
+        profile_note = f" perfil={profile_used}" if profile_used else ""
+        turns = result.get("turns")
+        if isinstance(turns, list) and turns:
+            out_lines = []
+            for idx, t in enumerate(turns[:4], 1):
+                if not isinstance(t, dict):
+                    continue
+                p = str(t.get("prompt", "")).strip()
+                tx = str(t.get("text", "")).strip()
+                if p:
+                    out_lines.append(f"Turno {idx} (yo): {p}")
+                if tx:
+                    out_lines.append(f"Turno {idx} ({provider}): {tx}")
+                out_lines.append("")
+            body = "\n".join(out_lines).strip()
+            if len(body) > 6500:
+                body = body[:6500] + "\n\n[...truncado...]"
+            return f"{body}\n\nEstado: ok ({duration}s){profile_note}."
+
+        return f"{provider} respondió:\n{text}\n\nEstado: ok ({duration}s){profile_note}."
 
     help_map = {
         "login_required": f"No pude completar en {provider}: la sesión requiere login manual en ese sitio.",
@@ -964,12 +1055,49 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str]) -> dict | 
     text = message.lower()
     normalized = _normalize_text(message)
 
+    # One-time helper: open a shadow-profile Chrome window so the user can login manually.
+    # This avoids brittle automation failures like "login_required" for ChatGPT/Gemini.
+    m_login = re.search(
+        r"(?:login|loguea|logueate|inicia\s+sesion|iniciar\s+sesion)\s+(?:en\s+)?(chatgpt|chat\s*gpt|gemini)\b",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if m_login:
+        if ("web_ask" not in allowed_tools) and ("firefox" not in allowed_tools):
+            return {"reply": "La herramienta local 'web_ask' está deshabilitada en esta sesión."}
+        provider = m_login.group(1).strip().lower()
+        site_key = "chatgpt" if "chat" in provider else "gemini"
+        browser, profile_dir = _resolve_site_browser_config(site_key)
+        if browser != "chrome":
+            return {"reply": f"No puedo bootstrap de login para {site_key}: perfil configurado no usa Chrome."}
+        script = Path(__file__).resolve().parent / "web_ask_bootstrap.sh"
+        if not script.exists():
+            return {"reply": f"No encontré script de bootstrap: {script}"}
+        try:
+            subprocess.Popen(
+                [str(script), site_key, profile_dir],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            return {
+                "reply": (
+                    f"Abrí una ventana de Chrome (shadow profile) para loguearte en {site_key}. "
+                    "Iniciá sesión ahí y luego cerrá esa ventana. Después probá de nuevo: "
+                    f"dialoga con {site_key}: <tu pregunta>"
+                )
+            }
+        except Exception as e:
+            return {"reply": f"No pude lanzar bootstrap de login para {site_key}: {e}"}
+
     web_req = _extract_web_ask_request(message)
     if web_req is not None:
-        if "firefox" not in allowed_tools:
-            return {"reply": "La herramienta local 'firefox' está deshabilitada en esta sesión."}
-        site_key, prompt = web_req
-        result = _run_web_ask(site_key, prompt, timeout_ms=60000)
+        # web_ask is separate from opening URLs via firefox. Keep backward-compat:
+        # if someone only enabled firefox (old UI), still allow web_ask.
+        if ("web_ask" not in allowed_tools) and ("firefox" not in allowed_tools):
+            return {"reply": "La herramienta local 'web_ask' está deshabilitada en esta sesión."}
+        site_key, prompt, followup = web_req
+        result = _run_web_ask(site_key, prompt, timeout_ms=60000, followup=followup)
         return {"reply": _format_web_ask_reply(site_key, prompt, result)}
 
     if "firefox" in text and any(k in normalized for k in ("abr", "open", "lanz", "inici")):
@@ -1116,11 +1244,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def _json(self, status: int, payload: dict):
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(raw)))
-        self.end_headers()
-        self.wfile.write(raw)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+        except BrokenPipeError:
+            # Client disconnected; avoid noisy tracebacks and "Empty reply" symptoms.
+            return
 
     def _parse_payload(self) -> dict:
         length = int(self.headers.get("Content-Length", "0"))
@@ -1256,9 +1388,12 @@ class Handler(BaseHTTPRequestHandler):
                     self.end_headers()
                     reply = str(local_action.get("reply", ""))
                     out = json.dumps({"token": reply}, ensure_ascii=False).encode("utf-8")
-                    self.wfile.write(b"data: " + out + b"\n\n")
-                    self.wfile.write(b"data: [DONE]\n\n")
-                    self.wfile.flush()
+                    try:
+                        self.wfile.write(b"data: " + out + b"\n\n")
+                        self.wfile.write(b"data: [DONE]\n\n")
+                        self.wfile.flush()
+                    except BrokenPipeError:
+                        return
                     self.close_connection = True
                     return
 
@@ -1293,11 +1428,17 @@ class Handler(BaseHTTPRequestHandler):
                 for i in range(0, len(full), step):
                     token = full[i:i + step]
                     out = json.dumps({"token": token}, ensure_ascii=False).encode("utf-8")
-                    self.wfile.write(b"data: " + out + b"\n\n")
-                    self.wfile.flush()
+                    try:
+                        self.wfile.write(b"data: " + out + b"\n\n")
+                        self.wfile.flush()
+                    except BrokenPipeError:
+                        return
                     time.sleep(0.01)
-                self.wfile.write(b"data: [DONE]\n\n")
-                self.wfile.flush()
+                try:
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                except BrokenPipeError:
+                    return
                 self.close_connection = True
                 return
 

@@ -30,11 +30,15 @@ const SITE_CONFIG = {
     ],
     loginSelectors: [
       "input[type='password']",
+      "text=/iniciar\\s+sesi[oó]n/i",
+      "text=/log\\s*in/i",
+      "text=/sign\\s*in/i",
       "button:has-text('Log in')",
       "a:has-text('Log in')",
       "button:has-text('Iniciar sesión')",
       "a:has-text('Iniciar sesión')",
     ],
+    minResponseLen: 4,
   },
   gemini: {
     url: "https://gemini.google.com/app",
@@ -65,7 +69,10 @@ const SITE_CONFIG = {
       "a:has-text('Iniciar sesión')",
       "button:has-text('Sign in')",
       "a:has-text('Sign in')",
+      "text=/iniciar\\s+sesi[oó]n/i",
+      "text=/sign\\s*in/i",
     ],
+    minResponseLen: 4,
   },
 };
 
@@ -181,14 +188,15 @@ async function extractLastResponseText(page, selectors) {
   return best;
 }
 
-async function waitForFreshResponse(page, selectors, baseline, timeoutMs) {
+async function waitForFreshResponse(page, selectors, baseline, timeoutMs, minLen) {
   const deadline = Date.now() + timeoutMs;
   let stableHits = 0;
   let candidate = "";
+  const needLen = Math.max(1, parseInt(String(minLen || 1), 10) || 1);
 
   while (Date.now() < deadline) {
     const latest = await extractLastResponseText(page, selectors);
-    if (latest && latest !== baseline && latest.length >= 24) {
+    if (latest && latest !== baseline && latest.length >= needLen) {
       if (latest === candidate) {
         stableHits += 1;
       } else {
@@ -209,6 +217,17 @@ function screenshotPath(site) {
   const outDir = path.join(os.homedir(), ".openclaw", "logs", "web_ask_screens");
   fs.mkdirSync(outDir, { recursive: true });
   return path.join(outDir, `${site}_${Date.now()}.png`);
+}
+
+async function safeScreenshot(page, site) {
+  const shot = screenshotPath(site);
+  try {
+    await page.screenshot({ path: shot, fullPage: true });
+    if (fs.existsSync(shot)) return { path: shot, error: "" };
+    return { path: "", error: "screenshot_missing_after_write" };
+  } catch (err) {
+    return { path: "", error: String(err && err.message ? err.message : err).slice(0, 400) };
+  }
 }
 
 function clearSingletonArtifacts(userDataDir) {
@@ -237,6 +256,8 @@ async function main() {
   const userDataDir = String(args["user-data-dir"] || path.join(os.homedir(), ".config", "google-chrome"));
   const timeoutMs = Math.max(5000, parseInt(String(args["timeout-ms"] || "60000"), 10) || 60000);
   const headless = String(args.headless || "false").toLowerCase() === "true";
+  const threadFile = String(args["thread-file"] || "").trim();
+  const followup = String(args.followup || "").trim();
 
   const startedAt = nowEpoch();
   const result = mkResult(site, startedAt);
@@ -276,8 +297,28 @@ async function main() {
 
   try {
     const page = context.pages()[0] || (await context.newPage());
-    await page.goto(cfg.url, { waitUntil: "domcontentloaded", timeout: timeoutMs });
+    let targetUrl = cfg.url;
+    if (threadFile && site === "chatgpt") {
+      try {
+        if (fs.existsSync(threadFile)) {
+          const saved = String(fs.readFileSync(threadFile, "utf-8") || "").trim();
+          if (/^https:\/\/chatgpt\.com\/c\//.test(saved)) targetUrl = saved;
+        }
+      } catch {
+        // non-fatal
+      }
+    }
+
+    await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: timeoutMs });
     await page.waitForTimeout(900);
+
+    // If we're not logged in, fail fast. These UIs often render an input even when logged out,
+    // but sending won't reliably work and tends to hang until timeout.
+    if (await detectSelectorAny(page, cfg.loginSelectors)) {
+      const cap = await safeScreenshot(page, site);
+      console.log(JSON.stringify(finish(result, "login_required", false, "", cap.path || cap.error), null, 2));
+      return;
+    }
 
     if (
       (await detectSelectorAny(page, [
@@ -297,10 +338,9 @@ async function main() {
     const baseline = await extractLastResponseText(page, cfg.responseSelectors);
     const input = await firstVisibleLocator(page, cfg.inputSelectors, Math.min(timeoutMs, 9000));
     if (!input) {
-      const shot = screenshotPath(site);
-      await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
+      const cap = await safeScreenshot(page, site);
       const status = (await detectSelectorAny(page, cfg.loginSelectors)) ? "login_required" : "selector_changed";
-      console.log(JSON.stringify(finish(result, status, false, "", shot), null, 2));
+      console.log(JSON.stringify(finish(result, status, false, "", cap.path || cap.error), null, 2));
       return;
     }
 
@@ -324,27 +364,92 @@ async function main() {
       sent = true;
     }
 
-    const responseText = await waitForFreshResponse(page, cfg.responseSelectors, baseline, timeoutMs);
+    const responseText = await waitForFreshResponse(
+      page,
+      cfg.responseSelectors,
+      baseline,
+      timeoutMs,
+      cfg.minResponseLen || 1
+    );
     if (!responseText) {
-      const shot = screenshotPath(site);
-      await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
+      const cap = await safeScreenshot(page, site);
       const status = (await detectSelectorAny(page, cfg.loginSelectors)) ? "login_required" : "timeout";
-      console.log(JSON.stringify(finish(result, status, false, "", shot), null, 2));
+      console.log(JSON.stringify(finish(result, status, false, "", cap.path || cap.error), null, 2));
       return;
     }
 
+    const turns = [{ prompt, text: responseText }];
+
+    if (threadFile && site === "chatgpt") {
+      try {
+        const current = String(page.url() || "").trim();
+        if (/^https:\/\/chatgpt\.com\/c\//.test(current)) {
+          fs.mkdirSync(path.dirname(threadFile), { recursive: true });
+          fs.writeFileSync(threadFile, current, "utf-8");
+        }
+      } catch {
+        // ignore thread save failures
+      }
+    }
+
+    if (followup) {
+      const baseline2 = responseText;
+      await page.waitForTimeout(600);
+      const input2 = await firstVisibleLocator(page, cfg.inputSelectors, Math.min(timeoutMs, 9000));
+      if (!input2) {
+        const cap = await safeScreenshot(page, site);
+        result.turns = turns;
+        console.log(JSON.stringify(finish(result, "selector_changed", false, "", cap.path || cap.error), null, 2));
+        return;
+      }
+      await writePrompt(page, input2, followup);
+      let sent2 = false;
+      for (const sel of cfg.sendSelectors) {
+        try {
+          const btn = page.locator(sel).first();
+          if ((await btn.count()) > 0 && (await btn.isVisible())) {
+            await btn.click({ force: true, timeout: 1500 });
+            sent2 = true;
+            break;
+          }
+        } catch {}
+      }
+      if (!sent2) await page.keyboard.press("Enter");
+
+      const response2 = await waitForFreshResponse(
+        page,
+        cfg.responseSelectors,
+        baseline2,
+        timeoutMs,
+        cfg.minResponseLen || 1
+      );
+      if (!response2) {
+        const cap = await safeScreenshot(page, site);
+        const status = (await detectSelectorAny(page, cfg.loginSelectors)) ? "login_required" : "timeout";
+        result.turns = turns;
+        console.log(JSON.stringify(finish(result, status, false, "", cap.path || cap.error), null, 2));
+        return;
+      }
+      turns.push({ prompt: followup, text: response2 });
+      result.turns = turns;
+      console.log(JSON.stringify(finish(result, "ok", true, response2), null, 2));
+      return;
+    }
+
+    result.turns = turns;
     console.log(JSON.stringify(finish(result, "ok", true, responseText), null, 2));
   } catch (err) {
     const raw = String(err && err.message ? err.message : err);
     const status = /timeout/i.test(raw) ? "timeout" : "blocked";
-    const shot = screenshotPath(site);
+    let evidence = raw.slice(0, 500);
     try {
       const p = context.pages()[0];
-      if (p) await p.screenshot({ path: shot, fullPage: true });
-    } catch {
-      // ignore screenshot errors on crash
-    }
-    console.log(JSON.stringify(finish(result, status, false, "", shot || raw.slice(0, 500)), null, 2));
+      if (p) {
+        const cap = await safeScreenshot(p, site);
+        evidence = cap.path || cap.error || evidence;
+      }
+    } catch {}
+    console.log(JSON.stringify(finish(result, status, false, "", evidence), null, 2));
   } finally {
     await context.close().catch(() => {});
   }
