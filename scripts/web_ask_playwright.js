@@ -258,6 +258,7 @@ async function main() {
   const headless = String(args.headless || "false").toLowerCase() === "true";
   const threadFile = String(args["thread-file"] || "").trim();
   const followup = String(args.followup || "").trim();
+  const followup2 = String(args.followup2 || "").trim();
 
   const startedAt = nowEpoch();
   const result = mkResult(site, startedAt);
@@ -431,6 +432,52 @@ async function main() {
         return;
       }
       turns.push({ prompt: followup, text: response2 });
+
+      if (followup2) {
+        const baseline3 = response2;
+        await page.waitForTimeout(600);
+        const input3 = await firstVisibleLocator(page, cfg.inputSelectors, Math.min(timeoutMs, 9000));
+        if (!input3) {
+          const cap = await safeScreenshot(page, site);
+          const status = (await detectSelectorAny(page, cfg.loginSelectors)) ? "login_required" : "selector_changed";
+          result.turns = turns;
+          console.log(JSON.stringify(finish(result, status, false, "", cap.path || cap.error), null, 2));
+          return;
+        }
+        await writePrompt(page, input3, followup2);
+        let sent3 = false;
+        for (const sel of cfg.sendSelectors) {
+          try {
+            const btn = page.locator(sel).first();
+            if ((await btn.count()) > 0 && (await btn.isVisible())) {
+              await btn.click({ force: true, timeout: 1500 });
+              sent3 = true;
+              break;
+            }
+          } catch {}
+        }
+        if (!sent3) await page.keyboard.press("Enter");
+
+        const response3 = await waitForFreshResponse(
+          page,
+          cfg.responseSelectors,
+          baseline3,
+          timeoutMs,
+          cfg.minResponseLen || 1
+        );
+        if (!response3) {
+          const cap = await safeScreenshot(page, site);
+          const status = (await detectSelectorAny(page, cfg.loginSelectors)) ? "login_required" : "timeout";
+          result.turns = turns;
+          console.log(JSON.stringify(finish(result, status, false, "", cap.path || cap.error), null, 2));
+          return;
+        }
+        turns.push({ prompt: followup2, text: response3 });
+        result.turns = turns;
+        console.log(JSON.stringify(finish(result, "ok", true, response3), null, 2));
+        return;
+      }
+
       result.turns = turns;
       console.log(JSON.stringify(finish(result, "ok", true, response2), null, 2));
       return;

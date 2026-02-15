@@ -179,7 +179,7 @@ def _log_web_ask(event: dict) -> None:
         return
 
 
-def extract_web_ask_request(message: str) -> tuple[str, str, str | None] | None:
+def extract_web_ask_request(message: str) -> tuple[str, str, str | None, str | None] | None:
     msg = (message or "").strip()
     dialog_patterns = [
         r"(?:dialoga|dialogá|dialogue|dialogar)\s+(?:con\s+)?(chatgpt|chat gpt|gemini)\s*[:,-]?\s*(.+)$",
@@ -194,7 +194,8 @@ def extract_web_ask_request(message: str) -> tuple[str, str, str | None] | None:
             continue
         site_key = "chatgpt" if "chat" in provider else "gemini"
         followup = "En base a tu respuesta anterior, resumila en 1 frase y listá 3 conceptos clave."
-        return site_key, prompt, followup
+        followup2 = "Ahora: proponé 2 preguntas de seguimiento y respondelas en forma breve (2-4 líneas cada una)."
+        return site_key, prompt, followup, followup2
 
     patterns = [
         r"(?:preguntale|preguntále|preguntale|pregunta|consultale|consúltale|consulta|decile|decirle)\s+(?:a\s+)?(chatgpt|chat gpt|gemini)\s*[:,-]?\s*(.+)$",
@@ -209,7 +210,7 @@ def extract_web_ask_request(message: str) -> tuple[str, str, str | None] | None:
         if not prompt:
             continue
         site_key = "chatgpt" if "chat" in provider else "gemini"
-        return site_key, prompt, None
+        return site_key, prompt, None, None
     return None
 
 
@@ -231,7 +232,9 @@ def bootstrap_login(site_key: str) -> tuple[bool, str]:
         return False, str(e)
 
 
-def run_web_ask(site_key: str, prompt: str, timeout_ms: int = 60000, followup: str | None = None) -> dict:
+def run_web_ask(
+    site_key: str, prompt: str, timeout_ms: int = 60000, followup: str | None = None, followup2: str | None = None
+) -> dict:
     started = time.time()
     browser, profile = _resolve_site_browser_config(site_key)
     if browser != "chrome":
@@ -301,6 +304,8 @@ def run_web_ask(site_key: str, prompt: str, timeout_ms: int = 60000, followup: s
         ]
         if followup:
             cmd.extend(["--followup", followup])
+        if followup2:
+            cmd.extend(["--followup2", followup2])
 
         WEB_ASK_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
         try:

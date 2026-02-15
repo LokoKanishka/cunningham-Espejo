@@ -593,9 +593,19 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         # if someone only enabled firefox (old UI), still allow web_ask.
         if ("web_ask" not in allowed_tools) and ("firefox" not in allowed_tools):
             return {"reply": "La herramienta local 'web_ask' está deshabilitada en esta sesión."}
-        site_key, prompt, followup = web_req
-        result = web_ask.run_web_ask(site_key, prompt, timeout_ms=60000, followup=followup)
-        return {"reply": web_ask.format_web_ask_reply(site_key, prompt, result)}
+        site_key, prompt, followup, followup2 = web_req
+        result = web_ask.run_web_ask(site_key, prompt, timeout_ms=60000, followup=followup, followup2=followup2)
+        reply = web_ask.format_web_ask_reply(site_key, prompt, result)
+        if str(result.get("status", "")).strip() == "login_required":
+            ok, info = web_ask.bootstrap_login(site_key)
+            if ok:
+                reply += (
+                    "\n\nAcción automática: abrí una ventana de Chrome (shadow profile) para que inicies sesión. "
+                    "Logueate ahí y cerrá esa ventana. Luego repetí tu pedido."
+                )
+            else:
+                reply += f"\n\nNo pude abrir ventana de login automáticamente: {info}"
+        return {"reply": reply}
 
     if "firefox" in text and any(k in normalized for k in ("abr", "open", "lanz", "inici")):
         if "firefox" not in allowed_tools:
