@@ -70,11 +70,43 @@ if [[ -z "$CHROME_BIN" ]]; then
   exit 1
 fi
 
+# Best-effort: keep the login window on the current workspace so we don't spawn across desktops.
+target_desktop=""
+before_ids=""
+if command -v wmctrl >/dev/null 2>&1; then
+  target_desktop="$(wmctrl -d | awk '$2=="*"{print $1; exit}')"
+  before_ids="$(wmctrl -l | awk '{print $1}')"
+fi
+
 "$CHROME_BIN" \
   --user-data-dir="$DST_ROOT" \
   --profile-directory="$PROFILE_DIR" \
   --new-window \
+  --class=web_ask_shadow \
   "$URL" >/dev/null 2>&1 &
+
+if command -v wmctrl >/dev/null 2>&1 && [[ -n "$target_desktop" ]]; then
+  # Poll briefly for the new window id, then move it to the current desktop and focus it.
+  for _ in {1..50}; do
+    sleep 0.1
+    after_ids="$(wmctrl -l | awk '{print $1}')"
+    new_ids="$(comm -13 <(printf "%s\n" "$before_ids" | sort) <(printf "%s\n" "$after_ids" | sort) || true)"
+    wid="$(wmctrl -l | awk -v site="$SITE" '
+      BEGIN { IGNORECASE=1 }
+      { id=$1; $1=$2=$3=""; title=$0 }
+      (site=="chatgpt" && title ~ /chatgpt|chatgpt\\.com/) { print id; exit }
+      (site=="gemini" && title ~ /gemini|gemini\\.google\\.com/) { print id; exit }
+    ')"
+    if [[ -z "$wid" ]]; then
+      wid="$(printf "%s\n" "$new_ids" | head -n 1)"
+    fi
+    if [[ -n "$wid" ]]; then
+      wmctrl -i -r "$wid" -t "$target_desktop" >/dev/null 2>&1 || true
+      wmctrl -i -a "$wid" >/dev/null 2>&1 || true
+      break
+    fi
+  done
+fi
 
 echo "WEB_ASK_BOOTSTRAP_OK site=$SITE profile_name=$PROFILE_NAME profile_dir=$PROFILE_DIR url=$URL"
 echo "Iniciá sesión en esa ventana (si hace falta) y luego cerrala."
