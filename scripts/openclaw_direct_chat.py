@@ -21,6 +21,8 @@ from molbot_direct_chat.util import extract_url as _extract_url
 from molbot_direct_chat.util import normalize_text as _normalize_text
 from molbot_direct_chat.util import safe_session_id as _safe_session_id
 
+_VRAM_CACHE = {"ts": 0.0, "data": None}
+
 
 HISTORY_DIR = Path.home() / ".openclaw" / "direct_chat_histories"
 HISTORY_DIR.mkdir(parents=True, exist_ok=True)
@@ -226,6 +228,72 @@ def _reset_recorded_browser_windows(session_id: str) -> None:
 def _looks_like_open_request(normalized: str) -> bool:
     tokens = ("abr", "abri", "abir", "abrir", "open", "entra", "entrar", "ir a", "lanz", "inici")
     return any(t in normalized for t in tokens)
+
+def _read_meminfo() -> dict:
+    out = {}
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            parts = line.split(":")
+            if len(parts) < 2:
+                continue
+            key = parts[0].strip()
+            val = parts[1].strip().split()[0]
+            if val.isdigit():
+                out[key] = int(val)  # kB
+    except Exception:
+        return {}
+    return out
+
+
+def _proc_rss_mb(pid: int) -> float | None:
+    try:
+        statm = Path(f"/proc/{pid}/statm").read_text(encoding="utf-8").split()
+        if len(statm) < 2:
+            return None
+        rss_pages = int(statm[1])
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        return (rss_pages * page_size) / (1024 * 1024)
+    except Exception:
+        return None
+
+
+def _read_vram_nvidia() -> dict | None:
+    # Cache for a few seconds to avoid hammering nvidia-smi.
+    now = time.time()
+    if (now - float(_VRAM_CACHE.get("ts", 0.0) or 0.0)) < 4.0:
+        return _VRAM_CACHE.get("data")
+
+    smi = shutil.which("nvidia-smi")
+    if not smi:
+        _VRAM_CACHE["ts"] = now
+        _VRAM_CACHE["data"] = None
+        return None
+    try:
+        proc = subprocess.run(
+            [
+                smi,
+                "--query-gpu=memory.used,memory.total,name",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=1.5,
+        )
+        line = (proc.stdout or "").strip().splitlines()[:1]
+        if not line:
+            raise RuntimeError("empty")
+        parts = [p.strip() for p in line[0].split(",")]
+        used = float(parts[0])
+        total = float(parts[1])
+        name = parts[2] if len(parts) > 2 else ""
+        data = {"used_mb": used, "total_mb": total, "name": name}
+        _VRAM_CACHE["ts"] = now
+        _VRAM_CACHE["data"] = data
+        return data
+    except Exception:
+        _VRAM_CACHE["ts"] = now
+        _VRAM_CACHE["data"] = None
+        return None
 
 
 
@@ -671,6 +739,22 @@ def load_gateway_token() -> str:
 class Handler(BaseHTTPRequestHandler):
     server_version = "MolbotDirectChat/2.0"
 
+    def _metrics_payload(self) -> dict:
+        pid = os.getpid()
+        rss_mb = _proc_rss_mb(pid)
+        mem = _read_meminfo()
+        mem_total_mb = (mem.get("MemTotal", 0) / 1024.0) if mem else None
+        mem_avail_mb = (mem.get("MemAvailable", 0) / 1024.0) if mem else None
+        mem_used_mb = (mem_total_mb - mem_avail_mb) if (mem_total_mb is not None and mem_avail_mb is not None) else None
+        vram = _read_vram_nvidia()
+
+        return {
+            "ts": time.time(),
+            "proc": {"pid": pid, "rss_mb": rss_mb},
+            "sys": {"ram_total_mb": mem_total_mb, "ram_used_mb": mem_used_mb, "ram_avail_mb": mem_avail_mb},
+            "gpu": {"vram": vram},
+        }
+
     def _json(self, status: int, payload: dict):
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         try:
@@ -710,6 +794,10 @@ class Handler(BaseHTTPRequestHandler):
             query = parse_qs(parsed.query)
             sid = _safe_session_id((query.get("session", ["default"])[0]))
             self._json(200, {"session_id": sid, "history": _load_history(sid)})
+            return
+
+        if path == "/api/metrics":
+            self._json(200, self._metrics_payload())
             return
 
         self.send_response(404)

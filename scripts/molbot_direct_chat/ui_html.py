@@ -63,6 +63,16 @@ HTML = r"""<!doctype html>
       font-size: 13px;
     }
     .tools label { display: inline-flex; gap: 6px; align-items: center; }
+    .meter {
+      font-size: 12px;
+      color: var(--muted);
+      border: 1px solid var(--border);
+      background: rgba(18, 24, 49, 0.85);
+      border-radius: 999px;
+      padding: 6px 10px;
+      white-space: nowrap;
+    }
+    .meter strong { color: var(--text); font-weight: 700; }
     .chat {
       padding: 14px;
       overflow: auto;
@@ -115,16 +125,17 @@ HTML = r"""<!doctype html>
 </head>
 <body>
   <div class="app">
-    <div class="top">
-      <div>
-        <div class="title">Molbot Direct Chat</div>
-        <div class="meta">Sin doble capa. OpenClaw directo.</div>
-      </div>
-      <div class="row">
-        <input id="model" value="openai-codex/gpt-5.1-codex-mini" style="min-width:260px" />
-        <select id="mode">
-          <option value="conciso">conciso</option>
-          <option value="operativo" selected>operativo</option>
+	    <div class="top">
+	      <div>
+	        <div class="title">Molbot Direct Chat</div>
+	        <div class="meta">Sin doble capa. OpenClaw directo.</div>
+	      </div>
+	      <div class="row">
+	        <div class="meter" id="meter">RAM: <strong>...</strong> | Proc: <strong>...</strong> | VRAM: <strong>...</strong></div>
+	        <input id="model" value="openai-codex/gpt-5.1-codex-mini" style="min-width:260px" />
+	        <select id="mode">
+	          <option value="conciso">conciso</option>
+	          <option value="operativo" selected>operativo</option>
           <option value="investigacion">investigacion</option>
         </select>
         <button class="alt" id="newSession">Nueva sesion</button>
@@ -177,15 +188,42 @@ HTML = r"""<!doctype html>
 	    const useStreamEl = document.getElementById("useStream");
     const btnFirefoxEl = document.getElementById("btnFirefox");
     const btnDesktopEl = document.getElementById("btnDesktop");
-    const attachEl = document.getElementById("attach");
-    const attachInfoEl = document.getElementById("attachInfo");
+	    const attachEl = document.getElementById("attach");
+	    const attachInfoEl = document.getElementById("attachInfo");
+	    const meterEl = document.getElementById("meter");
 
     const SESSION_KEY = "molbot_direct_chat_session_id";
     let sessionId = localStorage.getItem(SESSION_KEY) || crypto.randomUUID();
     localStorage.setItem(SESSION_KEY, sessionId);
 
-    let history = [];
-    let pendingAttachments = [];
+	    let history = [];
+	    let pendingAttachments = [];
+
+	    function fmtMb(mb) {
+	      if (mb == null || Number.isNaN(mb)) return "?";
+	      if (mb > 1024) return (mb / 1024).toFixed(1) + " GB";
+	      return Math.round(mb) + " MB";
+	    }
+
+	    async function refreshMeter() {
+	      try {
+	        const r = await fetch("/api/metrics");
+	        const j = await r.json();
+	        const sys = j.sys || {};
+	        const proc = j.proc || {};
+	        const gpu = (j.gpu || {}).vram;
+
+	        const ram = `${fmtMb(sys.ram_used_mb)}/${fmtMb(sys.ram_total_mb)}`;
+	        const pr = fmtMb(proc.rss_mb);
+	        let vram = "N/A";
+	        if (gpu && gpu.total_mb != null) {
+	          vram = `${fmtMb(gpu.used_mb)}/${fmtMb(gpu.total_mb)}`;
+	        }
+	        meterEl.innerHTML = `RAM: <strong>${ram}</strong> | Proc: <strong>${pr}</strong> | VRAM: <strong>${vram}</strong>`;
+	      } catch {
+	        // keep last value
+	      }
+	    }
 
 	    function allowedTools() {
 	      const out = [];
@@ -431,6 +469,8 @@ HTML = r"""<!doctype html>
     exportTxtEl.addEventListener("click", exportTxt);
 
     loadServerHistory().then(() => inputEl.focus());
+    refreshMeter();
+    setInterval(refreshMeter, 2000);
   </script>
 </body>
 </html>
