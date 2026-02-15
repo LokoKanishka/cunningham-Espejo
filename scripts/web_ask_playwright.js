@@ -1,0 +1,367 @@
+#!/usr/bin/env node
+"use strict";
+
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const { chromium } = require("playwright");
+
+const SITE_CONFIG = {
+  chatgpt: {
+    url: "https://chatgpt.com/",
+    inputSelectors: [
+      "#prompt-textarea",
+      "textarea[data-id]",
+      "textarea[placeholder*='Message']",
+      "textarea",
+      "div[contenteditable='true'][data-id]",
+      "div[contenteditable='true']",
+    ],
+    sendSelectors: [
+      "button[data-testid='send-button']",
+      "button[aria-label*='Send']",
+      "button:has(svg)",
+    ],
+    responseSelectors: [
+      "[data-message-author-role='assistant']",
+      "article [data-message-author-role='assistant']",
+      "article div.markdown",
+      "div.markdown",
+    ],
+    loginSelectors: [
+      "input[type='password']",
+      "button:has-text('Log in')",
+      "a:has-text('Log in')",
+      "button:has-text('Iniciar sesión')",
+      "a:has-text('Iniciar sesión')",
+    ],
+  },
+  gemini: {
+    url: "https://gemini.google.com/app",
+    inputSelectors: [
+      "rich-textarea div[contenteditable='true']",
+      "div[contenteditable='true'][aria-label*='Mensaje']",
+      "div[contenteditable='true'][aria-label*='Message']",
+      "textarea[aria-label*='Gemini']",
+      "div[contenteditable='true']",
+      "textarea",
+    ],
+    sendSelectors: [
+      "button[aria-label*='Enviar']",
+      "button[aria-label*='Send']",
+      "button:has(mat-icon)",
+      "button.send-button",
+    ],
+    responseSelectors: [
+      "model-response .markdown",
+      "model-response",
+      "message-content",
+      ".response-content",
+      "div.markdown",
+    ],
+    loginSelectors: [
+      "input[type='password']",
+      "button:has-text('Iniciar sesión')",
+      "a:has-text('Iniciar sesión')",
+      "button:has-text('Sign in')",
+      "a:has-text('Sign in')",
+    ],
+  },
+};
+
+function parseArgs(argv) {
+  const out = {};
+  for (let i = 2; i < argv.length; i += 1) {
+    const token = argv[i];
+    if (!token.startsWith("--")) continue;
+    const key = token.slice(2);
+    const next = argv[i + 1];
+    if (next && !next.startsWith("--")) {
+      out[key] = next;
+      i += 1;
+    } else {
+      out[key] = "true";
+    }
+  }
+  return out;
+}
+
+function nowEpoch() {
+  return Date.now() / 1000;
+}
+
+function mkResult(site, startedAt) {
+  return {
+    ok: false,
+    text: "",
+    status: "error",
+    evidence: "",
+    timings: {
+      start: startedAt,
+      end: startedAt,
+      duration: 0,
+    },
+    meta: {
+      site,
+    },
+  };
+}
+
+function finish(result, status, ok, text = "", evidence = "") {
+  const ended = nowEpoch();
+  result.ok = ok;
+  result.status = status;
+  result.text = text;
+  result.evidence = evidence;
+  result.timings.end = ended;
+  result.timings.duration = Number((ended - result.timings.start).toFixed(3));
+  return result;
+}
+
+async function firstVisibleLocator(page, selectors, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    for (const sel of selectors) {
+      const loc = page.locator(sel).first();
+      try {
+        if ((await loc.count()) > 0 && (await loc.isVisible())) {
+          return loc;
+        }
+      } catch {
+        // continue trying selector list
+      }
+    }
+    await page.waitForTimeout(180);
+  }
+  return null;
+}
+
+async function detectSelectorAny(page, selectors) {
+  for (const sel of selectors) {
+    try {
+      if ((await page.locator(sel).count()) > 0) return true;
+    } catch {
+      // ignore invalid selector on runtime
+    }
+  }
+  return false;
+}
+
+async function writePrompt(page, inputLocator, prompt) {
+  await inputLocator.scrollIntoViewIfNeeded();
+  await inputLocator.click({ force: true });
+  await page.keyboard.press("Control+A");
+  await page.keyboard.press("Backspace");
+
+  try {
+    await inputLocator.fill(prompt);
+    return;
+  } catch {
+    await page.keyboard.type(prompt, { delay: 12 });
+  }
+}
+
+function normalizeText(raw) {
+  return String(raw || "").replace(/\s+/g, " ").trim();
+}
+
+async function extractLastResponseText(page, selectors) {
+  let best = "";
+  for (const sel of selectors) {
+    try {
+      const count = await page.locator(sel).count();
+      if (count < 1) continue;
+      const last = page.locator(sel).nth(count - 1);
+      const txt = normalizeText(await last.innerText());
+      if (txt.length > best.length) best = txt;
+    } catch {
+      // keep trying selector candidates
+    }
+  }
+  return best;
+}
+
+async function waitForFreshResponse(page, selectors, baseline, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let stableHits = 0;
+  let candidate = "";
+
+  while (Date.now() < deadline) {
+    const latest = await extractLastResponseText(page, selectors);
+    if (latest && latest !== baseline && latest.length >= 24) {
+      if (latest === candidate) {
+        stableHits += 1;
+      } else {
+        candidate = latest;
+        stableHits = 1;
+      }
+      if (stableHits >= 2) {
+        return latest;
+      }
+    }
+    await page.waitForTimeout(900);
+  }
+
+  return "";
+}
+
+function screenshotPath(site) {
+  const outDir = path.join(os.homedir(), ".openclaw", "logs", "web_ask_screens");
+  fs.mkdirSync(outDir, { recursive: true });
+  return path.join(outDir, `${site}_${Date.now()}.png`);
+}
+
+function clearSingletonArtifacts(userDataDir) {
+  const targets = [
+    "SingletonCookie",
+    "SingletonLock",
+    "SingletonSocket",
+    "lockfile",
+    "LOCK",
+  ];
+  for (const name of targets) {
+    const p = path.join(userDataDir, name);
+    try {
+      fs.rmSync(p, { force: true, recursive: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  }
+}
+
+async function main() {
+  const args = parseArgs(process.argv);
+  const site = String(args.site || "").trim().toLowerCase();
+  const prompt = String(args.prompt || "").trim();
+  const profileDir = String(args["profile-dir"] || "Default");
+  const userDataDir = String(args["user-data-dir"] || path.join(os.homedir(), ".config", "google-chrome"));
+  const timeoutMs = Math.max(5000, parseInt(String(args["timeout-ms"] || "60000"), 10) || 60000);
+  const headless = String(args.headless || "false").toLowerCase() === "true";
+
+  const startedAt = nowEpoch();
+  const result = mkResult(site, startedAt);
+  const cfg = SITE_CONFIG[site];
+  if (!cfg) {
+    console.log(JSON.stringify(finish(result, "unsupported_site", false), null, 2));
+    process.exit(2);
+  }
+  if (!prompt) {
+    console.log(JSON.stringify(finish(result, "missing_prompt", false), null, 2));
+    process.exit(2);
+  }
+
+  let context;
+  clearSingletonArtifacts(userDataDir);
+  try {
+    context = await chromium.launchPersistentContext(userDataDir, {
+      channel: "chrome",
+      headless,
+      viewport: null,
+      args: [
+        `--profile-directory=${profileDir}`,
+        "--no-first-run",
+        "--no-default-browser-check",
+      ],
+    });
+  } catch (err) {
+    const raw = String(err && err.message ? err.message : err);
+    const lower = raw.toLowerCase();
+    const status =
+      lower.includes("lock") || lower.includes("singleton")
+        ? "profile_locked"
+        : "launch_failed";
+    console.log(JSON.stringify(finish(result, status, false, "", raw.slice(0, 500)), null, 2));
+    process.exit(3);
+  }
+
+  try {
+    const page = context.pages()[0] || (await context.newPage());
+    await page.goto(cfg.url, { waitUntil: "domcontentloaded", timeout: timeoutMs });
+    await page.waitForTimeout(900);
+
+    if (
+      (await detectSelectorAny(page, [
+        "iframe[src*='captcha']",
+        "iframe[title*='captcha']",
+        "div.g-recaptcha",
+        "text=/captcha/i",
+      ])) ||
+      /captcha/i.test(await page.title().catch(() => ""))
+    ) {
+      const shot = screenshotPath(site);
+      await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
+      console.log(JSON.stringify(finish(result, "captcha_required", false, "", shot), null, 2));
+      return;
+    }
+
+    const baseline = await extractLastResponseText(page, cfg.responseSelectors);
+    const input = await firstVisibleLocator(page, cfg.inputSelectors, Math.min(timeoutMs, 9000));
+    if (!input) {
+      const shot = screenshotPath(site);
+      await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
+      const status = (await detectSelectorAny(page, cfg.loginSelectors)) ? "login_required" : "selector_changed";
+      console.log(JSON.stringify(finish(result, status, false, "", shot), null, 2));
+      return;
+    }
+
+    await writePrompt(page, input, prompt);
+
+    let sent = false;
+    for (const sel of cfg.sendSelectors) {
+      try {
+        const btn = page.locator(sel).first();
+        if ((await btn.count()) > 0 && (await btn.isVisible())) {
+          await btn.click({ force: true, timeout: 1500 });
+          sent = true;
+          break;
+        }
+      } catch {
+        // fallback to keyboard
+      }
+    }
+    if (!sent) {
+      await page.keyboard.press("Enter");
+      sent = true;
+    }
+
+    const responseText = await waitForFreshResponse(page, cfg.responseSelectors, baseline, timeoutMs);
+    if (!responseText) {
+      const shot = screenshotPath(site);
+      await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
+      const status = (await detectSelectorAny(page, cfg.loginSelectors)) ? "login_required" : "timeout";
+      console.log(JSON.stringify(finish(result, status, false, "", shot), null, 2));
+      return;
+    }
+
+    console.log(JSON.stringify(finish(result, "ok", true, responseText), null, 2));
+  } catch (err) {
+    const raw = String(err && err.message ? err.message : err);
+    const status = /timeout/i.test(raw) ? "timeout" : "blocked";
+    const shot = screenshotPath(site);
+    try {
+      const p = context.pages()[0];
+      if (p) await p.screenshot({ path: shot, fullPage: true });
+    } catch {
+      // ignore screenshot errors on crash
+    }
+    console.log(JSON.stringify(finish(result, status, false, "", shot || raw.slice(0, 500)), null, 2));
+  } finally {
+    await context.close().catch(() => {});
+  }
+}
+
+main().catch((err) => {
+  const fallback = {
+    ok: false,
+    text: "",
+    status: "internal_error",
+    evidence: String(err && err.message ? err.message : err),
+    timings: {
+      start: nowEpoch(),
+      end: nowEpoch(),
+      duration: 0,
+    },
+  };
+  console.log(JSON.stringify(fallback, null, 2));
+  process.exit(1);
+});

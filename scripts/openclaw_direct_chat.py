@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -52,6 +53,9 @@ DEFAULT_BROWSER_PROFILE_CONFIG = {
     "chatgpt": {"browser": "chrome", "profile": "Chat"},
     "youtube": {"browser": "chrome", "profile": "diego"},
 }
+WEB_ASK_SCRIPT_PATH = Path(__file__).with_name("web_ask_playwright.js")
+WEB_ASK_LOG_PATH = Path.home() / ".openclaw" / "logs" / "web_ask.log"
+WEB_ASK_LOCK_PATH = Path.home() / ".openclaw" / "web_ask_shadow" / ".web_ask.lock"
 
 
 HTML = r"""<!doctype html>
@@ -658,6 +662,272 @@ def _build_site_search_url(site_key: str, query: str) -> str | None:
     return template.format(q=quote_plus(query))
 
 
+def _resolve_site_browser_config(site_key: str) -> tuple[str, str]:
+    cfg = _load_browser_profile_config()
+    site_cfg = cfg.get(site_key, {})
+    if not site_cfg:
+        site_cfg = cfg.get("_default", {})
+
+    browser = str(site_cfg.get("browser", "")).lower().strip() or "chrome"
+    profile = _resolve_chrome_profile_directory(str(site_cfg.get("profile", "")).strip() or "Default")
+    return browser, profile
+
+
+def _prepare_shadow_chrome_user_data(profile_dir: str) -> tuple[str, str | None]:
+    src_root = Path.home() / ".config" / "google-chrome"
+    src_profile = src_root / profile_dir
+    if not src_root.exists() or not src_profile.exists():
+        return str(src_root), "source_profile_missing"
+
+    dst_root = Path.home() / ".openclaw" / "web_ask_shadow" / "google-chrome"
+    dst_profile = dst_root / profile_dir
+    dst_root.mkdir(parents=True, exist_ok=True)
+    dst_profile.parent.mkdir(parents=True, exist_ok=True)
+
+    local_state_src = src_root / "Local State"
+    local_state_dst = dst_root / "Local State"
+    try:
+        if local_state_src.exists():
+            shutil.copy2(local_state_src, local_state_dst)
+    except Exception:
+        # non-fatal: playwright can still launch without latest Local State
+        pass
+
+    rsync = shutil.which("rsync")
+    if rsync:
+        cmd = [
+            rsync,
+            "-a",
+            "--delete",
+            "--exclude=Cache/",
+            "--exclude=Code Cache/",
+            "--exclude=GPUCache/",
+            "--exclude=GrShaderCache/",
+            "--exclude=ShaderCache/",
+            "--exclude=Service Worker/CacheStorage/",
+            "--exclude=Crashpad/",
+            "--exclude=BrowserMetrics/",
+            "--exclude=Session Storage/",
+            "--exclude=Sessions/",
+            f"{src_profile}/",
+            f"{dst_profile}/",
+        ]
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return str(dst_root), None
+        except Exception:
+            # fallback to shutil copytree below
+            pass
+
+    try:
+        if dst_profile.exists():
+            shutil.rmtree(dst_profile)
+        shutil.copytree(src_profile, dst_profile)
+        return str(dst_root), None
+    except Exception as e:
+        return str(src_root), f"shadow_copy_failed:{e}"
+
+
+def _parse_json_object(raw: str) -> dict | None:
+    data = (raw or "").strip()
+    if not data:
+        return None
+    try:
+        parsed = json.loads(data)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        pass
+
+    start = data.find("{")
+    end = data.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            parsed = json.loads(data[start : end + 1])
+            return parsed if isinstance(parsed, dict) else None
+        except Exception:
+            return None
+    return None
+
+
+def _log_web_ask(event: dict) -> None:
+    try:
+        WEB_ASK_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(event, ensure_ascii=False)
+        with WEB_ASK_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        return
+
+
+def _extract_web_ask_request(message: str) -> tuple[str, str] | None:
+    msg = message.strip()
+    patterns = [
+        r"(?:preguntale|preguntále|preguntale|pregunta|consultale|consúltale|consulta|decile|decirle)\s+(?:a\s+)?(chatgpt|chat gpt|gemini)\s*[:,-]?\s*(.+)$",
+        r"^(chatgpt|chat gpt|gemini)\s*[:,-]\s*(.+)$",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, msg, flags=re.IGNORECASE | re.DOTALL)
+        if not m:
+            continue
+        provider = m.group(1).strip().lower()
+        prompt = m.group(2).strip().strip("\"'").strip()
+        if not prompt:
+            continue
+        site_key = "chatgpt" if "chat" in provider else "gemini"
+        return site_key, prompt
+    return None
+
+
+def _run_web_ask(site_key: str, prompt: str, timeout_ms: int = 60000) -> dict:
+    started = time.time()
+    browser, profile = _resolve_site_browser_config(site_key)
+    if browser != "chrome":
+        return {
+            "ok": False,
+            "status": "unsupported_browser",
+            "text": "",
+            "evidence": f"browser={browser}",
+            "timings": {"start": started, "end": time.time(), "duration": 0.0},
+        }
+
+    node = shutil.which("node")
+    if not node:
+        return {
+            "ok": False,
+            "status": "missing_runtime",
+            "text": "",
+            "evidence": "node_not_found",
+            "timings": {"start": started, "end": time.time(), "duration": 0.0},
+        }
+    if not WEB_ASK_SCRIPT_PATH.exists():
+        return {
+            "ok": False,
+            "status": "missing_script",
+            "text": "",
+            "evidence": str(WEB_ASK_SCRIPT_PATH),
+            "timings": {"start": started, "end": time.time(), "duration": 0.0},
+        }
+
+    shadow_user_data_dir, shadow_warn = _prepare_shadow_chrome_user_data(profile)
+
+    cmd = [
+        node,
+        str(WEB_ASK_SCRIPT_PATH),
+        "--site",
+        site_key,
+        "--prompt",
+        prompt,
+        "--profile-dir",
+        profile,
+        "--user-data-dir",
+        shadow_user_data_dir,
+        "--timeout-ms",
+        str(timeout_ms),
+        "--headless",
+        "false",
+    ]
+    WEB_ASK_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with WEB_ASK_LOCK_PATH.open("w", encoding="utf-8") as lockf:
+            fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=max(20, int(timeout_ms / 1000) + 20),
+            )
+    except subprocess.TimeoutExpired:
+        result = {
+            "ok": False,
+            "status": "timeout",
+            "text": "",
+            "evidence": "playwright_runner_timeout",
+            "timings": {"start": started, "end": time.time(), "duration": round(time.time() - started, 3)},
+        }
+        _log_web_ask({"ts": time.time(), "site": site_key, "status": result["status"], "prompt": prompt[:220], "result": result})
+        return result
+    except Exception as e:
+        result = {
+            "ok": False,
+            "status": "runner_error",
+            "text": "",
+            "evidence": str(e),
+            "timings": {"start": started, "end": time.time(), "duration": round(time.time() - started, 3)},
+        }
+        _log_web_ask({"ts": time.time(), "site": site_key, "status": result["status"], "prompt": prompt[:220], "result": result})
+        return result
+
+    payload = _parse_json_object(proc.stdout) or {}
+    if not payload:
+        payload = {
+            "ok": False,
+            "status": "invalid_output",
+            "text": "",
+            "evidence": (proc.stderr or proc.stdout or "").strip()[:800],
+            "timings": {"start": started, "end": time.time(), "duration": round(time.time() - started, 3)},
+        }
+
+    if "timings" not in payload or not isinstance(payload.get("timings"), dict):
+        payload["timings"] = {"start": started, "end": time.time(), "duration": round(time.time() - started, 3)}
+
+    payload["ok"] = bool(payload.get("ok", False))
+    payload["status"] = str(payload.get("status", "error"))
+    payload["text"] = str(payload.get("text", ""))
+    payload["evidence"] = str(payload.get("evidence", ""))
+    payload["runner_code"] = proc.returncode
+    if shadow_warn:
+        payload["shadow_warn"] = shadow_warn
+
+    _log_web_ask(
+        {
+            "ts": time.time(),
+            "site": site_key,
+            "status": payload["status"],
+            "ok": payload["ok"],
+            "runner_code": proc.returncode,
+            "prompt": prompt[:220],
+            "duration": payload.get("timings", {}).get("duration", None),
+            "evidence": payload.get("evidence", ""),
+            "shadow_user_data_dir": shadow_user_data_dir,
+            "shadow_warn": shadow_warn,
+        }
+    )
+    return payload
+
+
+def _format_web_ask_reply(site_key: str, prompt: str, result: dict) -> str:
+    provider = "ChatGPT" if site_key == "chatgpt" else "Gemini"
+    status = str(result.get("status", "error"))
+    duration = result.get("timings", {}).get("duration", "?")
+    if result.get("ok"):
+        text = str(result.get("text", "")).strip()
+        if not text:
+            text = "(respuesta vacía)"
+        if len(text) > 6000:
+            text = text[:6000] + "\n\n[...respuesta truncada por longitud...]"
+        return f"{provider} respondió:\n{text}\n\nEstado: ok ({duration}s)."
+
+    help_map = {
+        "login_required": f"No pude completar en {provider}: la sesión requiere login manual en ese sitio.",
+        "captcha_required": f"No pude completar en {provider}: apareció captcha/validación humana.",
+        "selector_changed": f"No pude completar en {provider}: cambió la UI y no encontré input/respuesta.",
+        "timeout": f"No pude completar en {provider}: timeout esperando respuesta.",
+        "profile_locked": f"No pude completar en {provider}: el perfil de Chrome está bloqueado por otra instancia.",
+        "launch_failed": f"No pude iniciar automatización de {provider}.",
+        "unsupported_browser": f"No pude completar en {provider}: el perfil configurado no usa Chrome.",
+        "missing_runtime": "No pude ejecutar automatización: falta runtime local de Node.js.",
+        "missing_script": "No pude ejecutar automatización: falta script local web_ask_playwright.js.",
+        "invalid_output": f"No pude completar en {provider}: salida inválida del runner.",
+        "blocked": f"No pude completar en {provider}: el sitio bloqueó o devolvió estado no esperado.",
+        "runner_error": f"No pude completar en {provider}: error interno del runner local.",
+    }
+    detail = str(result.get("evidence", "")).strip()
+    base = help_map.get(status, f"No pude completar en {provider}: estado '{status}'.")
+    if detail:
+        base += f"\nDetalle: {detail[:400]}"
+    return base + f"\nPrompt intentado: \"{prompt[:220]}\""
+
+
 def _safe_session_id(value: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9_-]", "", value)[:64]
     return cleaned or "default"
@@ -693,6 +963,14 @@ def _save_history(session_id: str, history: list) -> None:
 def _maybe_handle_local_action(message: str, allowed_tools: set[str]) -> dict | None:
     text = message.lower()
     normalized = _normalize_text(message)
+
+    web_req = _extract_web_ask_request(message)
+    if web_req is not None:
+        if "firefox" not in allowed_tools:
+            return {"reply": "La herramienta local 'firefox' está deshabilitada en esta sesión."}
+        site_key, prompt = web_req
+        result = _run_web_ask(site_key, prompt, timeout_ms=60000)
+        return {"reply": _format_web_ask_reply(site_key, prompt, result)}
 
     if "firefox" in text and any(k in normalized for k in ("abr", "open", "lanz", "inici")):
         if "firefox" not in allowed_tools:
