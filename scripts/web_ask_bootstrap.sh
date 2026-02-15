@@ -72,10 +72,12 @@ fi
 
 # Best-effort: keep the login window on the current workspace so we don't spawn across desktops.
 target_desktop=""
-before_ids=""
+shadow_pids_before=""
 if command -v wmctrl >/dev/null 2>&1; then
   target_desktop="$(wmctrl -d | awk '$2=="*"{print $1; exit}')"
-  before_ids="$(wmctrl -l | awk '{print $1}')"
+fi
+if command -v pgrep >/dev/null 2>&1; then
+  shadow_pids_before="$(pgrep -f -- "--user-data-dir=$DST_ROOT" || true)"
 fi
 
 "$CHROME_BIN" \
@@ -86,23 +88,34 @@ fi
   "$URL" >/dev/null 2>&1 &
 
 if command -v wmctrl >/dev/null 2>&1 && [[ -n "$target_desktop" ]]; then
-  # Poll briefly for the new window id, then move it to the current desktop and focus it.
+  # Prefer moving windows belonging to the shadow profile process(es).
   for _ in {1..50}; do
     sleep 0.1
-    after_ids="$(wmctrl -l | awk '{print $1}')"
-    new_ids="$(comm -13 <(printf "%s\n" "$before_ids" | sort) <(printf "%s\n" "$after_ids" | sort) || true)"
-    wid="$(wmctrl -l | awk -v site="$SITE" '
-      BEGIN { IGNORECASE=1 }
-      { id=$1; $1=$2=$3=""; title=$0 }
-      (site=="chatgpt" && title ~ /chatgpt|chatgpt\\.com/) { print id; exit }
-      (site=="gemini" && title ~ /gemini|gemini\\.google\\.com/) { print id; exit }
-    ')"
-    if [[ -z "$wid" ]]; then
-      wid="$(printf "%s\n" "$new_ids" | head -n 1)"
+    shadow_pids_after=""
+    if command -v pgrep >/dev/null 2>&1; then
+      shadow_pids_after="$(pgrep -f -- "--user-data-dir=$DST_ROOT" || true)"
     fi
-    if [[ -n "$wid" ]]; then
-      wmctrl -i -r "$wid" -t "$target_desktop" >/dev/null 2>&1 || true
-      wmctrl -i -a "$wid" >/dev/null 2>&1 || true
+    shadow_pids_new="$(comm -13 <(printf "%s\n" "$shadow_pids_before" | tr ' ' '\n' | sed '/^$/d' | sort -n) <(printf "%s\n" "$shadow_pids_after" | tr ' ' '\n' | sed '/^$/d' | sort -n) || true)"
+    shadow_pids_use="$shadow_pids_new"
+    if [[ -z "$shadow_pids_use" ]]; then
+      shadow_pids_use="$shadow_pids_after"
+    fi
+
+    moved_any="0"
+    if [[ -n "$shadow_pids_use" ]]; then
+      while IFS= read -r pid; do
+        [[ -z "$pid" ]] && continue
+        # wmctrl -lp: window_id desktop pid host title...
+        while IFS= read -r wid; do
+          [[ -z "$wid" ]] && continue
+          wmctrl -i -r "$wid" -t "$target_desktop" >/dev/null 2>&1 || true
+          wmctrl -i -a "$wid" >/dev/null 2>&1 || true
+          moved_any="1"
+        done < <(wmctrl -lp | awk -v pid="$pid" '$3==pid {print $1}')
+      done < <(printf "%s\n" "$shadow_pids_use" | tr ' ' '\n' | sed '/^$/d' | sort -n | uniq)
+    fi
+
+    if [[ "$moved_any" == "1" ]]; then
       break
     fi
   done
