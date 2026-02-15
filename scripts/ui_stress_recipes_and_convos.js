@@ -73,7 +73,10 @@ async function sendAndWait(page, text) {
 }
 
 function isLoginRequired(reply) {
-  return /login_required|requiere\s+login|login\s+manual|iniciar\s+sesi[oó]n|sign\s*in|log\s*in/i.test(reply);
+  // Treat captcha/human verification like login_required: it needs a manual step in the shadow window.
+  return /login_required|captcha_required|verifica\s+que\s+eres\s+un\s+ser\s+humano|turnstile|cloudflare|requiere\s+login|login\s+manual|iniciar\s+sesi[oó]n|sign\s*in|log\s*in|captcha/i.test(
+    reply
+  );
 }
 
 async function screenshot(page, name) {

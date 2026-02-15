@@ -154,6 +154,36 @@ async function detectSelectorAny(page, selectors) {
   return false;
 }
 
+async function detectHumanVerification(page) {
+  // Detect captcha / anti-bot verification pages (Cloudflare Turnstile, reCAPTCHA, etc).
+  // We do NOT try to solve/bypass; we just return a clear status so the user can intervene.
+  const selectors = [
+    "iframe[src*='captcha']",
+    "iframe[title*='captcha']",
+    "div.g-recaptcha",
+    "iframe[src*='challenges.cloudflare.com']",
+    "iframe[src*='turnstile']",
+    ".cf-turnstile",
+    "text=/verifica\\s+que\\s+eres\\s+un\\s+ser\\s+humano/i",
+    "text=/cloudflare/i",
+    "text=/turnstile/i",
+    "text=/captcha/i",
+  ];
+  if (await detectSelectorAny(page, selectors)) return true;
+
+  try {
+    const title = await page.title();
+    if (/captcha|cloudflare|turnstile/i.test(String(title || ""))) return true;
+  } catch {}
+
+  try {
+    const url = page.url();
+    if (/challenges\\.cloudflare\\.com/i.test(String(url || ""))) return true;
+  } catch {}
+
+  return false;
+}
+
 async function writePrompt(page, inputLocator, prompt) {
   await inputLocator.scrollIntoViewIfNeeded();
   await inputLocator.click({ force: true });
@@ -321,15 +351,7 @@ async function main() {
       return;
     }
 
-    if (
-      (await detectSelectorAny(page, [
-        "iframe[src*='captcha']",
-        "iframe[title*='captcha']",
-        "div.g-recaptcha",
-        "text=/captcha/i",
-      ])) ||
-      /captcha/i.test(await page.title().catch(() => ""))
-    ) {
+    if (await detectHumanVerification(page)) {
       const shot = screenshotPath(site);
       await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
       console.log(JSON.stringify(finish(result, "captcha_required", false, "", shot), null, 2));
@@ -340,7 +362,9 @@ async function main() {
     const input = await firstVisibleLocator(page, cfg.inputSelectors, Math.min(timeoutMs, 9000));
     if (!input) {
       const cap = await safeScreenshot(page, site);
-      const status = (await detectSelectorAny(page, cfg.loginSelectors)) ? "login_required" : "selector_changed";
+      let status = "selector_changed";
+      if (await detectSelectorAny(page, cfg.loginSelectors)) status = "login_required";
+      else if (await detectHumanVerification(page)) status = "captcha_required";
       console.log(JSON.stringify(finish(result, status, false, "", cap.path || cap.error), null, 2));
       return;
     }
@@ -374,7 +398,9 @@ async function main() {
     );
     if (!responseText) {
       const cap = await safeScreenshot(page, site);
-      const status = (await detectSelectorAny(page, cfg.loginSelectors)) ? "login_required" : "timeout";
+      let status = "timeout";
+      if (await detectSelectorAny(page, cfg.loginSelectors)) status = "login_required";
+      else if (await detectHumanVerification(page)) status = "captcha_required";
       console.log(JSON.stringify(finish(result, status, false, "", cap.path || cap.error), null, 2));
       return;
     }
@@ -426,7 +452,9 @@ async function main() {
       );
       if (!response2) {
         const cap = await safeScreenshot(page, site);
-        const status = (await detectSelectorAny(page, cfg.loginSelectors)) ? "login_required" : "timeout";
+        let status = "timeout";
+        if (await detectSelectorAny(page, cfg.loginSelectors)) status = "login_required";
+        else if (await detectHumanVerification(page)) status = "captcha_required";
         result.turns = turns;
         console.log(JSON.stringify(finish(result, status, false, "", cap.path || cap.error), null, 2));
         return;
@@ -439,7 +467,9 @@ async function main() {
         const input3 = await firstVisibleLocator(page, cfg.inputSelectors, Math.min(timeoutMs, 9000));
         if (!input3) {
           const cap = await safeScreenshot(page, site);
-          const status = (await detectSelectorAny(page, cfg.loginSelectors)) ? "login_required" : "selector_changed";
+          let status = "selector_changed";
+          if (await detectSelectorAny(page, cfg.loginSelectors)) status = "login_required";
+          else if (await detectHumanVerification(page)) status = "captcha_required";
           result.turns = turns;
           console.log(JSON.stringify(finish(result, status, false, "", cap.path || cap.error), null, 2));
           return;
@@ -467,7 +497,9 @@ async function main() {
         );
         if (!response3) {
           const cap = await safeScreenshot(page, site);
-          const status = (await detectSelectorAny(page, cfg.loginSelectors)) ? "login_required" : "timeout";
+          let status = "timeout";
+          if (await detectSelectorAny(page, cfg.loginSelectors)) status = "login_required";
+          else if (await detectHumanVerification(page)) status = "captcha_required";
           result.turns = turns;
           console.log(JSON.stringify(finish(result, status, false, "", cap.path || cap.error), null, 2));
           return;

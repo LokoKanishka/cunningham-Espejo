@@ -596,12 +596,12 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         site_key, prompt, followup, followup2 = web_req
         result = web_ask.run_web_ask(site_key, prompt, timeout_ms=60000, followup=followup, followup2=followup2)
         reply = web_ask.format_web_ask_reply(site_key, prompt, result)
-        if str(result.get("status", "")).strip() == "login_required":
+        if str(result.get("status", "")).strip() in ("login_required", "captcha_required"):
             ok, info = web_ask.bootstrap_login(site_key)
             if ok:
                 reply += (
                     "\n\nAcción automática: abrí una ventana de Chrome (shadow profile) para que inicies sesión. "
-                    "Logueate ahí y cerrá esa ventana. Luego repetí tu pedido."
+                    "Si aparece verificación humana/captcha, resolvela ahí. Luego cerrá esa ventana y repetí tu pedido."
                 )
             else:
                 reply += f"\n\nNo pude abrir ventana de login automáticamente: {info}"
