@@ -40,29 +40,36 @@ PY
 )"
 
 mkdir -p "$DST_ROOT/$PROFILE_DIR"
-if [[ -f "$LOCAL_STATE" ]]; then
-  cp -f "$LOCAL_STATE" "$DST_ROOT/Local State" || true
-fi
+KEEP_MARKER="$DST_ROOT/$PROFILE_DIR/.web_ask_bootstrap_keep"
+if [[ -f "$KEEP_MARKER" ]]; then
+  # If the user already logged in once, do NOT rsync from the real profile again:
+  # it would wipe cookies/session in the shadow profile and re-trigger login_required.
+  :
+else
+  if [[ -f "$LOCAL_STATE" ]]; then
+    cp -f "$LOCAL_STATE" "$DST_ROOT/Local State" || true
+  fi
 
-if command -v rsync >/dev/null 2>&1; then
-  rsync -a --delete \
-    --exclude=.web_ask_bootstrap_keep \
-    --exclude=Cache/ \
-    --exclude='Code Cache/' \
-    --exclude=GPUCache/ \
-    --exclude=GrShaderCache/ \
-    --exclude=ShaderCache/ \
-    --exclude='Service Worker/CacheStorage/' \
-    --exclude=Crashpad/ \
-    --exclude=BrowserMetrics/ \
-    --exclude='Session Storage/' \
-    --exclude=Sessions/ \
-    "$SRC_ROOT/$PROFILE_DIR/" "$DST_ROOT/$PROFILE_DIR/" || true
-fi
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -a --delete \
+      --exclude=.web_ask_bootstrap_keep \
+      --exclude=Cache/ \
+      --exclude='Code Cache/' \
+      --exclude=GPUCache/ \
+      --exclude=GrShaderCache/ \
+      --exclude=ShaderCache/ \
+      --exclude='Service Worker/CacheStorage/' \
+      --exclude=Crashpad/ \
+      --exclude=BrowserMetrics/ \
+      --exclude='Session Storage/' \
+      --exclude=Sessions/ \
+      "$SRC_ROOT/$PROFILE_DIR/" "$DST_ROOT/$PROFILE_DIR/" || true
+  fi
 
-# Marker: if present, the web_ask runner won't overwrite this shadow profile.
-# This allows one-time manual login in the shadow profile to persist.
-touch "$DST_ROOT/$PROFILE_DIR/.web_ask_bootstrap_keep" || true
+  # Marker: if present, the web_ask runner won't overwrite this shadow profile.
+  # This allows one-time manual login in the shadow profile to persist.
+  touch "$KEEP_MARKER" || true
+fi
 
 rm -f "$DST_ROOT/SingletonCookie" "$DST_ROOT/SingletonLock" "$DST_ROOT/SingletonSocket" "$DST_ROOT/LOCK" || true
 
