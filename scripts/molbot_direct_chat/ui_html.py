@@ -231,12 +231,12 @@ HTML = r"""<!doctype html>
     }
 
     function exportTxt() {
-      const body = history.map(m => `[${m.role}] ${m.content}`).join("\\n\\n");
+      const body = history.map(m => `[${m.role}] ${m.content}`).join("\n\n");
       download(`molbot_chat_${sessionId}.txt`, body);
     }
 
     function exportMd() {
-      const body = history.map(m => `${m.role === "user" ? "## Usuario" : "## Asistente"}\\n\\n${m.content}`).join("\\n\\n");
+      const body = history.map(m => `${m.role === "user" ? "## Usuario" : "## Asistente"}\n\n${m.content}`).join("\n\n");
       download(`molbot_chat_${sessionId}.md`, body);
     }
 
@@ -257,7 +257,7 @@ HTML = r"""<!doctype html>
       const out = [];
       for (const f of files) {
         const type = (f.type || "").toLowerCase();
-        if (type.startsWith("text/") || /\\.(md|txt|json|csv|log|py|js|ts|html|css|sh)$/i.test(f.name)) {
+        if (type.startsWith("text/") || /\.(md|txt|json|csv|log|py|js|ts|html|css|sh)$/i.test(f.name)) {
           const text = await f.text();
           out.push({ name: f.name, type: "text", content: text.slice(0, 12000) });
         } else if (type.startsWith("image/")) {
@@ -274,12 +274,12 @@ HTML = r"""<!doctype html>
       if (!t.startsWith("/")) return null;
       if (t === "/new") return { kind: "new" };
       if (t.startsWith("/firefox")) {
-        const url = t.replace(/^\\/firefox\\s*/i, "").trim();
+        const url = t.replace(/^\/firefox\s*/i, "").trim();
         return { kind: "message", text: `abrí firefox ${url}`.trim() };
       }
       if (t === "/escritorio") return { kind: "message", text: "decime que carpetas y archivos hay en mi escritorio" };
       if (t.startsWith("/modo")) {
-        const mode = t.replace(/^\\/modo\\s*/i, "").trim();
+        const mode = t.replace(/^\/modo\s*/i, "").trim();
         if (["conciso", "operativo", "investigacion"].includes(mode)) return { kind: "mode", mode };
       }
       return { kind: "unknown" };
@@ -333,7 +333,7 @@ HTML = r"""<!doctype html>
       }
 
       if (pendingAttachments.length) {
-        text += "\\n\\nAdjuntos:\\n" + pendingAttachments.map(a => `- ${a.name} (${a.type})`).join("\\n");
+        text += "\n\nAdjuntos:\n" + pendingAttachments.map(a => `- ${a.name} (${a.type})`).join("\n");
       }
 
       inputEl.value = "";
@@ -368,17 +368,17 @@ HTML = r"""<!doctype html>
             const { done, value } = await reader.read();
             if (done) break;
             buf += decoder.decode(value, { stream: true });
-            const parts = buf.split("\\n\\n");
+            const parts = buf.split("\n\n");
             buf = parts.pop() || "";
             for (const part of parts) {
-              const line = part.split("\\n").find(l => l.startsWith("data: "));
+              const line = part.split("\n").find(l => l.startsWith("data: "));
               if (!line) continue;
               const data = line.slice(6);
               if (data === "[DONE]") continue;
               try {
                 const j = JSON.parse(data);
                 if (j.token) appendAssistantChunk(j.token);
-                if (j.error) appendAssistantChunk(`\\nError: ${j.error}`);
+                if (j.error) appendAssistantChunk(`\nError: ${j.error}`);
               } catch {}
             }
           }

@@ -608,6 +608,9 @@ class Handler(BaseHTTPRequestHandler):
             mode = str(payload.get("mode", "operativo"))
             attachments = payload.get("attachments", [])
             allowed_tools = set(payload.get("allowed_tools", []))
+            # Local-only tools that should not be advertised to the upstream model.
+            allowed_tools_for_prompt = set(allowed_tools)
+            allowed_tools_for_prompt.discard("web_search")
 
             if not message:
                 self._json(400, {"error": "Missing message"})
@@ -635,7 +638,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, local_action)
                 return
 
-            messages = self._build_messages(message, history, mode, allowed_tools, attachments)
+            messages = self._build_messages(message, history, mode, allowed_tools_for_prompt, attachments)
             q = web_search.extract_web_search_query(message)
             if q and ("web_search" in allowed_tools):
                 sp = web_search.searxng_search(q)
@@ -667,6 +670,7 @@ class Handler(BaseHTTPRequestHandler):
                         "content": (
                             "Se te proveen resultados de busqueda web desde SearXNG local. "
                             "Usalos como base. Si no alcanza para responder, deci que falta. "
+                            "No intentes usar herramientas de busqueda externas. "
                             "Cita fuentes mencionando el numero de resultado (1,2,3...).\n\n" + context
                         ),
                     },
