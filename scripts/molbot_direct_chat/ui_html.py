@@ -133,13 +133,14 @@ HTML = r"""<!doctype html>
       </div>
     </div>
 
-    <div class="tools">
-      <span>Herramientas locales:</span>
-      <label><input type="checkbox" id="toolFirefox" checked /> firefox</label>
-      <label><input type="checkbox" id="toolWebAsk" checked /> web_ask</label>
-      <label><input type="checkbox" id="toolDesktop" checked /> escritorio</label>
-      <label><input type="checkbox" id="toolModel" checked /> modelo</label>
-      <label><input type="checkbox" id="useStream" checked /> streaming</label>
+	    <div class="tools">
+	      <span>Herramientas locales:</span>
+	      <label><input type="checkbox" id="toolFirefox" checked /> firefox</label>
+	      <label><input type="checkbox" id="toolWebSearch" checked /> web_search</label>
+	      <label><input type="checkbox" id="toolWebAsk" checked /> web_ask</label>
+	      <label><input type="checkbox" id="toolDesktop" checked /> escritorio</label>
+	      <label><input type="checkbox" id="toolModel" checked /> modelo</label>
+	      <label><input type="checkbox" id="useStream" checked /> streaming</label>
       <button class="alt" id="btnFirefox">Abrir Firefox</button>
       <button class="alt" id="btnDesktop">Listar Escritorio</button>
       <span class="small">Slash: /new /firefox [url] /escritorio /modo [conciso|operativo|investigacion]</span>
@@ -167,12 +168,13 @@ HTML = r"""<!doctype html>
     const sendEl = document.getElementById("send");
     const newSessionEl = document.getElementById("newSession");
     const exportMdEl = document.getElementById("exportMd");
-    const exportTxtEl = document.getElementById("exportTxt");
-    const toolFirefoxEl = document.getElementById("toolFirefox");
-    const toolWebAskEl = document.getElementById("toolWebAsk");
-    const toolDesktopEl = document.getElementById("toolDesktop");
-    const toolModelEl = document.getElementById("toolModel");
-    const useStreamEl = document.getElementById("useStream");
+	    const exportTxtEl = document.getElementById("exportTxt");
+	    const toolFirefoxEl = document.getElementById("toolFirefox");
+	    const toolWebSearchEl = document.getElementById("toolWebSearch");
+	    const toolWebAskEl = document.getElementById("toolWebAsk");
+	    const toolDesktopEl = document.getElementById("toolDesktop");
+	    const toolModelEl = document.getElementById("toolModel");
+	    const useStreamEl = document.getElementById("useStream");
     const btnFirefoxEl = document.getElementById("btnFirefox");
     const btnDesktopEl = document.getElementById("btnDesktop");
     const attachEl = document.getElementById("attach");
@@ -185,14 +187,15 @@ HTML = r"""<!doctype html>
     let history = [];
     let pendingAttachments = [];
 
-    function allowedTools() {
-      const out = [];
-      if (toolFirefoxEl.checked) out.push("firefox");
-      if (toolWebAskEl.checked) out.push("web_ask");
-      if (toolDesktopEl.checked) out.push("desktop");
-      if (toolModelEl.checked) out.push("model");
-      return out;
-    }
+	    function allowedTools() {
+	      const out = [];
+	      if (toolFirefoxEl.checked) out.push("firefox");
+	      if (toolWebSearchEl.checked) out.push("web_search");
+	      if (toolWebAskEl.checked) out.push("web_ask");
+	      if (toolDesktopEl.checked) out.push("desktop");
+	      if (toolModelEl.checked) out.push("model");
+	      return out;
+	    }
 
     function el(tag, cls, text) {
       const node = document.createElement(tag);
@@ -432,4 +435,3 @@ HTML = r"""<!doctype html>
 </body>
 </html>
 """
-

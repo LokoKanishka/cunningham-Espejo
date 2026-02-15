@@ -40,6 +40,9 @@ PY
 )"
 
 mkdir -p "$DST_ROOT/$PROFILE_DIR"
+# Marker: if present, the web_ask runner won't overwrite this shadow profile.
+# This allows one-time manual login in the shadow profile to persist.
+touch "$DST_ROOT/$PROFILE_DIR/.web_ask_bootstrap_keep" || true
 if [[ -f "$LOCAL_STATE" ]]; then
   cp -f "$LOCAL_STATE" "$DST_ROOT/Local State" || true
 fi

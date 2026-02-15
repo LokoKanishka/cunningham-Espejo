@@ -122,6 +122,11 @@ def _prepare_shadow_chrome_user_data(profile_dir: str) -> tuple[str, str | None]
     dst_root.mkdir(parents=True, exist_ok=True)
     dst_profile.parent.mkdir(parents=True, exist_ok=True)
 
+    # If the user bootstrapped a login in the shadow profile, don't overwrite it.
+    # Otherwise `rsync --delete` would wipe the logged-in cookies and force login_required.
+    if (dst_profile / ".web_ask_bootstrap_keep").exists():
+        return str(dst_root), "shadow_kept_bootstrap_marker"
+
     local_state_src = src_root / "Local State"
     local_state_dst = dst_root / "Local State"
     try:
@@ -135,7 +140,6 @@ def _prepare_shadow_chrome_user_data(profile_dir: str) -> tuple[str, str | None]
         cmd = [
             rsync,
             "-a",
-            "--delete",
             "--exclude=Cache/",
             "--exclude=Code Cache/",
             "--exclude=GPUCache/",
@@ -156,9 +160,10 @@ def _prepare_shadow_chrome_user_data(profile_dir: str) -> tuple[str, str | None]
             pass
 
     try:
-        if dst_profile.exists():
-            shutil.rmtree(dst_profile)
-        shutil.copytree(src_profile, dst_profile)
+        # Keep existing dst_profile if present (no deletion). This avoids
+        # wiping a user-authenticated shadow profile and reduces flakiness.
+        if not dst_profile.exists():
+            shutil.copytree(src_profile, dst_profile)
         return str(dst_root), None
     except Exception as e:
         return str(src_root), f"shadow_copy_failed:{e}"
@@ -430,4 +435,3 @@ def build_site_search_url(site_key: str, query: str) -> str | None:
     if not template:
         return None
     return template.format(q=quote_plus(query))
-

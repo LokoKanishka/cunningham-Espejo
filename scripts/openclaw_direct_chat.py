@@ -14,7 +14,7 @@ from urllib.parse import parse_qs, urlparse
 from urllib.parse import quote_plus
 from urllib.request import Request, urlopen
 
-from molbot_direct_chat import desktop_ops, web_ask
+from molbot_direct_chat import desktop_ops, web_ask, web_search
 from molbot_direct_chat.ui_html import HTML as UI_HTML
 from molbot_direct_chat.util import extract_url as _extract_url
 from molbot_direct_chat.util import normalize_text as _normalize_text
@@ -636,6 +636,41 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             messages = self._build_messages(message, history, mode, allowed_tools, attachments)
+            q = web_search.extract_web_search_query(message)
+            if q and ("web_search" in allowed_tools):
+                sp = web_search.searxng_search(q)
+                if not sp.get("ok"):
+                    err = str(sp.get("error", "web_search_failed"))
+                    if self.path == "/api/chat/stream":
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/event-stream")
+                        self.send_header("Cache-Control", "no-cache")
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                        out = json.dumps({"token": f"No pude buscar en SearXNG local: {err}"}, ensure_ascii=False).encode("utf-8")
+                        try:
+                            self.wfile.write(b"data: " + out + b"\n\n")
+                            self.wfile.write(b"data: [DONE]\n\n")
+                            self.wfile.flush()
+                        except BrokenPipeError:
+                            return
+                        self.close_connection = True
+                        return
+                    self._json(200, {"reply": f"No pude buscar en SearXNG local: {err}"})
+                    return
+
+                context = web_search.format_results_for_prompt(sp)
+                messages = [
+                    messages[0],
+                    {
+                        "role": "system",
+                        "content": (
+                            "Se te proveen resultados de busqueda web desde SearXNG local. "
+                            "Usalos como base. Si no alcanza para responder, deci que falta. "
+                            "Cita fuentes mencionando el numero de resultado (1,2,3...).\n\n" + context
+                        ),
+                    },
+                ] + messages[1:]
 
             if self.path == "/api/chat/stream":
                 self.send_response(200)
