@@ -26,8 +26,14 @@ if os.path.exists(local_state):
     try:
         data = json.load(open(local_state, "r", encoding="utf-8"))
         info = data.get("profile", {}).get("info_cache", {})
+        # Prefer human profile-name first ("diego" -> "Profile 1").
         for key, value in info.items():
             if str(value.get("name", "")).strip().lower() == hint:
+                print(key)
+                raise SystemExit(0)
+        # Fallback: exact profile-directory key.
+        for key in info.keys():
+            if str(key).strip().lower() == hint:
                 print(key)
                 raise SystemExit(0)
     except Exception:
@@ -98,7 +104,7 @@ fi
 
 if command -v wmctrl >/dev/null 2>&1 && [[ -n "$target_desktop" ]]; then
   # Prefer moving windows belonging to the shadow profile process(es).
-  for _ in {1..50}; do
+  for _ in {1..80}; do
     sleep 0.1
     shadow_pids_after=""
     if command -v pgrep >/dev/null 2>&1; then
@@ -122,6 +128,16 @@ if command -v wmctrl >/dev/null 2>&1 && [[ -n "$target_desktop" ]]; then
           moved_any="1"
         done < <(wmctrl -lp | awk -v pid="$pid" '$3==pid {print $1}')
       done < <(printf "%s\n" "$shadow_pids_use" | tr ' ' '\n' | sed '/^$/d' | sort -n | uniq)
+    fi
+
+    # Fallback: match by WM_CLASS in case Chrome process mapping is delayed/hidden.
+    if [[ "$moved_any" != "1" ]]; then
+      while IFS= read -r wid; do
+        [[ -z "$wid" ]] && continue
+        wmctrl -i -r "$wid" -t "$target_desktop" >/dev/null 2>&1 || true
+        wmctrl -i -a "$wid" >/dev/null 2>&1 || true
+        moved_any="1"
+      done < <(wmctrl -lx | awk 'tolower($3) ~ /web_ask_shadow/ {print $1}')
     fi
 
     if [[ "$moved_any" == "1" ]]; then

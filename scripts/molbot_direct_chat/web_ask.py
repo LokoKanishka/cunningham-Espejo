@@ -59,20 +59,27 @@ def _load_browser_profile_config() -> dict:
 def _resolve_chrome_profile_directory(profile_hint: str) -> str:
     hint = profile_hint.strip()
     if not hint:
-        return hint
+        hint = "Default"
 
     chrome_root = Path.home() / ".config" / "google-chrome"
     local_state = chrome_root / "Local State"
+    known_keys: list[str] = []
     try:
         data = json.loads(local_state.read_text(encoding="utf-8"))
         info = data.get("profile", {}).get("info_cache", {})
         if isinstance(info, dict):
+            known_keys = [k for k in info.keys() if isinstance(k, str)]
             hint_norm = hint.lower().strip()
+            # Prefer a human profile-name match first ("diego" -> "Profile 1"),
+            # then fall back to exact profile-directory key.
             for key, value in info.items():
                 if not isinstance(key, str) or not isinstance(value, dict):
                     continue
                 name = str(value.get("name", "")).lower().strip()
                 if name == hint_norm:
+                    return key
+            for key in known_keys:
+                if key.lower().strip() == hint_norm:
                     return key
     except Exception:
         pass
@@ -80,7 +87,12 @@ def _resolve_chrome_profile_directory(profile_hint: str) -> str:
     if (chrome_root / hint).is_dir():
         return hint
 
-    return hint
+    if (chrome_root / "Default").is_dir():
+        return "Default"
+    for key in known_keys:
+        if (chrome_root / key).is_dir():
+            return key
+    return "Default"
 
 
 def _resolve_site_browser_config(site_key: str) -> tuple[str, str]:
@@ -179,7 +191,7 @@ def _log_web_ask(event: dict) -> None:
         return
 
 
-def extract_web_ask_request(message: str) -> tuple[str, str, str | None, str | None] | None:
+def extract_web_ask_request(message: str) -> tuple[str, str, list[str] | None] | None:
     msg = (message or "").strip()
     dialog_patterns = [
         r"(?:dialoga|dialogá|dialogue|dialogar)\s+(?:con\s+)?(chatgpt|chat gpt|gemini)\s*[:,-]?\s*(.+)$",
@@ -193,9 +205,13 @@ def extract_web_ask_request(message: str) -> tuple[str, str, str | None, str | N
         if not prompt:
             continue
         site_key = "chatgpt" if "chat" in provider else "gemini"
-        followup = "En base a tu respuesta anterior, resumila en 1 frase y listá 3 conceptos clave."
-        followup2 = "Ahora: proponé 2 preguntas de seguimiento y respondelas en forma breve (2-4 líneas cada una)."
-        return site_key, prompt, followup, followup2
+        followups = [
+            "En base a tu respuesta anterior, resumila en 1 frase y listá 3 conceptos clave.",
+            "Ahora detectá 2 riesgos o huecos de esa respuesta y proponé cómo mitigarlos.",
+            "Dame un ejemplo concreto y breve aplicado al caso.",
+            "Cerrá con un mini checklist de 3 pasos accionables.",
+        ]
+        return site_key, prompt, followups
 
     patterns = [
         r"(?:preguntale|preguntále|preguntale|pregunta|consultale|consúltale|consulta|decile|decirle)\s+(?:a\s+)?(chatgpt|chat gpt|gemini)\s*[:,-]?\s*(.+)$",
@@ -210,7 +226,7 @@ def extract_web_ask_request(message: str) -> tuple[str, str, str | None, str | N
         if not prompt:
             continue
         site_key = "chatgpt" if "chat" in provider else "gemini"
-        return site_key, prompt, None, None
+        return site_key, prompt, None
     return None
 
 
@@ -232,9 +248,7 @@ def bootstrap_login(site_key: str) -> tuple[bool, str]:
         return False, str(e)
 
 
-def run_web_ask(
-    site_key: str, prompt: str, timeout_ms: int = 60000, followup: str | None = None, followup2: str | None = None
-) -> dict:
+def run_web_ask(site_key: str, prompt: str, timeout_ms: int = 60000, followups: list[str] | None = None) -> dict:
     started = time.time()
     browser, profile = _resolve_site_browser_config(site_key)
     if browser != "chrome":
@@ -283,6 +297,7 @@ def run_web_ask(
     }
 
     for idx, profile_candidate in enumerate(fallback_profiles):
+        real_user_data_dir = str(Path.home() / ".config" / "google-chrome")
         shadow_user_data_dir, shadow_warn = _prepare_shadow_chrome_user_data(profile_candidate)
         cmd = [
             node,
@@ -302,10 +317,8 @@ def run_web_ask(
             "--thread-file",
             str(thread_file),
         ]
-        if followup:
-            cmd.extend(["--followup", followup])
-        if followup2:
-            cmd.extend(["--followup2", followup2])
+        if followups:
+            cmd.extend(["--followups-json", json.dumps(followups, ensure_ascii=False)])
 
         WEB_ASK_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -379,6 +392,70 @@ def run_web_ask(
         last_payload = payload
         if payload.get("ok"):
             return payload
+        # Gemini fallback: if shadow profile appears logged-out, try the real profile once.
+        # This preserves shadow-by-default but helps when session state doesn't carry over.
+        if site_key == "gemini" and payload.get("status") == "login_required":
+            cmd_real = [
+                node,
+                str(WEB_ASK_SCRIPT_PATH),
+                "--site",
+                site_key,
+                "--prompt",
+                prompt,
+                "--profile-dir",
+                profile_candidate,
+                "--user-data-dir",
+                real_user_data_dir,
+                "--timeout-ms",
+                str(timeout_ms),
+                "--headless",
+                "false",
+                "--thread-file",
+                str(thread_file),
+            ]
+            if followups:
+                cmd_real.extend(["--followups-json", json.dumps(followups, ensure_ascii=False)])
+            try:
+                with WEB_ASK_LOCK_PATH.open("w", encoding="utf-8") as lockf:
+                    fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
+                    proc_real = subprocess.run(
+                        cmd_real,
+                        capture_output=True,
+                        text=True,
+                        timeout=max(20, int(timeout_ms / 1000) + 20),
+                    )
+                payload_real = parse_json_object(proc_real.stdout) or {}
+                if payload_real:
+                    payload_real["ok"] = bool(payload_real.get("ok", False))
+                    payload_real["status"] = str(payload_real.get("status", "error"))
+                    payload_real["text"] = str(payload_real.get("text", ""))
+                    payload_real["evidence"] = str(payload_real.get("evidence", ""))
+                    payload_real["runner_code"] = proc_real.returncode
+                    payload_real["profile_used"] = profile_candidate
+                    payload_real["attempt"] = idx + 1
+                    payload_real["user_data_mode"] = "real_profile_fallback"
+                    _log_web_ask(
+                        {
+                            "ts": time.time(),
+                            "site": site_key,
+                            "status": payload_real["status"],
+                            "ok": payload_real["ok"],
+                            "runner_code": proc_real.returncode,
+                            "prompt": prompt[:220],
+                            "duration": payload_real.get("timings", {}).get("duration", None),
+                            "evidence": payload_real.get("evidence", ""),
+                            "shadow_user_data_dir": real_user_data_dir,
+                            "shadow_warn": "real_profile_fallback",
+                            "profile_used": profile_candidate,
+                            "attempt": idx + 1,
+                        }
+                    )
+                    if payload_real.get("ok"):
+                        return payload_real
+                    if payload_real.get("status") != "profile_locked":
+                        return payload_real
+            except Exception:
+                pass
         if payload.get("status") not in ("login_required", "profile_locked"):
             return payload
 
@@ -398,7 +475,7 @@ def format_web_ask_reply(site_key: str, prompt: str, result: dict) -> str:
         turns = result.get("turns")
         if isinstance(turns, list) and turns:
             out_lines = []
-            for idx, t in enumerate(turns[:4], 1):
+            for idx, t in enumerate(turns[:6], 1):
                 if not isinstance(t, dict):
                     continue
                 p = str(t.get("prompt", "")).strip()
@@ -411,7 +488,7 @@ def format_web_ask_reply(site_key: str, prompt: str, result: dict) -> str:
             body = "\n".join(out_lines).strip()
             if len(body) > 6500:
                 body = body[:6500] + "\n\n[...truncado...]"
-            return f"{body}\n\nEstado: ok ({duration}s){profile_note}."
+            return f"{body}\n\nEstado: ok ({duration}s){profile_note}. Turnos: {len(turns)}."
         return f"{provider} respondió:\n{text}\n\nEstado: ok ({duration}s){profile_note}."
 
     help_map = {

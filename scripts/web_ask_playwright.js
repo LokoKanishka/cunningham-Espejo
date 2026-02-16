@@ -164,6 +164,8 @@ async function detectHumanVerification(page) {
     "iframe[src*='challenges.cloudflare.com']",
     "iframe[src*='turnstile']",
     ".cf-turnstile",
+    "text=/verifica\\s+que\\s+eres\\s+humano/i",
+    "text=/verifica\\s+que\\s+eres\\s+una\\s+persona/i",
     "text=/verifica\\s+que\\s+eres\\s+un\\s+ser\\s+humano/i",
     "text=/cloudflare/i",
     "text=/turnstile/i",
@@ -181,21 +183,112 @@ async function detectHumanVerification(page) {
     if (/challenges\\.cloudflare\\.com/i.test(String(url || ""))) return true;
   } catch {}
 
+  try {
+    const frames = page.frames();
+    for (const fr of frames) {
+      const furl = String(fr.url() || "");
+      if (/challenges\.cloudflare\.com|turnstile|captcha|recaptcha/i.test(furl)) return true;
+    }
+  } catch {}
+
+  try {
+    const bodyText = await page.evaluate(() =>
+      String(document && document.body ? document.body.innerText || "" : "")
+    );
+    if (/verifica\s+que\s+eres\s+.*humano|verify\s+you\s+are\s+human|cloudflare|turnstile|captcha/i.test(bodyText)) {
+      return true;
+    }
+  } catch {}
+
   return false;
+}
+
+function randInt(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+async function dismissInterruptions(page) {
+  const closeSelectors = [
+    "button[aria-label='Close']",
+    "button[aria-label*='Cerrar']",
+    "button:has-text('Close')",
+    "button:has-text('Cerrar')",
+    "button:has-text('Entendido')",
+    "button:has-text('Aceptar')",
+    "button:has-text('Accept')",
+    "button:has-text('Got it')",
+    "button:has-text('Not now')",
+    "button:has-text('Ahora no')",
+    "button:has-text('Continue')",
+    "[data-testid='close-button']",
+    "[data-testid='modal-close-button']",
+  ];
+
+  for (let round = 0; round < 3; round += 1) {
+    for (const sel of closeSelectors) {
+      try {
+        const btn = page.locator(sel).first();
+        if ((await btn.count()) > 0 && (await btn.isVisible())) {
+          await btn.click({ force: true, timeout: 800 }).catch(() => {});
+          await page.waitForTimeout(180);
+        }
+      } catch {
+        // keep trying candidates
+      }
+    }
+    await page.keyboard.press("Escape").catch(() => {});
+    await page.waitForTimeout(140);
+  }
+}
+
+async function ensureChatSurfaceReady(page, cfg, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await dismissInterruptions(page);
+    if (await detectSelectorAny(page, cfg.loginSelectors)) {
+      return { ok: false, status: "login_required", input: null };
+    }
+    if (await detectHumanVerification(page)) {
+      return { ok: false, status: "captcha_required", input: null };
+    }
+    const input = await firstVisibleLocator(page, cfg.inputSelectors, 1400);
+    if (input) {
+      return { ok: true, status: "ok", input };
+    }
+    await page.mouse.wheel(0, randInt(180, 420)).catch(() => {});
+    await page.waitForTimeout(240);
+  }
+  return { ok: false, status: "selector_changed", input: null };
 }
 
 async function writePrompt(page, inputLocator, prompt) {
   await inputLocator.scrollIntoViewIfNeeded();
-  await inputLocator.click({ force: true });
+  await inputLocator.click({ force: true, delay: randInt(20, 70) });
   await page.keyboard.press("Control+A");
   await page.keyboard.press("Backspace");
 
   try {
-    await inputLocator.fill(prompt);
+    await page.keyboard.type(prompt, { delay: randInt(22, 48) });
     return;
   } catch {
-    await page.keyboard.type(prompt, { delay: 12 });
+    await inputLocator.fill(prompt);
   }
+}
+
+async function sendPrompt(page, cfg) {
+  for (const sel of cfg.sendSelectors) {
+    try {
+      const btn = page.locator(sel).first();
+      if ((await btn.count()) > 0 && (await btn.isVisible())) {
+        await btn.click({ force: true, timeout: 1500, delay: randInt(20, 60) });
+        return true;
+      }
+    } catch {
+      // fallback to keyboard
+    }
+  }
+  await page.keyboard.press("Enter");
+  return true;
 }
 
 function normalizeText(raw) {
@@ -289,6 +382,7 @@ async function main() {
   const threadFile = String(args["thread-file"] || "").trim();
   const followup = String(args.followup || "").trim();
   const followup2 = String(args.followup2 || "").trim();
+  const followupsJson = String(args["followups-json"] || "").trim();
 
   const startedAt = nowEpoch();
   const result = mkResult(site, startedAt);
@@ -340,117 +434,49 @@ async function main() {
       }
     }
 
+    const prompts = [prompt];
+    if (followupsJson) {
+      try {
+        const parsed = JSON.parse(followupsJson);
+        if (Array.isArray(parsed)) {
+          for (const item of parsed) {
+            const clean = String(item || "").trim();
+            if (clean) prompts.push(clean);
+          }
+        }
+      } catch {
+        // fallback to legacy args
+      }
+    }
+    if (prompts.length === 1 && followup) prompts.push(followup);
+    if (prompts.length <= 2 && followup2) prompts.push(followup2);
+
     await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: timeoutMs });
     await page.waitForTimeout(900);
 
-    // If we're not logged in, fail fast. These UIs often render an input even when logged out,
-    // but sending won't reliably work and tends to hang until timeout.
-    if (await detectSelectorAny(page, cfg.loginSelectors)) {
-      const cap = await safeScreenshot(page, site);
-      console.log(JSON.stringify(finish(result, "login_required", false, "", cap.path || cap.error), null, 2));
-      return;
-    }
-
-    if (await detectHumanVerification(page)) {
-      const shot = screenshotPath(site);
-      await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
-      console.log(JSON.stringify(finish(result, "captcha_required", false, "", shot), null, 2));
-      return;
-    }
-
-    const baseline = await extractLastResponseText(page, cfg.responseSelectors);
-    const input = await firstVisibleLocator(page, cfg.inputSelectors, Math.min(timeoutMs, 9000));
-    if (!input) {
-      const cap = await safeScreenshot(page, site);
-      let status = "selector_changed";
-      if (await detectSelectorAny(page, cfg.loginSelectors)) status = "login_required";
-      else if (await detectHumanVerification(page)) status = "captcha_required";
-      console.log(JSON.stringify(finish(result, status, false, "", cap.path || cap.error), null, 2));
-      return;
-    }
-
-    await writePrompt(page, input, prompt);
-
-    let sent = false;
-    for (const sel of cfg.sendSelectors) {
-      try {
-        const btn = page.locator(sel).first();
-        if ((await btn.count()) > 0 && (await btn.isVisible())) {
-          await btn.click({ force: true, timeout: 1500 });
-          sent = true;
-          break;
-        }
-      } catch {
-        // fallback to keyboard
-      }
-    }
-    if (!sent) {
-      await page.keyboard.press("Enter");
-      sent = true;
-    }
-
-    const responseText = await waitForFreshResponse(
-      page,
-      cfg.responseSelectors,
-      baseline,
-      timeoutMs,
-      cfg.minResponseLen || 1
-    );
-    if (!responseText) {
-      const cap = await safeScreenshot(page, site);
-      let status = "timeout";
-      if (await detectSelectorAny(page, cfg.loginSelectors)) status = "login_required";
-      else if (await detectHumanVerification(page)) status = "captcha_required";
-      console.log(JSON.stringify(finish(result, status, false, "", cap.path || cap.error), null, 2));
-      return;
-    }
-
-    const turns = [{ prompt, text: responseText }];
-
-    if (threadFile && site === "chatgpt") {
-      try {
-        const current = String(page.url() || "").trim();
-        if (/^https:\/\/chatgpt\.com\/c\//.test(current)) {
-          fs.mkdirSync(path.dirname(threadFile), { recursive: true });
-          fs.writeFileSync(threadFile, current, "utf-8");
-        }
-      } catch {
-        // ignore thread save failures
-      }
-    }
-
-    if (followup) {
-      const baseline2 = responseText;
-      await page.waitForTimeout(600);
-      const input2 = await firstVisibleLocator(page, cfg.inputSelectors, Math.min(timeoutMs, 9000));
-      if (!input2) {
+    const turns = [];
+    for (let turnIndex = 0; turnIndex < prompts.length; turnIndex += 1) {
+      const turnPrompt = prompts[turnIndex];
+      const ready = await ensureChatSurfaceReady(page, cfg, Math.min(timeoutMs, 12000));
+      if (!ready.ok || !ready.input) {
         const cap = await safeScreenshot(page, site);
         result.turns = turns;
-        console.log(JSON.stringify(finish(result, "selector_changed", false, "", cap.path || cap.error), null, 2));
+        console.log(JSON.stringify(finish(result, ready.status || "selector_changed", false, "", cap.path || cap.error), null, 2));
         return;
       }
-      await writePrompt(page, input2, followup);
-      let sent2 = false;
-      for (const sel of cfg.sendSelectors) {
-        try {
-          const btn = page.locator(sel).first();
-          if ((await btn.count()) > 0 && (await btn.isVisible())) {
-            await btn.click({ force: true, timeout: 1500 });
-            sent2 = true;
-            break;
-          }
-        } catch {}
-      }
-      if (!sent2) await page.keyboard.press("Enter");
 
-      const response2 = await waitForFreshResponse(
+      const baseline = await extractLastResponseText(page, cfg.responseSelectors);
+      await writePrompt(page, ready.input, turnPrompt);
+      await sendPrompt(page, cfg);
+
+      const responseText = await waitForFreshResponse(
         page,
         cfg.responseSelectors,
-        baseline2,
+        baseline,
         timeoutMs,
         cfg.minResponseLen || 1
       );
-      if (!response2) {
+      if (!responseText) {
         const cap = await safeScreenshot(page, site);
         let status = "timeout";
         if (await detectSelectorAny(page, cfg.loginSelectors)) status = "login_required";
@@ -459,64 +485,26 @@ async function main() {
         console.log(JSON.stringify(finish(result, status, false, "", cap.path || cap.error), null, 2));
         return;
       }
-      turns.push({ prompt: followup, text: response2 });
 
-      if (followup2) {
-        const baseline3 = response2;
-        await page.waitForTimeout(600);
-        const input3 = await firstVisibleLocator(page, cfg.inputSelectors, Math.min(timeoutMs, 9000));
-        if (!input3) {
-          const cap = await safeScreenshot(page, site);
-          let status = "selector_changed";
-          if (await detectSelectorAny(page, cfg.loginSelectors)) status = "login_required";
-          else if (await detectHumanVerification(page)) status = "captcha_required";
-          result.turns = turns;
-          console.log(JSON.stringify(finish(result, status, false, "", cap.path || cap.error), null, 2));
-          return;
-        }
-        await writePrompt(page, input3, followup2);
-        let sent3 = false;
-        for (const sel of cfg.sendSelectors) {
-          try {
-            const btn = page.locator(sel).first();
-            if ((await btn.count()) > 0 && (await btn.isVisible())) {
-              await btn.click({ force: true, timeout: 1500 });
-              sent3 = true;
-              break;
-            }
-          } catch {}
-        }
-        if (!sent3) await page.keyboard.press("Enter");
+      turns.push({ prompt: turnPrompt, text: responseText });
+      await page.waitForTimeout(randInt(300, 900));
 
-        const response3 = await waitForFreshResponse(
-          page,
-          cfg.responseSelectors,
-          baseline3,
-          timeoutMs,
-          cfg.minResponseLen || 1
-        );
-        if (!response3) {
-          const cap = await safeScreenshot(page, site);
-          let status = "timeout";
-          if (await detectSelectorAny(page, cfg.loginSelectors)) status = "login_required";
-          else if (await detectHumanVerification(page)) status = "captcha_required";
-          result.turns = turns;
-          console.log(JSON.stringify(finish(result, status, false, "", cap.path || cap.error), null, 2));
-          return;
+      if (threadFile && site === "chatgpt" && turnIndex === 0) {
+        try {
+          const current = String(page.url() || "").trim();
+          if (/^https:\/\/chatgpt\.com\/c\//.test(current)) {
+            fs.mkdirSync(path.dirname(threadFile), { recursive: true });
+            fs.writeFileSync(threadFile, current, "utf-8");
+          }
+        } catch {
+          // ignore thread save failures
         }
-        turns.push({ prompt: followup2, text: response3 });
-        result.turns = turns;
-        console.log(JSON.stringify(finish(result, "ok", true, response3), null, 2));
-        return;
       }
-
-      result.turns = turns;
-      console.log(JSON.stringify(finish(result, "ok", true, response2), null, 2));
-      return;
     }
 
+    const lastText = turns.length ? String(turns[turns.length - 1].text || "") : "";
     result.turns = turns;
-    console.log(JSON.stringify(finish(result, "ok", true, responseText), null, 2));
+    console.log(JSON.stringify(finish(result, "ok", true, lastText), null, 2));
   } catch (err) {
     const raw = String(err && err.message ? err.message : err);
     const status = /timeout/i.test(raw) ? "timeout" : "blocked";

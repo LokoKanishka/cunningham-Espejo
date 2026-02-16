@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 "use strict";
 
-// Drive Molbot Direct Chat UI like a human and start a 3-turn chat with ChatGPT via web_ask.
+// Drive Molbot Direct Chat UI like a human and start a 5-turn chat with ChatGPT via web_ask.
 // If ChatGPT isn't logged-in in the shadow profile, it triggers the bootstrap login and waits.
 
 const fs = require("fs");
@@ -11,6 +11,7 @@ const { chromium } = require("playwright");
 const BASE_URL = process.env.DIRECT_CHAT_URL || "http://127.0.0.1:8787/";
 const OUT_DIR = process.env.OUT_DIR || path.join(process.cwd(), "output", "playwright");
 const LOGIN_WAIT_MS = Number(process.env.LOGIN_WAIT_MS || "180000");
+const HEADLESS = String(process.env.HEADLESS || "false").toLowerCase() === "true";
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -32,8 +33,10 @@ async function sendAndWait(page, text) {
   const beforeAssistant = await chat.locator(".msg.assistant").count();
 
   const input = page.getByRole("textbox", { name: "Escribi en lenguaje natural..." });
-  await input.click();
-  await input.fill(text);
+  await input.click({ delay: 40 });
+  await input.press("Control+A");
+  await input.press("Backspace");
+  await input.type(text, { delay: 24 });
   await page.getByRole("button", { name: "Enviar" }).click();
 
   await page.waitForFunction(
@@ -78,8 +81,30 @@ async function ensureWebAskLoggedIn(page, provider) {
   }
 }
 
+function validateReplyCoherence(reply, topic) {
+  const r = String(reply || "").toLowerCase();
+  if (!r || r.length < 100) return { ok: false, reason: "respuesta demasiado corta" };
+  if (/login_required|captcha_required|selector_changed|timeout|profile_locked|blocked|error interno/i.test(r)) {
+    return { ok: false, reason: "respuesta indica error operativo" };
+  }
+  const keywords = String(topic || "")
+    .toLowerCase()
+    .split(/[^a-z0-9áéíóúñü]+/i)
+    .filter((w) => w.length >= 4)
+    .slice(0, 4);
+  const hits = keywords.filter((k) => r.includes(k)).length;
+  if (hits < Math.min(2, keywords.length)) {
+    return { ok: false, reason: "respuesta poco alineada al tema" };
+  }
+  const turnMatches = r.match(/turno\s+\d+/gi) || [];
+  if (turnMatches.length < 5) {
+    return { ok: false, reason: "no llegó a 5 turnos" };
+  }
+  return { ok: true, reason: "" };
+}
+
 async function main() {
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch({ headless: HEADLESS });
   try {
     const page = await browser.newPage();
     await page.goto(BASE_URL, { waitUntil: "domcontentloaded" });
@@ -94,9 +119,10 @@ async function main() {
     const prompt = `dialoga con chatgpt: ${topic}`;
     const reply = await sendAndWait(page, prompt);
 
-    if (!/Turno\s+3/i.test(reply)) {
-      const shot = await screenshot(page, `ui_chatgpt_no_turn3.png`);
-      throw new Error(`Chat did not reach 3 turns. Screenshot: ${shot}. Reply: ${reply}`);
+    const check = validateReplyCoherence(reply, topic);
+    if (!check.ok) {
+      const shot = await screenshot(page, `ui_chatgpt_invalid_reply.png`);
+      throw new Error(`Chat invalid (${check.reason}). Screenshot: ${shot}. Reply: ${reply}`);
     }
 
     // Print the whole assistant reply to stdout.

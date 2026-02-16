@@ -48,7 +48,7 @@ SITE_SEARCH_TEMPLATES = {
 SITE_CANONICAL_TOKENS = {
     # Include common typos so simple "open X" doesn't fall back to the model.
     "chatgpt": ["chatgpt", "chat gpt", "chatgtp", "chat gtp"],
-    "gemini": ["gemini", "gemni", "geminy"],
+    "gemini": ["gemini", "gemni", "geminy", "gemin"],
     "youtube": ["youtube", "you tube", "ytube", "yutub", "youtbe", "youtub"],
     "wikipedia": ["wikipedia", "wiki"],
     "gmail": ["gmail", "mail"],
@@ -123,6 +123,64 @@ def _wmctrl_move_to_desktop(win_id: str, desktop_idx: int) -> bool:
         return True
     except Exception:
         return False
+
+
+def _wmctrl_close_window(win_id: str) -> bool:
+    if not shutil.which("wmctrl"):
+        return False
+    try:
+        subprocess.run(
+            ["wmctrl", "-ic", win_id],
+            timeout=3,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _wmctrl_current_desktop_site_windows(site_key: str) -> list[tuple[str, str]]:
+    if not shutil.which("wmctrl"):
+        return []
+    desk = _wmctrl_current_desktop()
+    if desk is None:
+        return []
+    token = "gemini" if site_key == "gemini" else ("chatgpt" if site_key == "chatgpt" else site_key)
+    out: list[tuple[str, str]] = []
+    try:
+        proc = subprocess.run(["wmctrl", "-lp"], capture_output=True, text=True, timeout=3)
+        for line in (proc.stdout or "").splitlines():
+            parts = line.split(None, 4)
+            if len(parts) < 5:
+                continue
+            win_id, desktop_raw, _pid, _host, title = parts
+            try:
+                desktop_i = int(desktop_raw)
+            except Exception:
+                continue
+            title_n = title.lower().strip()
+            if desktop_i != desk:
+                continue
+            if token not in title_n:
+                continue
+            if "molbot direct chat" in title_n:
+                continue
+            out.append((win_id, title))
+    except Exception:
+        return []
+    return out
+
+
+def _close_recent_site_window_fallback(site_key: str) -> tuple[bool, str]:
+    wins = _wmctrl_current_desktop_site_windows(site_key)
+    if not wins:
+        return False, "no_window_found_current_workspace"
+    # wmctrl ordering is stable enough for "last listed" as a practical fallback.
+    win_id, title = wins[-1]
+    if _wmctrl_close_window(win_id):
+        return True, title
+    return False, "wmctrl_close_failed"
 
 
 def _browser_windows_load() -> dict:
@@ -228,6 +286,14 @@ def _reset_recorded_browser_windows(session_id: str) -> None:
 def _looks_like_open_request(normalized: str) -> bool:
     tokens = ("abr", "abri", "abir", "abrir", "open", "entra", "entrar", "ir a", "lanz", "inici")
     return any(t in normalized for t in tokens)
+
+
+def _looks_like_direct_gemini_open(normalized: str) -> bool:
+    has_gemini = any(t in normalized for t in SITE_CANONICAL_TOKENS.get("gemini", []))
+    if not has_gemini:
+        return False
+    openish = _looks_like_open_request(normalized) or any(t in normalized for t in ("acceso directo", "shortcut"))
+    return bool(openish)
 
 def _read_meminfo() -> dict:
     out = {}
@@ -366,20 +432,27 @@ def _chrome_command() -> str | None:
 def _resolve_chrome_profile_directory(profile_hint: str) -> str:
     hint = profile_hint.strip()
     if not hint:
-        return hint
+        hint = "Default"
 
     chrome_root = Path.home() / ".config" / "google-chrome"
     local_state = chrome_root / "Local State"
+    known_keys: list[str] = []
     try:
         data = json.loads(local_state.read_text(encoding="utf-8"))
         info = data.get("profile", {}).get("info_cache", {})
         if isinstance(info, dict):
+            known_keys = [k for k in info.keys() if isinstance(k, str)]
             hint_norm = hint.lower().strip()
+            # Prefer a human profile-name match first ("diego" -> "Profile 1"),
+            # then fall back to exact profile-directory key.
             for key, value in info.items():
                 if not isinstance(key, str) or not isinstance(value, dict):
                     continue
                 name = str(value.get("name", "")).lower().strip()
                 if name == hint_norm:
+                    return key
+            for key in known_keys:
+                if key.lower().strip() == hint_norm:
                     return key
     except Exception:
         pass
@@ -387,7 +460,12 @@ def _resolve_chrome_profile_directory(profile_hint: str) -> str:
     if (chrome_root / hint).is_dir():
         return hint
 
-    return hint
+    if (chrome_root / "Default").is_dir():
+        return "Default"
+    for key in known_keys:
+        if (chrome_root / key).is_dir():
+            return key
+    return "Default"
 
 
 def _open_url_with_site_context(url: str, site_key: str | None, session_id: str | None = None) -> str | None:
@@ -418,21 +496,28 @@ def _open_url_with_site_context(url: str, site_key: str | None, session_id: str 
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
-            if before:
-                time.sleep(0.9)
+            new_ids: list[str] = []
+            after: dict[str, str] = {}
+            for _ in range(8):
+                time.sleep(0.25)
                 after = _wmctrl_list()
+                if not after:
+                    continue
                 new_ids = [wid for wid in after.keys() if wid not in before]
-                if new_ids and (target_desktop is not None):
-                    for wid in new_ids:
-                        _wmctrl_move_to_desktop(wid, target_desktop)
-                if session_id and new_ids:
-                    _record_browser_windows(
-                        session_id,
-                        [
-                            {"win_id": wid, "title": after.get(wid, ""), "url": url, "site_key": site_key, "ts": time.time()}
-                            for wid in new_ids
-                        ],
-                    )
+                if new_ids:
+                    break
+
+            if new_ids and (target_desktop is not None):
+                for wid in new_ids:
+                    _wmctrl_move_to_desktop(wid, target_desktop)
+            if session_id and new_ids:
+                _record_browser_windows(
+                    session_id,
+                    [
+                        {"win_id": wid, "title": after.get(wid, ""), "url": url, "site_key": site_key, "ts": time.time()}
+                        for wid in new_ids
+                    ],
+                )
             return None
         except Exception as e:
             return f"No pude abrir Chrome perfil '{profile}': {e}"
@@ -459,6 +544,17 @@ def _open_site_urls(entries: list[tuple[str | None, str]], session_id: str | Non
             return opened, error
         opened.append(url)
     return opened, None
+
+
+def _open_gemini_client_flow(session_id: str | None = None) -> tuple[list[str], str | None]:
+    # Deterministic "human-like" flow requested by user:
+    # 1) open Google in the Gemini-configured client/profile
+    # 2) open Gemini from that same client/profile
+    entries = [
+        ("gemini", "https://www.google.com/"),
+        ("gemini", _site_url("gemini")),
+    ]
+    return _open_site_urls(entries, session_id=session_id)
 
 
 def _site_url(site_key: str) -> str:
@@ -525,6 +621,24 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
             if errors:
                 return {"reply": f"Cerré {closed} ventana(s) web que abrí. Errores: {', '.join(errors)[:260]}"}
             return {"reply": f"Cerré {closed} ventana(s) web que abrí (solo las registradas por el sistema)."}
+
+    # Human variant fallback:
+    # "cerrá la ventana que abriste recién" (without explicit "web/browser")
+    if any(k in normalized for k in ("cerr", "close", "cierra")) and any(
+        k in normalized for k in ("ventan", "window", "pestañ", "tab")
+    ):
+        closed, errors = _close_recorded_browser_windows(session_id=session_id)
+        if closed > 0 or errors:
+            if errors:
+                return {"reply": f"Cerré {closed} ventana(s) web que abrí. Errores: {', '.join(errors)[:260]}"}
+            return {"reply": f"Cerré {closed} ventana(s) web que abrí (solo las registradas por el sistema)."}
+
+        # If no tracked windows, allow a safe fallback only for explicit Gemini mentions.
+        if any(t in normalized for t in SITE_CANONICAL_TOKENS.get("gemini", [])):
+            ok, detail = _close_recent_site_window_fallback("gemini")
+            if ok:
+                return {"reply": f"Cerré la ventana de Gemini más reciente en este workspace: {detail[:120]}"}
+            return {"reply": "No veo ninguna ventana de Gemini abierta en este workspace."}
 
     # Safe local opens/closes for Desktop items (no deletion).
     # Examples:
@@ -593,8 +707,8 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         # if someone only enabled firefox (old UI), still allow web_ask.
         if ("web_ask" not in allowed_tools) and ("firefox" not in allowed_tools):
             return {"reply": "La herramienta local 'web_ask' está deshabilitada en esta sesión."}
-        site_key, prompt, followup, followup2 = web_req
-        result = web_ask.run_web_ask(site_key, prompt, timeout_ms=60000, followup=followup, followup2=followup2)
+        site_key, prompt, followups = web_req
+        result = web_ask.run_web_ask(site_key, prompt, timeout_ms=60000, followups=followups)
         reply = web_ask.format_web_ask_reply(site_key, prompt, result)
         if str(result.get("status", "")).strip() in ("login_required", "captcha_required"):
             ok, info = web_ask.bootstrap_login(site_key)
@@ -621,6 +735,13 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
     wants_search = ("busc" in normalized) or any(k in normalized for k in ("search", "investiga", "investigar"))
     wants_new_chat = any(k in normalized for k in ("chat nuevo", "nuevo chat", "iniciar una conversacion", "iniciar conversacion"))
     topic = _extract_topic(message)
+
+    # Hard rule: "open Gemini" (or close variants) always executes the same deterministic flow.
+    if "firefox" in allowed_tools and _looks_like_direct_gemini_open(normalized) and not wants_search and not wants_new_chat:
+        opened, error = _open_gemini_client_flow(session_id=session_id)
+        if error:
+            return {"reply": error}
+        return {"reply": f"Abrí Gemini en el cliente configurado con flujo fijo: {' | '.join(opened)}"}
 
     m_site_search = re.search(r"(?:busca|buscar|search)\s+(.+?)\s+en\s+(youtube|wikipedia)", normalized, flags=re.IGNORECASE)
     if "firefox" in allowed_tools and m_site_search:
