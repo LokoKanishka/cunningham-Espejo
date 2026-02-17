@@ -23,6 +23,8 @@ WEB_ASK_BOOTSTRAP_PATH = SCRIPTS_ROOT / "web_ask_bootstrap.sh"
 WEB_ASK_LOG_PATH = Path.home() / ".openclaw" / "logs" / "web_ask.log"
 WEB_ASK_LOCK_PATH = Path.home() / ".openclaw" / "web_ask_shadow" / ".web_ask.lock"
 WEB_ASK_THREAD_DIR = Path.home() / ".openclaw" / "web_ask_shadow" / "threads"
+GEMINI_API_USAGE_PATH = Path.home() / ".openclaw" / "logs" / "gemini_api_usage.json"
+GEMINI_API_USAGE_LOCK_PATH = Path.home() / ".openclaw" / "logs" / ".gemini_api_usage.lock"
 
 PROFILE_CONFIG_PATH = Path.home() / ".openclaw" / "direct_chat_browser_profiles.json"
 
@@ -72,6 +74,83 @@ def _gemini_api_models() -> list[str]:
     if not models:
         models = ["gemini-2.0-flash"]
     return models
+
+
+def _gemini_api_allow_paid() -> bool:
+    return _env_flag("GEMINI_API_ALLOW_PAID", "0")
+
+
+def _gemini_api_free_allowlist() -> list[str]:
+    raw = str(
+        os.environ.get(
+            "GEMINI_API_FREE_MODELS",
+            "gemini-2.5-flash,gemini-2.0-flash,gemini-1.5-flash",
+        )
+    ).strip()
+    out: list[str] = []
+    for part in raw.split(","):
+        m = part.strip()
+        if m and m not in out:
+            out.append(m)
+    if not out:
+        out = ["gemini-2.0-flash"]
+    return out
+
+
+def _gemini_api_daily_limit() -> int:
+    raw = str(os.environ.get("GEMINI_API_DAILY_LIMIT", "200")).strip()
+    try:
+        n = int(raw)
+    except Exception:
+        n = 200
+    return max(1, n)
+
+
+def _gemini_api_prompt_char_limit() -> int:
+    raw = str(os.environ.get("GEMINI_API_PROMPT_CHAR_LIMIT", "2500")).strip()
+    try:
+        n = int(raw)
+    except Exception:
+        n = 2500
+    return max(128, n)
+
+
+def _gemini_api_models_safe() -> list[str]:
+    models = _gemini_api_models()
+    if _gemini_api_allow_paid():
+        return models
+    free_allowed = set(_gemini_api_free_allowlist())
+    return [m for m in models if m in free_allowed]
+
+
+def _gemini_api_usage_reserve(units: int = 1) -> tuple[bool, int, int]:
+    limit = _gemini_api_daily_limit()
+    today = time.strftime("%Y-%m-%d", time.localtime())
+    used = 0
+    try:
+        GEMINI_API_USAGE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        GEMINI_API_USAGE_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with GEMINI_API_USAGE_LOCK_PATH.open("a+", encoding="utf-8") as lockf:
+            fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
+            data = {}
+            if GEMINI_API_USAGE_PATH.exists():
+                try:
+                    data = json.loads(GEMINI_API_USAGE_PATH.read_text(encoding="utf-8"))
+                except Exception:
+                    data = {}
+            date = str(data.get("date", ""))
+            used = int(data.get("used", 0) or 0)
+            if date != today:
+                used = 0
+            if used + units > limit:
+                return False, used, limit
+            used += units
+            payload = {"date": today, "used": used, "limit": limit, "updated_ts": time.time()}
+            GEMINI_API_USAGE_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            return True, used, limit
+    except Exception:
+        # Fail closed: if usage persistence fails, don't risk unbounded calls.
+        return False, used, limit
 
 
 def _gemini_api_extract_text(payload: dict) -> str:
@@ -195,6 +274,47 @@ def _run_gemini_api(prompt: str, timeout_ms: int = 60000, followups: list[str] |
             "timings": {"start": started, "end": time.time(), "duration": 0.0},
         }
 
+    prompt_limit = _gemini_api_prompt_char_limit()
+    if len(prompt) > prompt_limit:
+        return {
+            "ok": False,
+            "status": "prompt_too_long",
+            "text": "",
+            "evidence": f"prompt_len={len(prompt)} limit={prompt_limit}",
+            "timings": {"start": started, "end": time.time(), "duration": 0.0},
+        }
+
+    if isinstance(followups, list):
+        for fup in followups:
+            if len(str(fup)) > prompt_limit:
+                return {
+                    "ok": False,
+                    "status": "prompt_too_long",
+                    "text": "",
+                    "evidence": f"followup_len={len(str(fup))} limit={prompt_limit}",
+                    "timings": {"start": started, "end": time.time(), "duration": 0.0},
+                }
+
+    models = _gemini_api_models_safe()
+    if not models:
+        return {
+            "ok": False,
+            "status": "model_not_allowed",
+            "text": "",
+            "evidence": "no_safe_model_in_GEMINI_API_MODELS",
+            "timings": {"start": started, "end": time.time(), "duration": 0.0},
+        }
+
+    reserved, used, max_daily = _gemini_api_usage_reserve(units=1)
+    if not reserved:
+        return {
+            "ok": False,
+            "status": "daily_limit_reached",
+            "text": "",
+            "evidence": f"used={used} limit={max_daily}",
+            "timings": {"start": started, "end": time.time(), "duration": 0.0},
+        }
+
     prompts = [prompt]
     if isinstance(followups, list):
         prompts.extend([str(x).strip() for x in followups if str(x).strip()])
@@ -207,7 +327,7 @@ def _run_gemini_api(prompt: str, timeout_ms: int = 60000, followups: list[str] |
         "timings": {"start": started, "end": time.time(), "duration": 0.0},
     }
 
-    for model in _gemini_api_models():
+    for model in models:
         contents: list[dict] = []
         turns: list[dict] = []
         failed = False
@@ -776,6 +896,9 @@ def format_web_ask_reply(site_key: str, prompt: str, result: dict) -> str:
         "quota_exceeded": f"No pude completar en {provider} por API: cuota/rate-limit excedido.",
         "model_not_found": f"No pude completar en {provider} por API: modelo no disponible.",
         "upstream_error": f"No pude completar en {provider} por API: error de red/servidor.",
+        "daily_limit_reached": f"No pude completar en {provider} por API: límite diario alcanzado.",
+        "model_not_allowed": f"No pude completar en {provider} por API: modelo no permitido por política anti-costo.",
+        "prompt_too_long": f"No pude completar en {provider} por API: prompt demasiado largo.",
     }
     detail = str(result.get("evidence", "")).strip()
     base = help_map.get(status, f"No pude completar en {provider}: estado '{status}'.")

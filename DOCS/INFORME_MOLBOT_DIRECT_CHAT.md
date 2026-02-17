@@ -62,6 +62,10 @@ Notas:
   - `GEMINI_API_ENABLED=1` (default)
   - `GEMINI_API_KEY=<tu_key_de_ai_studio>` (o `GOOGLE_API_KEY`)
   - `GEMINI_API_MODELS=gemini-2.5-flash,gemini-2.0-flash,gemini-1.5-flash`
+  - `GEMINI_API_ALLOW_PAID=0` (default, evita modelos fuera de allowlist free)
+  - `GEMINI_API_FREE_MODELS=...` (allowlist explícita de modelos gratuitos)
+  - `GEMINI_API_DAILY_LIMIT=200` (hard cap diario local)
+  - `GEMINI_API_PROMPT_CHAR_LIMIT=2500` (tope por prompt)
 - Persistencia local recomendada:
   - `scripts/gemini_api_env.sh <GEMINI_API_KEY>`
   - reiniciar: `scripts/openclaw_direct_chat.sh 8787`

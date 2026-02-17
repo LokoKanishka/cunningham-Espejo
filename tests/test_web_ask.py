@@ -2,6 +2,10 @@ import os
 import sys
 import unittest
 from unittest.mock import patch
+import tempfile
+from pathlib import Path
+import json
+import time
 
 
 REPO_ROOT = os.path.dirname(os.path.dirname(__file__))
@@ -42,6 +46,72 @@ class TestWebAsk(unittest.TestCase):
             out = web_ask._run_gemini_api("hola", timeout_ms=1000, followups=None)
         self.assertFalse(out.get("ok"))
         self.assertEqual(out.get("status"), "missing_api_key")
+
+    def test_run_gemini_api_model_not_allowed(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "GEMINI_API_ENABLED": "1",
+                "GEMINI_API_KEY": "x",
+                "GEMINI_API_ALLOW_PAID": "0",
+                "GEMINI_API_MODELS": "gemini-pro",
+                "GEMINI_API_FREE_MODELS": "gemini-2.0-flash",
+            },
+            clear=False,
+        ):
+            out = web_ask._run_gemini_api("hola", timeout_ms=1000, followups=None)
+        self.assertFalse(out.get("ok"))
+        self.assertEqual(out.get("status"), "model_not_allowed")
+
+    def test_run_gemini_api_prompt_too_long(self) -> None:
+        long_prompt = "x" * 300
+        with patch.dict(
+            os.environ,
+            {
+                "GEMINI_API_ENABLED": "1",
+                "GEMINI_API_KEY": "x",
+                "GEMINI_API_PROMPT_CHAR_LIMIT": "128",
+            },
+            clear=False,
+        ):
+            out = web_ask._run_gemini_api(long_prompt, timeout_ms=1000, followups=None)
+        self.assertFalse(out.get("ok"))
+        self.assertEqual(out.get("status"), "prompt_too_long")
+
+    def test_run_gemini_api_daily_limit_reached(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            usage_path = Path(td) / "usage.json"
+            usage_lock = Path(td) / "usage.lock"
+            old_usage = web_ask.GEMINI_API_USAGE_PATH
+            old_lock = web_ask.GEMINI_API_USAGE_LOCK_PATH
+            web_ask.GEMINI_API_USAGE_PATH = usage_path
+            web_ask.GEMINI_API_USAGE_LOCK_PATH = usage_lock
+            try:
+                usage_path.write_text(
+                    json.dumps(
+                        {
+                            "date": time.strftime("%Y-%m-%d", time.localtime()),
+                            "used": 1,
+                            "limit": 1,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                with patch.dict(
+                    os.environ,
+                    {
+                        "GEMINI_API_ENABLED": "1",
+                        "GEMINI_API_KEY": "x",
+                        "GEMINI_API_DAILY_LIMIT": "1",
+                    },
+                    clear=False,
+                ):
+                    out = web_ask._run_gemini_api("hola", timeout_ms=1000, followups=None)
+            finally:
+                web_ask.GEMINI_API_USAGE_PATH = old_usage
+                web_ask.GEMINI_API_USAGE_LOCK_PATH = old_lock
+        self.assertFalse(out.get("ok"))
+        self.assertEqual(out.get("status"), "daily_limit_reached")
 
 
 if __name__ == "__main__":
