@@ -328,6 +328,11 @@ def _open_gemini_in_current_workspace_via_ui(
         _xdotool_command(["key", "--window", target, "Return"], timeout=2.0)
         time.sleep(0.9)
 
+    needs_login, snap = _gemini_window_requires_login(target)
+    if needs_login:
+        _wmctrl_close_window(target)
+        return False, f"login_required workspace={workspace} target={target} snap={snap}"
+
     if session_id:
         title = _wmctrl_list().get(target, "")
         _record_browser_windows(
@@ -358,6 +363,26 @@ def _wmctrl_close_window(win_id: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def _gemini_window_requires_login(win_id: str) -> tuple[bool, str]:
+    import_bin = shutil.which("import")
+    if not import_bin:
+        return False, ""
+    snap_dir = Path.home() / ".openclaw" / "logs" / "gemini_write_screens"
+    snap_dir.mkdir(parents=True, exist_ok=True)
+    snap = snap_dir / f"gemini_open_state_{int(time.time() * 1000)}.png"
+    try:
+        subprocess.run(
+            [import_bin, "-window", win_id, str(snap)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=4,
+        )
+    except Exception:
+        return False, ""
+    needs_login = _ocr_contains_any(snap, ["iniciar sesión", "iniciar sesion", "sign in"])
+    return needs_login, str(snap)
 
 
 def _wmctrl_current_desktop_site_windows(
