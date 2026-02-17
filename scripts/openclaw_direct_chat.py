@@ -424,16 +424,17 @@ def _extract_gemini_write_request(message: str) -> str | None:
     # Pick the LAST writing verb in the phrase, so requests like
     # "decile a cunn que abra gemini y escriba hola gemini"
     # extract only "hola gemini".
-    pat = re.compile(
-        r"(?:escrib[ií]|\bescribe\b|\bescriba\b|\bdec[ií]\b|\bdecime\b|\bdeci\b|pon[eé]|manda|envia|envi[aá])\s+(.+)",
-        flags=re.IGNORECASE | re.DOTALL,
+    verb_pat = re.compile(
+        r"\b(?:escrib\w*|dec[ií]\w*|pon[eé]\w*|manda\w*|envia\w*|envi[aá]\w*)\b",
+        flags=re.IGNORECASE,
     )
-    matches = list(pat.finditer(normalized))
+    matches = list(verb_pat.finditer(normalized))
     if not matches:
         return None
-    text = str(matches[-1].group(1) or "")
+    text = normalized[matches[-1].end() :].strip()
     text = re.split(r"\s+y\s+(?:da\s+)?enter\b|\s+enter\b", text, maxsplit=1, flags=re.IGNORECASE)[0]
     text = re.split(r"[\n\r]", text, maxsplit=1)[0]
+    text = re.sub(r"\ben\s+el\s+chat\b", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\ben\s+gemini\b", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\bpor\s+favor\b", "", text, flags=re.IGNORECASE)
     text = text.strip(" .,:;\"'`")
@@ -493,9 +494,9 @@ def _ocr_contains_any(image_path: Path, expected_terms: list[str]) -> bool:
     return False
 
 
-def _ocr_find_phrase_center(image_path: Path, phrases: list[str]) -> tuple[int, int] | None:
+def _ocr_phrase_centers(image_path: Path, phrase: str) -> list[tuple[int, int]]:
     if not shutil.which("tesseract"):
-        return None
+        return []
     try:
         proc = subprocess.run(
             ["tesseract", str(image_path), "stdout", "hocr"],
@@ -505,9 +506,9 @@ def _ocr_find_phrase_center(image_path: Path, phrases: list[str]) -> tuple[int, 
         )
         raw = proc.stdout or ""
     except Exception:
-        return None
+        return []
     if not raw.strip():
-        return None
+        return []
 
     words: list[tuple[str, tuple[int, int, int, int]]] = []
     for m in re.finditer(
@@ -535,27 +536,84 @@ def _ocr_find_phrase_center(image_path: Path, phrases: list[str]) -> tuple[int, 
         return None
 
     tokens = [w for w, _ in words]
-    for phrase in phrases:
-        pnorm = _normalize_text(phrase)
-        wanted = [re.sub(r"[^\wáéíóúüñ]+", "", t) for t in pnorm.split()]
-        wanted = [t for t in wanted if t]
-        if not wanted:
+    pnorm = _normalize_text(phrase)
+    wanted = [re.sub(r"[^\wáéíóúüñ]+", "", t) for t in pnorm.split()]
+    wanted = [t for t in wanted if t]
+    if not wanted:
+        return []
+
+    n = len(wanted)
+    out: list[tuple[int, int]] = []
+    for i in range(0, len(tokens) - n + 1):
+        if tokens[i : i + n] != wanted:
             continue
-        n = len(wanted)
-        for i in range(0, len(tokens) - n + 1):
-            if tokens[i : i + n] != wanted:
-                continue
-            xs = []
-            ys = []
-            for _w, (x1, y1, x2, y2) in words[i : i + n]:
-                xs.extend([x1, x2])
-                ys.extend([y1, y2])
-            if not xs or not ys:
-                continue
-            cx = (min(xs) + max(xs)) // 2
-            cy = (min(ys) + max(ys)) // 2
-            return cx, cy
+        xs = []
+        ys = []
+        for _w, (x1, y1, x2, y2) in words[i : i + n]:
+            xs.extend([x1, x2])
+            ys.extend([y1, y2])
+        if not xs or not ys:
+            continue
+        cx = (min(xs) + max(xs)) // 2
+        cy = (min(ys) + max(ys)) // 2
+        out.append((cx, cy))
+    return out
+
+
+def _ocr_find_phrase_center(image_path: Path, phrases: list[str]) -> tuple[int, int] | None:
+    for phrase in phrases:
+        centers = _ocr_phrase_centers(image_path, phrase)
+        if centers:
+            return centers[0]
     return None
+
+
+def _looks_like_phrase_still_in_composer(
+    image_path: Path, phrase: str, win_h: int, threshold_pct: int = 72
+) -> bool:
+    pts = _ocr_phrase_centers(image_path, phrase)
+    if not pts:
+        return False
+    threshold = int(win_h * threshold_pct / 100)
+    return any(y >= threshold for _x, y in pts)
+
+
+def _composer_send_click_point(
+    image_path: Path, win_w: int, win_h: int, composer_center: tuple[int, int] | None
+) -> tuple[int, int] | None:
+    anchor = _ocr_find_phrase_center(
+        image_path,
+        [
+            "pensar",
+            "think",
+            "herramientas",
+            "tools",
+        ],
+    )
+    if anchor:
+        ax, ay = anchor
+        # In Gemini layout, the send button sits to the right of "Pensar/Think".
+        return min(win_w - 24, ax + int(win_w * 0.12)), ay
+    if composer_center:
+        cx, cy = composer_center
+        # Fallback: right edge of composer row.
+        return min(win_w - 24, cx + int(win_w * 0.38)), cy
+    return None
+
+
+def _composer_looks_empty(image_path: Path) -> bool:
+    return _ocr_contains_any(
+        image_path,
+        [
+            "preguntale a gemini",
+            "pregúntale a gemini",
+            "pregunta a gemini",
+            "pregunta a gemini 3",
+            "que quieres investigar",
+            "¿qué quieres investigar?",
+            "ask gemini",
+        ],
+    )
 
 
 def _gemini_write_in_current_workspace(text: str, session_id: str | None = None) -> tuple[bool, str]:
@@ -635,6 +693,21 @@ def _gemini_write_in_current_workspace(text: str, session_id: str | None = None)
         ],
     )
     if not composer_center:
+        tools_anchor = _ocr_find_phrase_center(
+            snap_state,
+            [
+                "herramientas",
+                "tools",
+                "pensar",
+                "think",
+            ],
+        )
+        if tools_anchor:
+            tx, ty = tools_anchor
+            # When placeholder text is absent, anchors in the composer footer are usually visible.
+            # Click a bit above that footer to focus the text input area.
+            composer_center = (tx, max(12, ty - int(gh * 0.055)))
+    if not composer_center:
         return False, f"composer_not_found workspace={workspace} win={win_id} snap={snap_state}"
 
     rel_x, rel_y = composer_center
@@ -643,6 +716,45 @@ def _gemini_write_in_current_workspace(text: str, session_id: str | None = None)
     _xdotool_command(["mousemove", str(px), str(py)], timeout=2.0)
     _xdotool_command(["click", "1"], timeout=2.0)
     time.sleep(0.14)
+
+    dirty_detected = False
+    pre_clean = screen_dir / f"gemini_write_pre_clean_{int(time.time() * 1000)}.png"
+    try:
+        subprocess.run(
+            [import_bin, "-window", win_id, str(pre_clean)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=4,
+        )
+        if _looks_like_phrase_still_in_composer(pre_clean, text, gh) or not _composer_looks_empty(pre_clean):
+            dirty_detected = True
+    except Exception:
+        pass
+
+    # Self-heal: clear any leftover draft to avoid cascading failures.
+    clean_ok = False
+    clean_snap = None
+    for _ in range(3):
+        _xdotool_command(["key", "--window", win_id, "ctrl+a"], timeout=2.0)
+        time.sleep(0.06)
+        _xdotool_command(["key", "--window", win_id, "BackSpace"], timeout=2.0)
+        time.sleep(0.10)
+        clean_snap = screen_dir / f"gemini_write_clean_{int(time.time() * 1000)}.png"
+        try:
+            subprocess.run(
+                [import_bin, "-window", win_id, str(clean_snap)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=4,
+            )
+            if not _looks_like_phrase_still_in_composer(clean_snap, text, gh):
+                clean_ok = True
+                break
+        except Exception:
+            continue
+    if not clean_ok:
+        return False, f"dirty_chat_not_cleaned workspace={workspace} win={win_id} snap={clean_snap}"
+
     _xdotool_command(["type", "--delay", "34", "--clearmodifiers", "--window", win_id, text], timeout=8.0)
     time.sleep(0.25)
 
@@ -657,28 +769,63 @@ def _gemini_write_in_current_workspace(text: str, session_id: str | None = None)
     except Exception:
         return False, f"pre_screenshot_failed workspace={workspace} win={win_id}"
 
-    if not _ocr_contains_text(snap_pre, text):
-        return False, f"typed_but_unverified workspace={workspace} win={win_id} snap={snap_pre}"
+    pre_verified = _ocr_contains_text(snap_pre, text)
 
-    _xdotool_command(["key", "--window", win_id, "Return"], timeout=2.0)
-    time.sleep(0.8)
-    snap_post = screen_dir / f"gemini_write_post_{int(time.time() * 1000)}.png"
-    try:
-        subprocess.run(
-            [import_bin, "-window", win_id, str(snap_post)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=4,
+    send_pt_rel = _composer_send_click_point(snap_pre, gw, gh, composer_center)
+    send_attempts = [("enter", None), ("ctrl_enter", None), ("enter_kp", None)]
+    if send_pt_rel:
+        send_attempts.append(("click_send_ocr", send_pt_rel))
+    # Crucial fallback: click on the right side of the SAME composer row, not near window bottom.
+    if composer_center:
+        send_attempts.extend(
+            [
+                ("click_send_row_right", (96, int((composer_center[1] * 100) / max(1, gh)))),
+                ("click_send_row_right_alt", (93, int((composer_center[1] * 100) / max(1, gh)))),
+            ]
         )
-        return True, (
-            f"verified workspace={workspace} win={win_id} click={px},{py} "
-            f"snap_pre={snap_pre} snap_post={snap_post} opened={' | '.join(opened)}"
-        )
-    except Exception:
-        return True, (
-            f"verified workspace={workspace} win={win_id} click={px},{py} "
-            f"snap_pre={snap_pre} opened={' | '.join(opened)}"
-        )
+    send_attempts.extend([("click_send", (92, 95)), ("click_send_alt", (95, 95))])
+    last_post = None
+    for action, point in send_attempts:
+        if action == "enter":
+            _xdotool_command(["key", "--window", win_id, "Return"], timeout=2.0)
+        elif action == "ctrl_enter":
+            _xdotool_command(["key", "--window", win_id, "ctrl+Return"], timeout=2.0)
+        elif action == "enter_kp":
+            _xdotool_command(["key", "--window", win_id, "KP_Enter"], timeout=2.0)
+        else:
+            if action == "click_send_ocr":
+                spx = gx + int(point[0])
+                spy = gy + int(point[1])
+            else:
+                spx = gx + int(gw * point[0] / 100)
+                spy = gy + int(gh * point[1] / 100)
+            _xdotool_command(["mousemove", str(spx), str(spy)], timeout=2.0)
+            _xdotool_command(["click", "1"], timeout=2.0)
+        time.sleep(0.85)
+
+        snap_post = screen_dir / f"gemini_write_post_{int(time.time() * 1000)}_{action}.png"
+        try:
+            subprocess.run(
+                [import_bin, "-window", win_id, str(snap_post)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=4,
+            )
+            last_post = snap_post
+            if not _looks_like_phrase_still_in_composer(snap_post, text, gh):
+                return True, (
+                    f"verified workspace={workspace} win={win_id} click={px},{py} "
+                    f"submit={action} dirty={int(dirty_detected)} "
+                    f"pre_verified={int(pre_verified)} snap_pre={snap_pre} "
+                    f"snap_post={snap_post} opened={' | '.join(opened)}"
+                )
+        except Exception:
+            continue
+
+    return False, (
+        f"submit_failed_draft_present workspace={workspace} win={win_id} "
+        f"pre_verified={int(pre_verified)} snap_pre={snap_pre} snap_post={last_post}"
+    )
 
 
 def _browser_windows_load() -> dict:

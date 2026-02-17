@@ -26,6 +26,11 @@ class TestGeminiWriteParser(unittest.TestCase):
         out = direct_chat._extract_gemini_write_request(msg)
         self.assertIsNone(out)
 
+    def test_extract_escribile_chat_phrase(self) -> None:
+        msg = "ahora en el chat escribile hola gemini"
+        out = direct_chat._extract_gemini_write_request(msg)
+        self.assertEqual(out, "hola gemini")
+
 
 if __name__ == "__main__":
     unittest.main()
