@@ -542,6 +542,119 @@ def _close_known_site_windows_in_current_workspace(max_windows: int = 12) -> tup
     return closed, details
 
 
+def _extract_youtube_transport_request(message: str) -> tuple[str, bool] | None:
+    normalized = _normalize_text(message or "")
+    if not any(t in normalized for t in SITE_CANONICAL_TOKENS.get("youtube", [])):
+        return None
+    # Keep search/open flows on the dedicated deterministic path.
+    if any(t in normalized for t in ("busc", "search", "investig", "abr", "open", "primer video")):
+        return None
+
+    wants_pause = any(
+        t in normalized
+        for t in (
+            "paus",
+            "pause",
+            "deten",
+            "detener",
+            "stop",
+            "fren",
+            "parar",
+            "para el video",
+            "detene",
+        )
+    )
+    wants_play = any(
+        t in normalized
+        for t in (
+            "reanuda",
+            "reanudar",
+            "resume",
+            "continu",
+            "seguir",
+            "segui",
+            "play",
+            "reproduc",
+            "ponelo",
+            "ponela",
+            "dale play",
+        )
+    )
+    wants_close = any(t in normalized for t in ("cerr", "close", "cierra", "cerra")) and any(
+        t in normalized for t in ("ventan", "window", "pestan", "tab")
+    )
+
+    if wants_play and not wants_pause:
+        return "play", wants_close
+    if wants_pause:
+        return "pause", wants_close
+    return None
+
+
+def _pick_active_site_window_id(
+    site_key: str, expected_profile: str | None = None
+) -> tuple[str | None, str]:
+    desk = _wmctrl_current_desktop()
+    if desk is None:
+        return None, "workspace_not_detected"
+    active = _xdotool_active_window()
+    if not active:
+        return None, "active_window_not_detected"
+    token = "gemini" if site_key == "gemini" else ("chatgpt" if site_key == "chatgpt" else site_key)
+    for wid, pid_raw, title in _wmctrl_windows_for_desktop(desk):
+        if wid.lower() != active.lower():
+            continue
+        t = str(title).lower().strip()
+        if token not in t:
+            return None, "active_window_not_site"
+        if "molbot direct chat" in t:
+            return None, "active_window_is_dc"
+        if expected_profile and not _window_matches_profile(pid_raw, expected_profile):
+            return None, "active_window_profile_mismatch"
+        return wid, str(title)
+    return None, "active_window_not_in_current_workspace"
+
+
+def _youtube_transport_action(action: str, close_window: bool = False, session_id: str | None = None) -> tuple[bool, str]:
+    _ = session_id  # Reserved for future per-session telemetry.
+    if not shutil.which("wmctrl") or not shutil.which("xdotool"):
+        return False, "missing_wmctrl_or_xdotool"
+
+    expected_profile = _expected_profile_directory_for_site("youtube")
+    win_id, detail = _pick_active_site_window_id("youtube", expected_profile=expected_profile)
+    if not win_id:
+        wins = _wmctrl_current_desktop_site_windows("youtube", expected_profile=expected_profile)
+        if wins:
+            win_id = wins[-1][0]
+            detail = wins[-1][1]
+    if not win_id:
+        win_id, detail = _pick_active_site_window_id("youtube", expected_profile=None)
+    if not win_id:
+        wins = _wmctrl_current_desktop_site_windows("youtube", expected_profile=None)
+        if wins:
+            win_id = wins[-1][0]
+            detail = wins[-1][1]
+    if not win_id:
+        return False, f"youtube_window_not_found_current_workspace profile={expected_profile}"
+
+    rc_activate, _ = _xdotool_command(["windowactivate", win_id], timeout=2.5)
+    if rc_activate != 0:
+        return False, f"window_activate_failed win={win_id}"
+    time.sleep(0.16)
+
+    # YouTube keyboard control: 'k' toggles play/pause consistently across layouts.
+    rc_key, _ = _xdotool_command(["key", "--window", win_id, "k"], timeout=2.0)
+    if rc_key != 0:
+        return False, f"youtube_key_toggle_failed win={win_id}"
+
+    if close_window:
+        time.sleep(0.15)
+        if not _wmctrl_close_window(win_id):
+            return False, f"youtube_close_failed win={win_id}"
+
+    return True, f"ok action={action} close={int(close_window)} win={win_id} detail={detail[:120]}"
+
+
 def _extract_gemini_write_request(message: str) -> str | None:
     msg = (message or "").strip()
     normalized = _normalize_text(msg)
@@ -1483,6 +1596,65 @@ def _resolve_chrome_profile_directory(profile_hint: str) -> str:
     return "Default"
 
 
+def _fallback_profiled_chrome_anchor_for_workspace(
+    desktop_idx: int, expected_profile: str | None
+) -> tuple[str | None, str]:
+    active = _xdotool_active_window()
+    strict_candidates: list[str] = []
+    lenient_candidates: list[str] = []
+    for wid, pid_raw, title in _wmctrl_windows_for_desktop(desktop_idx):
+        t = str(title).lower().strip()
+        if "chrome" not in t and "google" not in t:
+            continue
+        lenient_candidates.append(wid)
+        if expected_profile and not _window_matches_profile(pid_raw, expected_profile):
+            continue
+        if active and wid.lower() == active.lower():
+            return wid, "fallback_active_profiled_chrome"
+        strict_candidates.append(wid)
+    if strict_candidates:
+        return strict_candidates[-1], "fallback_recent_profiled_chrome"
+    if active and any(w.lower() == active.lower() for w in lenient_candidates):
+        return active, "fallback_active_chrome_unverified_profile"
+    if lenient_candidates:
+        return lenient_candidates[-1], "fallback_recent_chrome_unverified_profile"
+    return None, "fallback_profiled_chrome_not_found"
+
+
+def _spawn_profiled_chrome_anchor_for_workspace(
+    desktop_idx: int, expected_profile: str | None
+) -> tuple[str | None, str]:
+    chrome_cmd = _chrome_command()
+    if not chrome_cmd:
+        return None, "chrome_command_missing"
+    profile = str(expected_profile or "").strip()
+    if not profile:
+        profile = "Default"
+    before_ids = set(_wmctrl_list().keys())
+    try:
+        subprocess.Popen(
+            [chrome_cmd, f"--profile-directory={profile}", "--new-window", "about:blank"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as e:
+        return None, f"spawn_profiled_chrome_failed: {e}"
+    win_id, desk = _find_new_profiled_chrome_window(before_ids, expected_profile=profile, timeout_s=8.0)
+    if not win_id:
+        win_id, desk = _find_new_profiled_chrome_window(before_ids, expected_profile=None, timeout_s=4.0)
+        if win_id and desk is not None and int(desk) == int(desktop_idx):
+            return win_id, "spawn_chrome_unverified_profile_ok"
+    if not win_id:
+        return None, "spawn_profiled_chrome_not_detected"
+    if desk is None:
+        return None, "spawn_profiled_chrome_workspace_unknown"
+    if int(desk) != int(desktop_idx):
+        # Workspace safety: never move windows across workspaces.
+        return None, f"spawn_profiled_chrome_other_workspace={desk}"
+    return win_id, "spawn_profiled_chrome_ok"
+
+
 def _open_url_with_site_context(url: str, site_key: str | None, session_id: str | None = None) -> str | None:
     cfg = _load_browser_profile_config()
     site_cfg = cfg.get(site_key or "", {})
@@ -1498,10 +1670,17 @@ def _open_url_with_site_context(url: str, site_key: str | None, session_id: str 
             return "No pude detectar el workspace actual."
         wins = _wmctrl_windows_for_desktop(desk)
         anchor, anchor_status = _trusted_or_autodetected_dc_anchor(expected_profile=profile)
+        fallback_status = ""
+        spawn_status = ""
+        if not anchor:
+            anchor, fallback_status = _fallback_profiled_chrome_anchor_for_workspace(desk, profile)
+        if not anchor:
+            anchor, spawn_status = _spawn_profiled_chrome_anchor_for_workspace(desk, profile)
         if not anchor:
             return (
-                "No abrí nada para evitar mezclar clientes: no hay ancla confiable del cliente diego "
-                f"en este workspace ({anchor_status}). Decime: 'fijar cliente diego' desde la ventana DC correcta."
+                "No abrí nada para evitar mezclar clientes: no encontré cliente Chrome del perfil diego "
+                "en este workspace. "
+                f"(anchor={anchor_status}; fallback={fallback_status or 'n/a'}; spawn={spawn_status or 'n/a'})"
             )
 
         before_ids = {wid for wid, _, _ in wins}
@@ -1890,6 +2069,32 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
             return {"reply": "No pude detectar el workspace de la ventana activa."}
         _save_trusted_dc_anchor(active, desk, title)
         return {"reply": f"Listo. Fijé este cliente como diego (anchor={active}, workspace={desk})."}
+
+    yt_transport = _extract_youtube_transport_request(message)
+    if yt_transport:
+        if "firefox" not in allowed_tools:
+            return {"reply": "La herramienta local 'firefox' está deshabilitada en esta sesión."}
+        action, close_window = yt_transport
+        ok_g, gd = _guardrail_check(
+            session_id,
+            "browser_vision",
+            {
+                "action": f"youtube_transport_{action}",
+                "site": "youtube",
+                "url": "https://www.youtube.com/",
+                "close_window": int(close_window),
+            },
+        )
+        if not ok_g:
+            return {"reply": _guardrail_block_reply("browser_vision", gd)}
+        ok, detail = _youtube_transport_action(action, close_window=close_window, session_id=session_id)
+        if not ok:
+            return {"reply": f"No pude controlar YouTube en este workspace. ({detail})"}
+        if close_window:
+            return {"reply": f"Listo: detuve YouTube y cerré la ventana en este workspace. ({detail})"}
+        if action == "play":
+            return {"reply": f"Listo: reanudé YouTube en este workspace. ({detail})"}
+        return {"reply": f"Listo: pausé YouTube en este workspace. ({detail})"}
 
     # Close browser windows opened by this system (tracked by session).
     # Examples:

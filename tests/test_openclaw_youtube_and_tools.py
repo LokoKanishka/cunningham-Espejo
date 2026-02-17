@@ -83,6 +83,63 @@ class TestOpenClawYoutubeAndTools(unittest.TestCase):
         mock_trusted.assert_not_called()
         mock_auto.assert_not_called()
 
+    def test_extract_youtube_transport_request_pause_and_close(self) -> None:
+        req = direct_chat._extract_youtube_transport_request(
+            "en youtube detené el video actual y cerrá la ventana"
+        )
+        self.assertEqual(req, ("pause", True))
+
+    def test_extract_youtube_transport_request_ignores_search_play_open(self) -> None:
+        req = direct_chat._extract_youtube_transport_request(
+            "en youtube buscá musica focus y reproducí el primer video"
+        )
+        self.assertIsNone(req)
+
+    @patch("openclaw_direct_chat._youtube_transport_action")
+    @patch("openclaw_direct_chat._guardrail_check")
+    def test_local_action_routes_youtube_pause(
+        self,
+        mock_guardrail,
+        mock_transport,
+    ) -> None:
+        mock_guardrail.return_value = (True, "GUARDRAIL_OK")
+        mock_transport.return_value = (True, "ok action=pause")
+        out = direct_chat._maybe_handle_local_action(
+            "en youtube pausá el video",
+            {"firefox", "web_search", "desktop", "model"},
+            "sess_test",
+        )
+        self.assertIsNotNone(out)
+        self.assertIn("paus", str(out.get("reply", "")).lower())
+        mock_transport.assert_called_once_with("pause", close_window=False, session_id="sess_test")
+
+    def test_local_action_youtube_pause_requires_firefox_tool(self) -> None:
+        out = direct_chat._maybe_handle_local_action(
+            "en youtube pausá el video",
+            {"web_search", "desktop", "model"},
+            "sess_test",
+        )
+        self.assertIsNotNone(out)
+        self.assertIn("firefox", str(out.get("reply", "")).lower())
+
+    @patch("openclaw_direct_chat._window_matches_profile", return_value=True)
+    @patch("openclaw_direct_chat._wmctrl_windows_for_desktop")
+    @patch("openclaw_direct_chat._xdotool_active_window")
+    def test_fallback_profiled_chrome_anchor_prefers_active_window(
+        self,
+        mock_active,
+        mock_windows,
+        _mock_profile,
+    ) -> None:
+        mock_active.return_value = "0xabc"
+        mock_windows.return_value = [
+            ("0x111", "100", "Google Chrome"),
+            ("0xabc", "101", "YouTube - Google Chrome"),
+        ]
+        wid, status = direct_chat._fallback_profiled_chrome_anchor_for_workspace(0, "Profile 1")
+        self.assertEqual(wid, "0xabc")
+        self.assertEqual(status, "fallback_active_profiled_chrome")
+
 
 if __name__ == "__main__":
     unittest.main()
