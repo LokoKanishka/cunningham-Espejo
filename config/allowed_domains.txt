@@ -1,0 +1,7 @@
+# Allowed domains for browser_vision (one per line)
+google.com
+gemini.google.com
+openai.com
+chatgpt.com
+youtube.com
+wikipedia.org

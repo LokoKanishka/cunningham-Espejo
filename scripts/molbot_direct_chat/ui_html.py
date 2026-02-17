@@ -133,28 +133,17 @@ HTML = r"""<!doctype html>
 	      <div class="row">
 	        <div class="meter" id="meter">RAM: <strong>...</strong> | Proc: <strong>...</strong> | VRAM: <strong>...</strong></div>
 	        <input id="model" value="openai-codex/gpt-5.1-codex-mini" style="min-width:260px" />
-	        <select id="mode">
-	          <option value="conciso">conciso</option>
-	          <option value="operativo" selected>operativo</option>
-          <option value="investigacion">investigacion</option>
-        </select>
+        <button class="alt" id="clearChat">Limpiar chat</button>
         <button class="alt" id="newSession">Nueva sesion</button>
-        <button class="alt" id="exportMd">Export MD</button>
-        <button class="alt" id="exportTxt">Export TXT</button>
       </div>
     </div>
 
 	    <div class="tools">
 	      <span>Herramientas locales:</span>
-	      <label><input type="checkbox" id="toolFirefox" checked /> firefox</label>
 	      <label><input type="checkbox" id="toolWebSearch" checked /> web_search</label>
 	      <label><input type="checkbox" id="toolWebAsk" checked /> web_ask</label>
 	      <label><input type="checkbox" id="toolDesktop" checked /> escritorio</label>
-	      <label><input type="checkbox" id="toolModel" checked /> modelo</label>
-	      <label><input type="checkbox" id="useStream" checked /> streaming</label>
-      <button class="alt" id="btnFirefox">Abrir Firefox</button>
-      <button class="alt" id="btnDesktop">Listar Escritorio</button>
-      <span class="small">Slash: /new /firefox [url] /escritorio /modo [conciso|operativo|investigacion]</span>
+      <span class="small">Slash: /new /escritorio</span>
     </div>
 
     <div id="chat" class="chat"></div>
@@ -175,19 +164,12 @@ HTML = r"""<!doctype html>
     const chatEl = document.getElementById("chat");
     const inputEl = document.getElementById("input");
     const modelEl = document.getElementById("model");
-    const modeEl = document.getElementById("mode");
     const sendEl = document.getElementById("send");
+    const clearChatEl = document.getElementById("clearChat");
     const newSessionEl = document.getElementById("newSession");
-    const exportMdEl = document.getElementById("exportMd");
-	    const exportTxtEl = document.getElementById("exportTxt");
-	    const toolFirefoxEl = document.getElementById("toolFirefox");
 	    const toolWebSearchEl = document.getElementById("toolWebSearch");
 	    const toolWebAskEl = document.getElementById("toolWebAsk");
 	    const toolDesktopEl = document.getElementById("toolDesktop");
-	    const toolModelEl = document.getElementById("toolModel");
-	    const useStreamEl = document.getElementById("useStream");
-    const btnFirefoxEl = document.getElementById("btnFirefox");
-    const btnDesktopEl = document.getElementById("btnDesktop");
 	    const attachEl = document.getElementById("attach");
 	    const attachInfoEl = document.getElementById("attachInfo");
 	    const meterEl = document.getElementById("meter");
@@ -227,11 +209,11 @@ HTML = r"""<!doctype html>
 
 	    function allowedTools() {
 	      const out = [];
-	      if (toolFirefoxEl.checked) out.push("firefox");
+	      out.push("firefox");
 	      if (toolWebSearchEl.checked) out.push("web_search");
 	      if (toolWebAskEl.checked) out.push("web_ask");
 	      if (toolDesktopEl.checked) out.push("desktop");
-	      if (toolModelEl.checked) out.push("model");
+	      out.push("model");
 	      return out;
 	    }
 
@@ -256,26 +238,6 @@ HTML = r"""<!doctype html>
       history = history.slice(-200);
       draw();
       await saveServerHistory();
-    }
-
-    function download(name, content) {
-      const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = name;
-      a.click();
-      URL.revokeObjectURL(url);
-    }
-
-    function exportTxt() {
-      const body = history.map(m => `[${m.role}] ${m.content}`).join("\n\n");
-      download(`molbot_chat_${sessionId}.txt`, body);
-    }
-
-    function exportMd() {
-      const body = history.map(m => `${m.role === "user" ? "## Usuario" : "## Asistente"}\n\n${m.content}`).join("\n\n");
-      download(`molbot_chat_${sessionId}.md`, body);
     }
 
     function startAssistantMessage() {
@@ -311,15 +273,7 @@ HTML = r"""<!doctype html>
       const t = text.trim();
       if (!t.startsWith("/")) return null;
       if (t === "/new") return { kind: "new" };
-      if (t.startsWith("/firefox")) {
-        const url = t.replace(/^\/firefox\s*/i, "").trim();
-        return { kind: "message", text: `abrí firefox ${url}`.trim() };
-      }
       if (t === "/escritorio") return { kind: "message", text: "decime que carpetas y archivos hay en mi escritorio" };
-      if (t.startsWith("/modo")) {
-        const mode = t.replace(/^\/modo\s*/i, "").trim();
-        if (["conciso", "operativo", "investigacion"].includes(mode)) return { kind: "mode", mode };
-      }
       return { kind: "unknown" };
     }
 
@@ -358,14 +312,9 @@ HTML = r"""<!doctype html>
         inputEl.value = "";
         return;
       }
-      if (slash?.kind === "mode") {
-        modeEl.value = slash.mode;
-        inputEl.value = "";
-        return;
-      }
       if (slash?.kind === "message") text = slash.text;
       if (slash?.kind === "unknown") {
-        await push("assistant", "Comando desconocido. Usá /new /firefox [url] /escritorio /modo [conciso|operativo|investigacion]");
+        await push("assistant", "Comando desconocido. Usá /new /escritorio");
         inputEl.value = "";
         return;
       }
@@ -382,14 +331,14 @@ HTML = r"""<!doctype html>
         message: text,
         model: modelEl.value.trim() || "openai-codex/gpt-5.1-codex-mini",
         history,
-        mode: modeEl.value,
+        mode: "operativo",
         session_id: sessionId,
         allowed_tools: allowedTools(),
         attachments: pendingAttachments,
       };
 
       try {
-        if (useStreamEl.checked) {
+        if (true) {
           const res = await fetch("/api/chat/stream", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -421,15 +370,6 @@ HTML = r"""<!doctype html>
             }
           }
           await saveServerHistory();
-        } else {
-          const res = await fetch("/api/chat", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload),
-          });
-          const data = await res.json();
-          if (!res.ok) throw new Error(data.error || (`HTTP ${res.status}`));
-          await push("assistant", data.reply || "(sin respuesta)");
         }
       } catch (err) {
         await push("assistant", "Error: " + (err?.message || String(err)));
@@ -462,11 +402,13 @@ HTML = r"""<!doctype html>
         : "";
     });
 
-    btnFirefoxEl.addEventListener("click", () => sendMessage("abrí firefox"));
-    btnDesktopEl.addEventListener("click", () => sendMessage("decime que carpetas y archivos hay en mi escritorio"));
     newSessionEl.addEventListener("click", () => sendMessage("/new"));
-    exportMdEl.addEventListener("click", exportMd);
-    exportTxtEl.addEventListener("click", exportTxt);
+    clearChatEl.addEventListener("click", async () => {
+      history = [];
+      draw();
+      await saveServerHistory();
+      inputEl.focus();
+    });
 
     loadServerHistory().then(() => inputEl.focus());
     refreshMeter();

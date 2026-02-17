@@ -11,6 +11,13 @@ SITE_DOMAIN_FILTERS = {
     "youtube": "youtube.com",
     "wikipedia": "wikipedia.org",
 }
+SEARCH_VERB_RE = r"(?:busca|buscá|buscar|investiga|investigar|search)"
+WEB_DEST_RE = r"(youtube|wikipedia|internet|la\s+red|web|la\s+web)"
+
+
+def _site_key_from_where(where: str) -> str | None:
+    norm = re.sub(r"\s+", " ", (where or "").strip().lower())
+    return norm if norm in ("youtube", "wikipedia") else None
 
 
 def extract_web_search_query(message: str) -> str | None:
@@ -25,9 +32,7 @@ def extract_web_search_query(message: str) -> str | None:
     if not msg:
         return None
 
-    patterns = [
-        r"(?:busca|buscar|investiga|investigar|search)\s+(?:en\s+internet|en\s+la\s+red|web)\s*[:,-]?\s*(.+)$",
-    ]
+    patterns = [rf"{SEARCH_VERB_RE}\s+(?:en\s+internet|en\s+la\s+red|en\s+la\s+web|en\s+web|web)\s*[:,-]?\s*(.+)$"]
     for pat in patterns:
         m = re.search(pat, msg, flags=re.IGNORECASE | re.DOTALL)
         if not m:
@@ -49,29 +54,53 @@ def extract_web_search_request(message: str) -> tuple[str, str | None] | None:
 
     # "busca <tema> en youtube|wikipedia|internet|la red|web"
     m = re.search(
-        r"(?:busca|buscar|investiga|investigar|search)\s+(.+?)\s+en\s+(youtube|wikipedia|internet|la\s+red|web)\b",
+        rf"{SEARCH_VERB_RE}\s+(.+?)\s+en\s+{WEB_DEST_RE}\b",
         msg,
         flags=re.IGNORECASE | re.DOTALL,
     )
     if m:
         q = (m.group(1) or "").strip().strip("\"'").strip()
         where = (m.group(2) or "").strip().lower()
-        site_key = where if where in ("youtube", "wikipedia") else None
+        site_key = _site_key_from_where(where)
         if q:
             return q[:400], site_key
 
     # "busca en youtube|wikipedia|internet|la red|web: <tema>"
     m = re.search(
-        r"(?:busca|buscar|investiga|investigar|search)\s+en\s+(youtube|wikipedia|internet|la\s+red|web)\s*[:,-]?\s*(.+)$",
+        rf"{SEARCH_VERB_RE}\s+en\s+{WEB_DEST_RE}\s*[:,-]?\s*(.+)$",
         msg,
         flags=re.IGNORECASE | re.DOTALL,
     )
     if m:
         where = (m.group(1) or "").strip().lower()
         q = (m.group(2) or "").strip().strip("\"'").strip()
-        site_key = where if where in ("youtube", "wikipedia") else None
+        site_key = _site_key_from_where(where)
         if q:
             return q[:400], site_key
+
+    # "en youtube|wikipedia busca: <tema>"
+    m = re.search(
+        rf"en\s+(youtube|wikipedia)\s+{SEARCH_VERB_RE}\s*[:,-]?\s*(.+)$",
+        msg,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if m:
+        where = (m.group(1) or "").strip().lower()
+        q = (m.group(2) or "").strip().strip("\"'").strip()
+        if q:
+            return q[:400], where
+
+    # "youtube|wikipedia busca: <tema>" (sin "en")
+    m = re.search(
+        rf"(youtube|wikipedia)\s+{SEARCH_VERB_RE}\s*[:,-]?\s*(.+)$",
+        msg,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if m:
+        where = (m.group(1) or "").strip().lower()
+        q = (m.group(2) or "").strip().strip("\"'").strip()
+        if q:
+            return q[:400], where
 
     q_only = extract_web_search_query(msg)
     if q_only:

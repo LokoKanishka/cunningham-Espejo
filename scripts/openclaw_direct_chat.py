@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -29,6 +30,7 @@ HISTORY_DIR = Path.home() / ".openclaw" / "direct_chat_histories"
 HISTORY_DIR.mkdir(parents=True, exist_ok=True)
 PROFILE_CONFIG_PATH = Path.home() / ".openclaw" / "direct_chat_browser_profiles.json"
 DIRECT_CHAT_ENV_PATH = Path(os.environ.get("OPENCLAW_DIRECT_CHAT_ENV", str(Path.home() / ".openclaw" / "direct_chat.env")))
+GUARDRAIL_SCRIPT_PATH = Path(__file__).resolve().parent / "guardrail_check.sh"
 
 SITE_ALIASES = {
     "chatgpt": "https://chatgpt.com/",
@@ -74,6 +76,7 @@ HTML = UI_HTML
 
 BROWSER_WINDOWS_PATH = Path.home() / ".openclaw" / "direct_chat_opened_browser_windows.json"
 BROWSER_WINDOWS_LOCK_PATH = Path.home() / ".openclaw" / ".direct_chat_opened_browser_windows.lock"
+TRUSTED_DC_ANCHOR_PATH = Path.home() / ".openclaw" / "direct_chat_trusted_anchor.json"
 
 
 def _load_local_env_file(path: Path) -> None:
@@ -346,89 +349,16 @@ def _open_gemini_in_current_workspace_via_ui(
     expected_profile: str | None = None, session_id: str | None = None
 ) -> tuple[bool, str]:
     # Workspace-safe open path using visible UI interactions only.
-    workspace, preferred_anchor = _preferred_workspace_and_anchor(expected_profile)
+    workspace, _preferred_anchor = _preferred_workspace_and_anchor(expected_profile)
     if workspace is None:
         return False, "workspace_not_detected"
 
     wins = _wmctrl_windows_for_desktop(workspace)
     before_ids = {wid for wid, _, _ in wins}
-    anchor = preferred_anchor or ""
+    trusted_anchor, trusted_status = _trusted_or_autodetected_dc_anchor(expected_profile=expected_profile)
+    anchor = trusted_anchor or ""
     if not anchor:
-        for wid, pid_raw, title in wins:
-            t = title.lower().strip()
-            if "molbot direct chat" in t and _window_matches_profile(pid_raw, expected_profile):
-                anchor = wid
-                break
-    if not anchor:
-        for wid, pid_raw, title in wins:
-            t = title.lower().strip()
-            if ("chrome" in t or "google" in t) and _window_matches_profile(pid_raw, expected_profile):
-                anchor = wid
-                break
-    if not anchor:
-        chrome = _chrome_command()
-        if not chrome:
-            return False, "no_anchor_and_chrome_not_found"
-        chrome_user_data = str(Path.home() / ".config" / "google-chrome")
-        try:
-            subprocess.Popen(
-                [
-                    chrome,
-                    f"--user-data-dir={chrome_user_data}",
-                    f"--profile-directory={expected_profile or 'Default'}",
-                    "--new-window",
-                    "about:blank",
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-        except Exception:
-            profile_txt = str(expected_profile or "any")
-            return False, f"no_anchor_window_in_current_workspace profile={profile_txt}"
-
-        spawned = ""
-        for _ in range(80):
-            now = _wmctrl_windows_for_desktop(workspace)
-            for wid, pid_raw, title in now:
-                t = title.lower()
-                if "chrome" not in t and "google" not in t and "about:blank" not in t:
-                    continue
-                if expected_profile and not _window_matches_profile(pid_raw, expected_profile):
-                    continue
-                spawned = wid
-                break
-            if spawned:
-                break
-            time.sleep(0.1)
-        if not spawned:
-            # Detect even if compositor initially placed it in another workspace.
-            for _ in range(80):
-                all_wins = _wmctrl_list()
-                for wid, title in all_wins.items():
-                    t = str(title).lower()
-                    if "chrome" not in t and "google" not in t and "about:blank" not in t:
-                        continue
-                    # Resolve pid/profile via desktop listing snapshots.
-                    for desk_idx in range(0, 12):
-                        for ww, pid_raw, _tt in _wmctrl_windows_for_desktop(desk_idx):
-                            if ww.lower() == wid.lower():
-                                if expected_profile and not _window_matches_profile(pid_raw, expected_profile):
-                                    continue
-                                spawned = wid
-                                break
-                        if spawned:
-                            break
-                    if spawned:
-                        break
-                if spawned:
-                    break
-                time.sleep(0.1)
-        if not spawned:
-            profile_txt = str(expected_profile or "any")
-            return False, f"no_anchor_window_in_current_workspace profile={profile_txt}"
-        _wmctrl_move_window_to_desktop(spawned, workspace)
-        anchor = spawned
+        return False, f"trusted_anchor_required ({trusted_status})"
 
     _xdotool_command(["windowactivate", anchor], timeout=2.5)
     time.sleep(0.22)
@@ -447,7 +377,7 @@ def _open_gemini_in_current_workspace_via_ui(
             break
         time.sleep(0.1)
     if not target:
-        target = anchor
+        return False, "new_window_not_detected_from_anchor"
 
     _xdotool_command(["windowactivate", target], timeout=2.5)
     time.sleep(0.18)
@@ -467,39 +397,8 @@ def _open_gemini_in_current_workspace_via_ui(
         if "gemini.google.com" in url:
             ok_title, _t = _wait_window_title_contains(target, ["gemini"], timeout_s=6.0)
             if not ok_title:
-                # Hard fallback: open Gemini directly with expected profile, then force same workspace.
-                chrome = _chrome_command()
-                if not chrome:
-                    return False, "gemini_not_loaded_and_chrome_not_found"
-                before_spawn = set(_wmctrl_list().keys())
-                chrome_user_data = str(Path.home() / ".config" / "google-chrome")
-                try:
-                    subprocess.Popen(
-                        [
-                            chrome,
-                            f"--user-data-dir={chrome_user_data}",
-                            f"--profile-directory={expected_profile or 'Default'}",
-                            "--new-window",
-                            "https://gemini.google.com/app",
-                        ],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        start_new_session=True,
-                    )
-                except Exception:
-                    cur_title = str(_wmctrl_list().get(target, ""))
-                    return False, f"gemini_not_loaded title={cur_title}"
-                spawned, spawned_desk = _find_new_profiled_chrome_window(before_spawn, expected_profile)
-                if not spawned:
-                    cur_title = str(_wmctrl_list().get(target, ""))
-                    return False, f"gemini_not_loaded title={cur_title}"
-                if spawned_desk is None or spawned_desk != workspace:
-                    _wmctrl_move_window_to_desktop(spawned, workspace)
-                _xdotool_command(["windowactivate", spawned], timeout=2.5)
-                target = spawned
-                ok_title2, final_title = _wait_window_title_contains(target, ["gemini"], timeout_s=8.0)
-                if not ok_title2:
-                    return False, f"gemini_not_loaded title={final_title}"
+                cur_title = str(_wmctrl_list().get(target, ""))
+                return False, f"gemini_not_loaded title={cur_title}"
 
     needs_login, snap = _gemini_window_requires_login(target)
     if needs_login:
@@ -594,8 +493,26 @@ def _wmctrl_current_desktop_site_windows(
     return out
 
 
-def _close_recent_site_window_fallback(site_key: str) -> tuple[bool, str]:
-    wins = _wmctrl_current_desktop_site_windows(site_key)
+def _wmctrl_window_pid(win_id: str) -> str | None:
+    if not shutil.which("wmctrl"):
+        return None
+    try:
+        proc = subprocess.run(["wmctrl", "-lp"], capture_output=True, text=True, timeout=3)
+        for line in (proc.stdout or "").splitlines():
+            parts = line.split(None, 4)
+            if len(parts) < 3:
+                continue
+            wid, _desktop_raw, pid_raw = parts[:3]
+            if wid.lower().strip() == str(win_id).lower().strip():
+                return pid_raw
+    except Exception:
+        return None
+    return None
+
+
+def _close_recent_site_window_fallback(site_key: str, expected_profile: str | None = None) -> tuple[bool, str]:
+    prof = expected_profile if expected_profile is not None else _expected_profile_directory_for_site(site_key)
+    wins = _wmctrl_current_desktop_site_windows(site_key, expected_profile=prof)
     if not wins:
         return False, "no_window_found_current_workspace"
     # wmctrl ordering is stable enough for "last listed" as a practical fallback.
@@ -603,6 +520,26 @@ def _close_recent_site_window_fallback(site_key: str) -> tuple[bool, str]:
     if _wmctrl_close_window(win_id):
         return True, title
     return False, "wmctrl_close_failed"
+
+
+def _close_known_site_windows_in_current_workspace(max_windows: int = 12) -> tuple[int, list[str]]:
+    closed = 0
+    details: list[str] = []
+    site_order = ("youtube", "chatgpt", "gemini", "wikipedia", "gmail")
+    for _ in range(max(1, max_windows)):
+        did_close = False
+        for site_key in site_order:
+            ok, detail = _close_recent_site_window_fallback(
+                site_key, expected_profile=_expected_profile_directory_for_site(site_key)
+            )
+            if ok:
+                closed += 1
+                details.append(f"{site_key}:{detail[:90]}")
+                did_close = True
+                break
+        if not did_close:
+            break
+    return closed, details
 
 
 def _extract_gemini_write_request(message: str) -> str | None:
@@ -1176,6 +1113,112 @@ def _browser_windows_save(data: dict) -> None:
         return
 
 
+def _load_trusted_dc_anchor() -> dict:
+    try:
+        if not TRUSTED_DC_ANCHOR_PATH.exists():
+            return {}
+        raw = json.loads(TRUSTED_DC_ANCHOR_PATH.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            return raw
+    except Exception:
+        return {}
+    return {}
+
+
+def _save_trusted_dc_anchor(win_id: str, desktop: int, title: str) -> None:
+    try:
+        TRUSTED_DC_ANCHOR_PATH.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "win_id": str(win_id),
+            "desktop": int(desktop),
+            "title": str(title),
+            "ts": int(time.time()),
+        }
+        TRUSTED_DC_ANCHOR_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        return
+
+
+def _trusted_dc_anchor_for_current_workspace() -> tuple[str | None, str]:
+    desk = _wmctrl_current_desktop()
+    if desk is None:
+        return None, "workspace_not_detected"
+    data = _load_trusted_dc_anchor()
+    win_id = str(data.get("win_id", "")).strip()
+    if not win_id:
+        return None, "trusted_anchor_not_set"
+    wins = _wmctrl_windows_for_desktop(desk)
+    for wid, _pid_raw, title in wins:
+        if wid.lower() != win_id.lower():
+            continue
+        t = str(title).lower()
+        if "molbot direct chat" not in t:
+            return None, "trusted_anchor_title_mismatch"
+        if "chrome" not in t and "google" not in t:
+            return None, "trusted_anchor_not_chrome"
+        return wid, "ok"
+    return None, "trusted_anchor_not_in_current_workspace"
+
+
+def _active_dc_anchor_for_current_workspace(expected_profile: str | None = None) -> tuple[str | None, str]:
+    desk = _wmctrl_current_desktop()
+    if desk is None:
+        return None, "workspace_not_detected"
+    active = _xdotool_active_window()
+    if not active:
+        return None, "active_window_not_detected"
+    wins = _wmctrl_windows_for_desktop(desk)
+    for wid, pid_raw, title in wins:
+        if wid.lower() != active.lower():
+            continue
+        t = str(title).lower()
+        if "molbot direct chat" not in t:
+            return None, "active_window_not_dc"
+        if "chrome" not in t and "google" not in t:
+            return None, "active_window_not_chrome"
+        if expected_profile and not _window_matches_profile(pid_raw, expected_profile):
+            return None, "active_window_profile_mismatch"
+        _save_trusted_dc_anchor(wid, desk, str(title))
+        return wid, "active_anchor_ok"
+    return None, "active_window_not_in_current_workspace"
+
+
+def _autodetect_dc_anchor_for_current_workspace(expected_profile: str | None = None) -> tuple[str | None, str]:
+    desk = _wmctrl_current_desktop()
+    if desk is None:
+        return None, "workspace_not_detected"
+    candidates: list[tuple[str, str]] = []
+    for wid, pid_raw, title in _wmctrl_windows_for_desktop(desk):
+        t = str(title).lower()
+        if "molbot direct chat" not in t:
+            continue
+        if "chrome" not in t and "google" not in t:
+            continue
+        if expected_profile and not _window_matches_profile(pid_raw, expected_profile):
+            continue
+        candidates.append((wid, str(title)))
+    if len(candidates) == 1:
+        wid, title = candidates[0]
+        _save_trusted_dc_anchor(wid, desk, title)
+        return wid, "auto_anchor_ok"
+    if len(candidates) > 1:
+        return None, "auto_anchor_ambiguous_multiple_windows"
+    return None, "auto_anchor_not_found"
+
+
+def _trusted_or_autodetected_dc_anchor(expected_profile: str | None = None) -> tuple[str | None, str]:
+    active, active_status = _active_dc_anchor_for_current_workspace(expected_profile=expected_profile)
+    if active:
+        return active, active_status
+    trusted, trusted_status = _trusted_dc_anchor_for_current_workspace()
+    if trusted:
+        return trusted, trusted_status
+    auto, auto_status = _autodetect_dc_anchor_for_current_workspace(expected_profile=expected_profile)
+    if auto:
+        return auto, auto_status
+    return None, f"{trusted_status}; {auto_status}"
+
+
 def _record_browser_windows(session_id: str, items: list[dict]) -> None:
     data = _browser_windows_load()
     sess = data.get(session_id)
@@ -1448,47 +1491,58 @@ def _open_url_with_site_context(url: str, site_key: str | None, session_id: str 
     browser = str(site_cfg.get("browser", "")).lower().strip()
     profile = _expected_profile_directory_for_site(site_key)
 
-    if browser == "chrome" and profile:
-        chrome = _chrome_command()
-        if not chrome:
-            return "No pude abrir Chrome: comando no encontrado en el sistema."
-        chrome_user_data = str(Path.home() / ".config" / "google-chrome")
-        before = _wmctrl_list()
-        try:
-            subprocess.Popen(
-                [
-                    chrome,
-                    f"--user-data-dir={chrome_user_data}",
-                    f"--profile-directory={profile}",
-                    "--new-window",
-                    url,
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
+    if browser == "chrome":
+        # Strict: open only from the visible DC Chrome client in this workspace.
+        desk = _wmctrl_current_desktop()
+        if desk is None:
+            return "No pude detectar el workspace actual."
+        wins = _wmctrl_windows_for_desktop(desk)
+        anchor, anchor_status = _trusted_or_autodetected_dc_anchor(expected_profile=profile)
+        if not anchor:
+            return (
+                "No abrí nada para evitar mezclar clientes: no hay ancla confiable del cliente diego "
+                f"en este workspace ({anchor_status}). Decime: 'fijar cliente diego' desde la ventana DC correcta."
             )
-            new_ids: list[str] = []
-            after: dict[str, str] = {}
-            for _ in range(8):
-                time.sleep(0.25)
-                after = _wmctrl_list()
-                if not after:
-                    continue
-                new_ids = [wid for wid in after.keys() if wid not in before]
-                if new_ids:
-                    break
 
-            if session_id and new_ids:
-                _record_browser_windows(
-                    session_id,
-                    [
-                        {"win_id": wid, "title": after.get(wid, ""), "url": url, "site_key": site_key, "ts": time.time()}
-                        for wid in new_ids
-                    ],
-                )
-            return None
-        except Exception as e:
-            return f"No pude abrir Chrome perfil '{profile}': {e}"
+        before_ids = {wid for wid, _, _ in wins}
+        _xdotool_command(["windowactivate", anchor], timeout=2.5)
+        time.sleep(0.18)
+        _xdotool_command(["key", "--window", anchor, "ctrl+n"], timeout=2.0)
+
+        target = ""
+        for _ in range(80):
+            now = _wmctrl_windows_for_desktop(desk)
+            for wid, _pid_raw, title in now:
+                t = str(title).lower()
+                if wid in before_ids:
+                    continue
+                if "chrome" in t or "google" in t:
+                    target = wid
+                    break
+            if target:
+                break
+            time.sleep(0.08)
+        if not target:
+            return "No abrí nada para evitar mezclar clientes: no se detectó una nueva ventana desde el cliente diego."
+
+        _xdotool_command(["windowactivate", target], timeout=2.5)
+        time.sleep(0.10)
+        _xdotool_command(["key", "--window", target, "ctrl+l"], timeout=2.0)
+        time.sleep(0.06)
+        _xdotool_command(
+            ["type", "--delay", "16", "--clearmodifiers", "--window", target, str(url)],
+            timeout=8.0,
+        )
+        time.sleep(0.06)
+        _xdotool_command(["key", "--window", target, "Return"], timeout=2.0)
+
+        if session_id:
+            title = _wmctrl_list().get(target, "")
+            _record_browser_windows(
+                session_id,
+                [{"win_id": target, "title": title, "url": url, "site_key": site_key, "ts": time.time()}],
+            )
+        return None
 
     try:
         subprocess.Popen(
@@ -1560,6 +1614,157 @@ def _build_site_search_url(site_key: str, query: str) -> str | None:
         return None
     return template.format(q=quote_plus(query))
 
+
+def _looks_like_youtube_play_request(normalized: str) -> bool:
+    if "youtube" not in normalized and "you tube" not in normalized:
+        return False
+    playish = any(
+        t in normalized
+        for t in (
+            "reproduc",
+            "play",
+            "pone",
+            "ponelo",
+            "ponela",
+            "primer video",
+            "abrí un video",
+            "abri un video",
+            "abrir un video",
+        )
+    )
+    return playish
+
+
+def _sanitize_youtube_query(query: str) -> str:
+    q = (query or "").strip().strip("\"'").strip()
+    if not q:
+        return q
+    # Cut trailing action clauses ("y abrí...", "y reproducilo...", "y dale play...")
+    q = re.sub(
+        r"\s+(?:y|e)\s+(?:abri|abr[ií]|abrir|abre|reproduc\w*|pon(?:e|é)\w*|dale\s+play|play)\b.*$",
+        "",
+        q,
+        flags=re.IGNORECASE,
+    ).strip()
+    # Keep query compact and deterministic for SearXNG/yt-dlp.
+    q = re.sub(r"\s+", " ", q).strip(" ,.;:-")
+    return q
+
+
+def _is_direct_youtube_video_url(url: str) -> bool:
+    u = str(url or "").strip()
+    if not u:
+        return False
+    p = urlparse(u)
+    host = (p.netloc or "").lower()
+    if "youtu.be" in host:
+        return bool((p.path or "").strip("/"))
+    if "youtube.com" not in host:
+        return False
+    path = (p.path or "").strip()
+    if path.startswith("/watch"):
+        q = parse_qs(p.query)
+        v = str((q.get("v", [""])[0] or "")).strip()
+        return bool(v)
+    if path.startswith("/shorts/") or path.startswith("/live/"):
+        return bool(path.split("/", 2)[-1].strip())
+    return False
+
+
+def _pick_first_youtube_video_url(query: str) -> tuple[str | None, str]:
+    clean_query = _sanitize_youtube_query(query) or (query or "").strip()
+
+    def from_ytdlp() -> str | None:
+        ytdlp = shutil.which("yt-dlp")
+        if not ytdlp:
+            return None
+        try:
+            proc = subprocess.run(
+                [
+                    ytdlp,
+                    "--no-playlist",
+                    "--get-id",
+                    "--default-search",
+                    "ytsearch",
+                    f"ytsearch1:{clean_query}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=14,
+            )
+            vid = (proc.stdout or "").strip().splitlines()
+            if not vid:
+                return None
+            v = vid[0].strip()
+            if not v:
+                return None
+            return f"https://www.youtube.com/watch?v={v}"
+        except Exception:
+            return None
+
+    def normalize_candidate(raw_url: str) -> str:
+        u = str(raw_url or "").strip()
+        if not u:
+            return ""
+        p = urlparse(u)
+        host = (p.netloc or "").lower()
+        if "youtube.com" in host or "youtu.be" in host:
+            return u
+        # Some engines wrap destination in query param (e.g., ?url=...)
+        try:
+            q = parse_qs(p.query)
+            for key in ("url", "target", "u"):
+                vals = q.get(key, [])
+                if not vals:
+                    continue
+                cand = str(vals[0]).strip()
+                cp = urlparse(cand)
+                ch = (cp.netloc or "").lower()
+                if "youtube.com" in ch or "youtu.be" in ch:
+                    return cand
+        except Exception:
+            return ""
+        return ""
+
+    results: list[dict] = []
+    sp = web_search.searxng_search(clean_query, site_key="youtube", max_results=10)
+    if sp.get("ok") and isinstance(sp.get("results"), list):
+        results.extend([r for r in sp.get("results", []) if isinstance(r, dict)])
+    # Fallback: some SearXNG setups don't keep YouTube engine/domain filter stable.
+    sp2 = web_search.searxng_search(clean_query, site_key=None, max_results=12)
+    if sp2.get("ok") and isinstance(sp2.get("results"), list):
+        results.extend([r for r in sp2.get("results", []) if isinstance(r, dict)])
+    if not results:
+        yd = from_ytdlp()
+        if yd:
+            chosen = yd
+            if "autoplay=" not in chosen:
+                chosen = chosen + ("&" if "?" in chosen else "?") + "autoplay=1"
+            return chosen, "ok_ytdlp"
+        return None, "no_results"
+
+    preferred: str | None = None
+    for r in results:
+        if not isinstance(r, dict):
+            continue
+        url = normalize_candidate(str(r.get("url", "")).strip())
+        if not url:
+            continue
+        if not _is_direct_youtube_video_url(url):
+            continue
+        preferred = url
+        break
+    chosen = preferred
+    if not chosen:
+        yd = from_ytdlp()
+        if yd:
+            chosen = yd
+        else:
+            return None, "no_youtube_video_url"
+    if "autoplay=" not in chosen:
+        chosen = chosen + ("&" if "?" in chosen else "?") + "autoplay=1"
+    return chosen, "ok"
+
 def _history_path(session_id: str) -> Path:
     return HISTORY_DIR / f"{_safe_session_id(session_id)}.json"
 
@@ -1587,23 +1792,122 @@ def _save_history(session_id: str, history: list) -> None:
     p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _guardrail_check(session_id: str, tool_name: str, params: dict | None = None) -> tuple[bool, str]:
+    if str(os.environ.get("GUARDRAIL_ENABLED", "1")).strip().lower() not in ("1", "true", "yes"):
+        return True, "guardrail_disabled"
+    fail_closed = str(os.environ.get("GUARDRAIL_FAIL_CLOSED", "0")).strip().lower() in ("1", "true", "yes")
+    if not GUARDRAIL_SCRIPT_PATH.exists():
+        return True, "guardrail_script_missing"
+    payload = params or {}
+    try:
+        proc = subprocess.run(
+            [str(GUARDRAIL_SCRIPT_PATH), str(session_id), str(tool_name), json.dumps(payload, ensure_ascii=False)],
+            capture_output=True,
+            text=True,
+            timeout=6.0,
+            cwd=str(Path(__file__).resolve().parent.parent),
+        )
+    except Exception as e:
+        if fail_closed:
+            return False, f"guardrail_exec_error: {e}"
+        return True, f"guardrail_bypass_exec_error: {e}"
+    detail = (proc.stderr or proc.stdout or "").strip()
+    if proc.returncode != 0:
+        if (not fail_closed) and detail.startswith("GUARDRAIL_ERROR:"):
+            return True, f"guardrail_bypass_infra_error: {detail}"
+        return False, detail or f"guardrail_denied rc={proc.returncode}"
+    return True, detail or "guardrail_ok"
+
+
+def _guardrail_block_reply(tool_name: str, detail: str) -> str:
+    reason = str(detail or "").strip()[:280]
+    return (
+        f"Bloqueado por guardrail ({tool_name}). "
+        f"Detalle: {reason if reason else 'policy_denied'}"
+    )
+
+
+def _normalize_allowed_tool_name(name: str) -> str:
+    t = str(name or "").strip().lower()
+    alias = {
+        "escritorio": "desktop",
+        "modelo": "model",
+    }
+    return alias.get(t, t)
+
+
+def _extract_allowed_tools(payload: dict) -> set[str]:
+    out: set[str] = set()
+
+    raw = payload.get("allowed_tools")
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            if v:
+                out.add(_normalize_allowed_tool_name(str(k)))
+    elif isinstance(raw, (list, tuple, set)):
+        for item in raw:
+            if isinstance(item, str):
+                t = _normalize_allowed_tool_name(item)
+                if t:
+                    out.add(t)
+
+    # Backward compatibility with legacy clients/scripts that still send {"tools": {...}}.
+    legacy = payload.get("tools")
+    if isinstance(legacy, dict):
+        for k, v in legacy.items():
+            if v:
+                t = _normalize_allowed_tool_name(str(k))
+                if t:
+                    out.add(t)
+    elif isinstance(legacy, (list, tuple, set)):
+        for item in legacy:
+            if isinstance(item, str):
+                t = _normalize_allowed_tool_name(item)
+                if t:
+                    out.add(t)
+
+    return out
+
+
 def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id: str) -> dict | None:
     text = message.lower()
     normalized = _normalize_text(message)
+    shadow_explicit = any(k in normalized for k in ("shadow", "experimental", "modo shadow"))
+
+    if (
+        ("cliente" in normalized and "diego" in normalized and any(k in normalized for k in ("fij", "usar", "set")))
+        or ("este cliente es diego" in normalized)
+    ):
+        active = _xdotool_active_window()
+        if not active:
+            return {"reply": "No pude detectar la ventana activa. Activá DC en Chrome y repetí."}
+        title = str(_wmctrl_list().get(active, ""))
+        t = title.lower()
+        if "molbot direct chat" not in t or ("chrome" not in t and "google" not in t):
+            return {"reply": "La ventana activa no es Molbot Direct Chat en Chrome. Activala y repetí."}
+        desk = _wmctrl_window_desktop(active)
+        if desk is None:
+            return {"reply": "No pude detectar el workspace de la ventana activa."}
+        _save_trusted_dc_anchor(active, desk, title)
+        return {"reply": f"Listo. Fijé este cliente como diego (anchor={active}, workspace={desk})."}
 
     # Close browser windows opened by this system (tracked by session).
     # Examples:
     # - "cerrá las ventanas web que abriste"
     # - "reset ventanas web"
     if any(k in normalized for k in ("web", "navegador", "browser")) and any(k in normalized for k in ("ventan", "windows")):
-        if any(k in normalized for k in ("reset", "reinic", "olvid", "limpia")):
-            _reset_recorded_browser_windows(session_id=session_id)
-            return {"reply": "Listo: limpié el registro de ventanas web abiertas por el sistema para esta sesión."}
         if any(k in normalized for k in ("cerr", "close", "cierra")):
             closed, errors = _close_recorded_browser_windows(session_id=session_id)
+            if closed == 0 and not errors:
+                fallback_closed, _fallback_details = _close_known_site_windows_in_current_workspace(max_windows=12)
+                if fallback_closed > 0:
+                    return {"reply": f"Cerré {fallback_closed} ventana(s) web en este workspace por fallback de sitio."}
             if errors:
                 return {"reply": f"Cerré {closed} ventana(s) web que abrí. Errores: {', '.join(errors)[:260]}"}
             return {"reply": f"Cerré {closed} ventana(s) web que abrí (solo las registradas por el sistema)."}
+        if any(k in normalized for k in ("reset", "reinic", "olvid", "limpia")):
+            _reset_recorded_browser_windows(session_id=session_id)
+            return {"reply": "Listo: limpié el registro de ventanas web abiertas por el sistema para esta sesión."}
 
     # Human variant fallback:
     # "cerrá la ventana que abriste recién" (without explicit "web/browser")
@@ -1615,13 +1919,11 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
             if errors:
                 return {"reply": f"Cerré {closed} ventana(s) web que abrí. Errores: {', '.join(errors)[:260]}"}
             return {"reply": f"Cerré {closed} ventana(s) web que abrí (solo las registradas por el sistema)."}
+        fallback_closed, _fallback_details = _close_known_site_windows_in_current_workspace(max_windows=12)
+        if fallback_closed > 0:
+            return {"reply": f"Cerré {fallback_closed} ventana(s) web en este workspace por fallback de sitio."}
 
-        # If no tracked windows, allow a safe fallback only for explicit Gemini mentions.
-        if any(t in normalized for t in SITE_CANONICAL_TOKENS.get("gemini", [])):
-            ok, detail = _close_recent_site_window_fallback("gemini")
-            if ok:
-                return {"reply": f"Cerré la ventana de Gemini más reciente en este workspace: {detail[:120]}"}
-            return {"reply": "No veo ninguna ventana de Gemini abierta en este workspace."}
+        return {"reply": "No veo ventanas registradas por esta sesión para cerrar."}
 
     # Safe local opens/closes for Desktop items (no deletion).
     # Examples:
@@ -1632,12 +1934,18 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         if any(k in normalized for k in ("reset", "reinic", "olvid", "limpia")) and any(k in normalized for k in ("ventan", "registro", "track")):
             if "desktop" not in allowed_tools:
                 return {"reply": "La herramienta local 'desktop' está deshabilitada en esta sesión."}
+            ok_g, gd = _guardrail_check(session_id, "desktop", {"action": "reset_windows"})
+            if not ok_g:
+                return {"reply": _guardrail_block_reply("desktop", gd)}
             desktop_ops.reset_recorded_windows(session_id=session_id)
             return {"reply": "Listo: limpié el registro de ventanas abiertas por el sistema para esta sesión."}
 
         if any(k in normalized for k in ("cerr", "close", "cierra")):
             if "desktop" not in allowed_tools:
                 return {"reply": "La herramienta local 'desktop' está deshabilitada en esta sesión."}
+            ok_g, gd = _guardrail_check(session_id, "desktop", {"action": "close_windows"})
+            if not ok_g:
+                return {"reply": _guardrail_block_reply("desktop", gd)}
             closed, errors = desktop_ops.close_recorded_windows(session_id=session_id)
             if errors:
                 return {"reply": f"Cerré {closed} ventana(s) que abrí. Errores: {', '.join(errors)[:260]}"}
@@ -1652,6 +1960,9 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
             if "desktop" not in allowed_tools:
                 return {"reply": "La herramienta local 'desktop' está deshabilitada en esta sesión."}
             name = m_open.group(1).strip(" \"'").strip()
+            ok_g, gd = _guardrail_check(session_id, "desktop", {"action": "open_item", "name": name})
+            if not ok_g:
+                return {"reply": _guardrail_block_reply("desktop", gd)}
             res = desktop_ops.open_desktop_item(name, session_id=session_id)
             if not res.get("ok"):
                 return {"reply": str(res.get("error", "No pude abrir el item del escritorio."))}
@@ -1671,8 +1982,19 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
     if m_login:
         if ("web_ask" not in allowed_tools) and ("firefox" not in allowed_tools):
             return {"reply": "La herramienta local 'web_ask' está deshabilitada en esta sesión."}
+        if not shadow_explicit:
+            return {
+                "reply": (
+                    "Bloqueado por política de cliente: login web_ask usa shadow profile. "
+                    "Si querés ejecutarlo explícitamente, pedilo con 'login shadow gemini' o 'login shadow chatgpt'."
+                )
+            }
         provider = m_login.group(1).strip().lower()
         site_key = "chatgpt" if "chat" in provider else "gemini"
+        login_url = _site_url(site_key) or f"https://{site_key}.com/"
+        ok_g, gd = _guardrail_check(session_id, "browser_vision", {"action": "bootstrap_login", "url": login_url, "site": site_key})
+        if not ok_g:
+            return {"reply": _guardrail_block_reply("browser_vision", gd)}
         ok, info = web_ask.bootstrap_login(site_key)
         if not ok:
             return {"reply": f"No pude lanzar bootstrap de login para {site_key}: {info}"}
@@ -1688,6 +2010,13 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
     if gemini_ask_text:
         if ("web_ask" not in allowed_tools) and ("firefox" not in allowed_tools):
             return {"reply": "La herramienta local 'gemini write' está deshabilitada en esta sesión."}
+        ok_g, gd = _guardrail_check(
+            session_id,
+            "web_ask",
+            {"site": "gemini", "prompt": gemini_ask_text[:500], "action": "ask"},
+        )
+        if not ok_g:
+            return {"reply": _guardrail_block_reply("web_ask", gd)}
         result = web_ask.run_web_ask("gemini", gemini_ask_text, timeout_ms=60000, followups=None)
         reply = web_ask.format_web_ask_reply("gemini", gemini_ask_text, result)
         return {"reply": reply}
@@ -1696,6 +2025,13 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
     if gemini_write_text:
         if ("web_ask" not in allowed_tools) and ("firefox" not in allowed_tools):
             return {"reply": "La herramienta local 'gemini write' está deshabilitada en esta sesión."}
+        ok_g, gd = _guardrail_check(
+            session_id,
+            "browser_vision",
+            {"action": "gemini_write", "url": "https://gemini.google.com/app", "text": gemini_write_text[:500]},
+        )
+        if not ok_g:
+            return {"reply": _guardrail_block_reply("browser_vision", gd)}
         ok, detail = _gemini_write_in_current_workspace(gemini_write_text, session_id=session_id)
         if ok:
             return {"reply": f"Listo: escribí en Gemini \"{gemini_write_text}\" y di Enter. ({detail})"}
@@ -1708,24 +2044,31 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         if ("web_ask" not in allowed_tools) and ("firefox" not in allowed_tools):
             return {"reply": "La herramienta local 'web_ask' está deshabilitada en esta sesión."}
         site_key, prompt, followups = web_req
+        site_url = _site_url(site_key) or f"https://{site_key}.com/"
+        ok_g, gd = _guardrail_check(
+            session_id,
+            "web_ask",
+            {"site": site_key, "url": site_url, "prompt": prompt[:500], "action": "dialog"},
+        )
+        if not ok_g:
+            return {"reply": _guardrail_block_reply("web_ask", gd)}
 
         result = web_ask.run_web_ask(site_key, prompt, timeout_ms=60000, followups=followups)
         reply = web_ask.format_web_ask_reply(site_key, prompt, result)
         if str(result.get("status", "")).strip() in ("login_required", "captcha_required"):
-            ok, info = web_ask.bootstrap_login(site_key)
-            if ok:
-                reply += (
-                    "\n\nAcción automática: abrí una ventana de Chrome (shadow profile) para que inicies sesión. "
-                    "Si aparece verificación humana/captcha, resolvela ahí. Luego cerrá esa ventana y repetí tu pedido."
-                )
-            else:
-                reply += f"\n\nNo pude abrir ventana de login automáticamente: {info}"
+            reply += (
+                "\n\nNo abrí shadow profile automáticamente (política estricta de cliente). "
+                "Si querés hacerlo, pedí explícitamente: 'login shadow gemini' o 'login shadow chatgpt'."
+            )
         return {"reply": reply}
 
     if "firefox" in text and any(k in normalized for k in ("abr", "open", "lanz", "inici")):
         if "firefox" not in allowed_tools:
             return {"reply": "La herramienta local 'firefox' está deshabilitada en esta sesión."}
         url = _extract_url(message) or "about:blank"
+        ok_g, gd = _guardrail_check(session_id, "browser_vision", {"action": "open_url", "url": url})
+        if not ok_g:
+            return {"reply": _guardrail_block_reply("browser_vision", gd)}
         opened, error = _open_site_urls([(None, url)], session_id=session_id)
         if error:
             return {"reply": error}
@@ -1739,14 +2082,52 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
 
     # Hard rule: "open Gemini" (or close variants) always executes the same deterministic flow.
     if "firefox" in allowed_tools and _looks_like_direct_gemini_open(normalized) and not wants_search and not wants_new_chat:
+        ok_g, gd = _guardrail_check(
+            session_id,
+            "browser_vision",
+            {"action": "open_site", "site": "gemini", "url": "https://gemini.google.com/app"},
+        )
+        if not ok_g:
+            return {"reply": _guardrail_block_reply("browser_vision", gd)}
         opened, error = _open_gemini_client_flow(session_id=session_id)
         if error:
             return {"reply": error}
         return {"reply": "Abrí Gemini en el cliente correcto con el flujo entrenado (Google -> Gemini)."}
 
     search_req = web_search.extract_web_search_request(message)
+    if "firefox" in allowed_tools and search_req and search_req[1] == "youtube" and _looks_like_youtube_play_request(normalized):
+        query = search_req[0]
+        ok_g, gd = _guardrail_check(
+            session_id,
+            "web_search",
+            {"action": "search_video", "query": query[:500], "site": "youtube"},
+        )
+        if not ok_g:
+            return {"reply": _guardrail_block_reply("web_search", gd)}
+        video_url, reason = _pick_first_youtube_video_url(query)
+        if not video_url:
+            return {"reply": f"No pude encontrar un video reproducible en YouTube para '{query}'. ({reason})"}
+        ok_g2, gd2 = _guardrail_check(
+            session_id,
+            "browser_vision",
+            {"action": "open_video", "site": "youtube", "url": video_url},
+        )
+        if not ok_g2:
+            return {"reply": _guardrail_block_reply("browser_vision", gd2)}
+        opened, error = _open_site_urls([("youtube", video_url)], session_id=session_id)
+        if error:
+            return {"reply": error}
+        return {"reply": f"Abrí y reproduzco un video de YouTube sobre '{query}': {opened[0]}"}
+
     if search_req and ("web_search" in allowed_tools):
         query, site_key = search_req
+        ok_g, gd = _guardrail_check(
+            session_id,
+            "web_search",
+            {"action": "search", "query": query[:500], "site": (site_key or "")},
+        )
+        if not ok_g:
+            return {"reply": _guardrail_block_reply("web_search", gd)}
         sp = web_search.searxng_search(query, site_key=site_key)
         if not sp.get("ok"):
             err = str(sp.get("error", "web_search_failed"))
@@ -1769,6 +2150,14 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
                 entries.append(("wikipedia", wiki_url))
 
         if entries:
+            urls = [u for _k, u in entries if u]
+            ok_g, gd = _guardrail_check(
+                session_id,
+                "browser_vision",
+                {"action": "open_multiple", "url": (urls[0] if urls else ""), "urls": urls},
+            )
+            if not ok_g:
+                return {"reply": _guardrail_block_reply("browser_vision", gd)}
             opened, error = _open_site_urls(entries, session_id=session_id)
             if error:
                 return {"reply": error}
@@ -1785,13 +2174,30 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         if query in ("el tema", "ese tema", "este tema") and topic:
             query = topic
         url = _build_site_search_url("youtube", query)
-        opened, error = _open_site_urls([("youtube", url)], session_id=session_id) if url else ([], "No pude construir la búsqueda en YouTube.")
+        if not url:
+            return {"reply": "No pude construir la búsqueda en YouTube."}
+        ok_g, gd = _guardrail_check(
+            session_id,
+            "browser_vision",
+            {"action": "open_site_search", "site": "youtube", "url": url},
+        )
+        if not ok_g:
+            return {"reply": _guardrail_block_reply("browser_vision", gd)}
+        opened, error = _open_site_urls([("youtube", url)], session_id=session_id)
         if error:
             return {"reply": error}
         return {"reply": f"Abrí videos de YouTube sobre '{query}': {opened[0]}"}
 
     if "firefox" in allowed_tools and site_keys and wants_open and not wants_search and not wants_new_chat:
         entries = [(site_key, _site_url(site_key)) for site_key in site_keys]
+        urls = [u for _k, u in entries if u]
+        ok_g, gd = _guardrail_check(
+            session_id,
+            "browser_vision",
+            {"action": "open_sites", "url": (urls[0] if urls else ""), "urls": urls},
+        )
+        if not ok_g:
+            return {"reply": _guardrail_block_reply("browser_vision", gd)}
         opened, error = _open_site_urls(entries, session_id=session_id)
         if error:
             return {"reply": error}
@@ -1805,6 +2211,9 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
     if wants_desktop and (asks_dirs or asks_files or asks_list):
         if "desktop" not in allowed_tools:
             return {"reply": "La herramienta local 'desktop' está deshabilitada en esta sesión."}
+        ok_g, gd = _guardrail_check(session_id, "desktop", {"action": "list_desktop"})
+        if not ok_g:
+            return {"reply": _guardrail_block_reply("desktop", gd)}
         home = Path.home()
         candidates = [home / "Escritorio", home / "Desktop"]
         desktop = next((p for p in candidates if p.exists() and p.is_dir()), None)
@@ -2019,7 +2428,7 @@ class Handler(BaseHTTPRequestHandler):
             session_id = _safe_session_id(str(payload.get("session_id", "default")))
             mode = str(payload.get("mode", "operativo"))
             attachments = payload.get("attachments", [])
-            allowed_tools = set(payload.get("allowed_tools", []))
+            allowed_tools = _extract_allowed_tools(payload)
             # Local-only tools that should not be advertised to the upstream model.
             allowed_tools_for_prompt = set(allowed_tools)
             allowed_tools_for_prompt.discard("web_search")
@@ -2053,6 +2462,30 @@ class Handler(BaseHTTPRequestHandler):
             messages = self._build_messages(message, history, mode, allowed_tools_for_prompt, attachments)
             q = web_search.extract_web_search_query(message)
             if q and ("web_search" in allowed_tools):
+                ok_g, gd = _guardrail_check(
+                    session_id,
+                    "web_search",
+                    {"action": "search", "query": q[:500], "site": ""},
+                )
+                if not ok_g:
+                    blocked = _guardrail_block_reply("web_search", gd)
+                    if self.path == "/api/chat/stream":
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/event-stream")
+                        self.send_header("Cache-Control", "no-cache")
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                        out = json.dumps({"token": blocked}, ensure_ascii=False).encode("utf-8")
+                        try:
+                            self.wfile.write(b"data: " + out + b"\n\n")
+                            self.wfile.write(b"data: [DONE]\n\n")
+                            self.wfile.flush()
+                        except BrokenPipeError:
+                            return
+                        self.close_connection = True
+                        return
+                    self._json(200, {"reply": blocked})
+                    return
                 sp = web_search.searxng_search(q)
                 if not sp.get("ok"):
                     err = str(sp.get("error", "web_search_failed"))

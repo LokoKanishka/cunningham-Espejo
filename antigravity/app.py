@@ -16,7 +16,19 @@ app = FastAPI(title="Antigravity Sandbox")
 WORKSPACE_ROOT = Path(os.environ.get("ANTIGRAVITY_WORKSPACE", "/workspace"))
 RUNS_DIR = WORKSPACE_ROOT / "antigravity_runs"
 
-DEFAULT_TIMEOUT_S = 15
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+DEFAULT_TIMEOUT_S = _env_int("ANTIGRAVITY_DEFAULT_TIMEOUT_S", 30)
+MAX_TIMEOUT_S = _env_int("ANTIGRAVITY_MAX_TIMEOUT_S", 30)
 
 
 @app.get("/healthz")
@@ -37,6 +49,11 @@ class ExecuteResponse(BaseModel):
     returncode: int
     artifacts: List[str]
     run_dir: str
+
+
+def _effective_timeout(requested: Optional[int]) -> int:
+    req = DEFAULT_TIMEOUT_S if requested is None else max(1, int(requested))
+    return min(req, MAX_TIMEOUT_S)
 
 
 def _guard_code(code: str) -> None:
@@ -67,7 +84,7 @@ def execute(req: ExecuteRequest) -> ExecuteResponse:
     run_file = run_dir / "run.py"
     run_file.write_text(req.code, encoding="utf-8")
 
-    timeout_s = req.timeout_s or DEFAULT_TIMEOUT_S
+    timeout_s = _effective_timeout(req.timeout_s)
 
     try:
         completed = subprocess.run(
@@ -83,7 +100,7 @@ def execute(req: ExecuteRequest) -> ExecuteResponse:
         rc = completed.returncode if completed.returncode is not None else 0
     except subprocess.TimeoutExpired as exc:
         stdout = exc.stdout or ""
-        stderr = (exc.stderr or "") + "\nTimed out."
+        stderr = (exc.stderr or "") + f"\nTimed out after {timeout_s}s."
         rc = 124
 
     artifacts = _collect_artifacts(run_dir)
