@@ -1744,16 +1744,14 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
             return {"reply": error}
         return {"reply": "Abrí Gemini en el cliente correcto con el flujo entrenado (Google -> Gemini)."}
 
-    m_site_search = re.search(r"(?:busca|buscar|search)\s+(.+?)\s+en\s+(youtube|wikipedia)", normalized, flags=re.IGNORECASE)
-    if "firefox" in allowed_tools and m_site_search:
-        query = m_site_search.group(1).strip()
-        site = m_site_search.group(2).strip()
-        url = _build_site_search_url(site, query)
-        if url:
-            opened, error = _open_site_urls([(site, url)], session_id=session_id)
-            if error:
-                return {"reply": error}
-            return {"reply": f"Listo, busqué '{query}' en {site} y abrí: {opened[0]}"}
+    search_req = web_search.extract_web_search_request(message)
+    if search_req and ("web_search" in allowed_tools):
+        query, site_key = search_req
+        sp = web_search.searxng_search(query, site_key=site_key)
+        if not sp.get("ok"):
+            err = str(sp.get("error", "web_search_failed"))
+            return {"reply": f"No pude buscar en SearXNG local: {err}"}
+        return {"reply": web_search.format_results_for_user(sp)}
 
     if "firefox" in allowed_tools and wants_new_chat and topic and ("chatgpt" in site_keys or "gemini" in site_keys):
         entries = []

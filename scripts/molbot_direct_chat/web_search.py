@@ -7,6 +7,10 @@ import urllib.request
 
 
 SEARXNG_URL = "http://127.0.0.1:8080/search"
+SITE_DOMAIN_FILTERS = {
+    "youtube": "youtube.com",
+    "wikipedia": "wikipedia.org",
+}
 
 
 def extract_web_search_query(message: str) -> str | None:
@@ -34,7 +38,50 @@ def extract_web_search_query(message: str) -> str | None:
     return None
 
 
-def searxng_search(query: str, *, max_results: int = 6, timeout_s: int = 12) -> dict:
+def extract_web_search_request(message: str) -> tuple[str, str | None] | None:
+    """
+    Returns (query, site_key) for explicit free-web search requests.
+    site_key is one of: None, "youtube", "wikipedia".
+    """
+    msg = (message or "").strip()
+    if not msg:
+        return None
+
+    # "busca <tema> en youtube|wikipedia|internet|la red|web"
+    m = re.search(
+        r"(?:busca|buscar|investiga|investigar|search)\s+(.+?)\s+en\s+(youtube|wikipedia|internet|la\s+red|web)\b",
+        msg,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if m:
+        q = (m.group(1) or "").strip().strip("\"'").strip()
+        where = (m.group(2) or "").strip().lower()
+        site_key = where if where in ("youtube", "wikipedia") else None
+        if q:
+            return q[:400], site_key
+
+    # "busca en youtube|wikipedia|internet|la red|web: <tema>"
+    m = re.search(
+        r"(?:busca|buscar|investiga|investigar|search)\s+en\s+(youtube|wikipedia|internet|la\s+red|web)\s*[:,-]?\s*(.+)$",
+        msg,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if m:
+        where = (m.group(1) or "").strip().lower()
+        q = (m.group(2) or "").strip().strip("\"'").strip()
+        site_key = where if where in ("youtube", "wikipedia") else None
+        if q:
+            return q[:400], site_key
+
+    q_only = extract_web_search_query(msg)
+    if q_only:
+        return q_only, None
+    return None
+
+
+def searxng_search(
+    query: str, *, site_key: str | None = None, max_results: int = 6, timeout_s: int = 12
+) -> dict:
     """
     Calls local SearXNG. Requires `search.formats` to include `json` in SearXNG settings.
     """
@@ -42,7 +89,9 @@ def searxng_search(query: str, *, max_results: int = 6, timeout_s: int = 12) -> 
     if not q:
         return {"ok": False, "status": "empty_query", "query": "", "results": [], "error": "empty_query"}
 
-    data = urllib.parse.urlencode({"q": q, "format": "json"}).encode("utf-8")
+    domain = SITE_DOMAIN_FILTERS.get(str(site_key or "").strip().lower(), "")
+    q_eff = f"{q} site:{domain}".strip() if domain else q
+    data = urllib.parse.urlencode({"q": q_eff, "format": "json"}).encode("utf-8")
     req = urllib.request.Request(
         SEARXNG_URL,
         data=data,
@@ -53,7 +102,7 @@ def searxng_search(query: str, *, max_results: int = 6, timeout_s: int = 12) -> 
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
     except Exception as e:
-        return {"ok": False, "status": "network_error", "query": q, "results": [], "error": str(e)}
+        return {"ok": False, "status": "network_error", "query": q, "results": [], "error": str(e), "site_key": site_key}
 
     try:
         payload = json.loads(raw)
@@ -65,6 +114,7 @@ def searxng_search(query: str, *, max_results: int = 6, timeout_s: int = 12) -> 
             "results": [],
             "error": f"{e}",
             "raw": raw[:600],
+            "site_key": site_key,
         }
 
     results = payload.get("results", [])
@@ -83,7 +133,7 @@ def searxng_search(query: str, *, max_results: int = 6, timeout_s: int = 12) -> 
             continue
         trimmed.append({"url": url, "title": title, "content": content, "engine": engine})
 
-    return {"ok": True, "status": "ok", "query": q, "results": trimmed}
+    return {"ok": True, "status": "ok", "query": q, "results": trimmed, "site_key": site_key}
 
 
 def format_results_for_prompt(search_payload: dict) -> str:
@@ -91,7 +141,9 @@ def format_results_for_prompt(search_payload: dict) -> str:
     results = search_payload.get("results", [])
     if not isinstance(results, list):
         results = []
-    lines = [f"Resultados SearXNG (local) para: {q}"]
+    site_key = str(search_payload.get("site_key", "")).strip()
+    where = f" en {site_key}" if site_key in ("youtube", "wikipedia") else ""
+    lines = [f"Resultados SearXNG (local){where} para: {q}"]
     for i, r in enumerate(results[:8], 1):
         if not isinstance(r, dict):
             continue
@@ -106,3 +158,24 @@ def format_results_for_prompt(search_payload: dict) -> str:
         lines.append(f"{i}. {title}{engine_note}\n{url}\n{snippet}".strip())
     return "\n\n".join(lines).strip()
 
+
+def format_results_for_user(search_payload: dict) -> str:
+    q = str(search_payload.get("query", "")).strip()
+    site_key = str(search_payload.get("site_key", "")).strip()
+    where = f" en {site_key}" if site_key in ("youtube", "wikipedia") else " en la web"
+    results = search_payload.get("results", [])
+    if not isinstance(results, list):
+        results = []
+    if not results:
+        return f"No encontré resultados{where} para: {q}"
+    lines = [f"Encontré {len(results)} resultado(s){where} para: {q}"]
+    for i, r in enumerate(results[:6], 1):
+        if not isinstance(r, dict):
+            continue
+        title = str(r.get("title", "")).strip() or "(sin titulo)"
+        url = str(r.get("url", "")).strip()
+        snippet = str(r.get("content", "")).replace("\n", " ").strip()
+        if len(snippet) > 160:
+            snippet = snippet[:160] + "..."
+        lines.append(f"{i}. {title}\n{url}\n{snippet}".strip())
+    return "\n\n".join(lines).strip()
