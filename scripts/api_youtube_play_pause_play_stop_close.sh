@@ -27,6 +27,10 @@ if [[ -z "${WS:-}" ]]; then
   echo "ERROR: no active workspace detected" >&2
   exit 1
 fi
+DC_ISOLATED_WORKSPACE="${DIRECT_CHAT_ISOLATED_WORKSPACE:-1}"
+DC_WORKSPACE_ID="${DIRECT_CHAT_WORKSPACE_ID:-$WS}"
+DC_FOLLOW_ACTIVE_WORKSPACE="${DIRECT_CHAT_FOLLOW_ACTIVE_WORKSPACE:-0}"
+DC_TEMP_SWITCH_WORKSPACE="${DIRECT_CHAT_TEMP_SWITCH_WORKSPACE:-0}"
 
 yt_ws_ids() {
   wmctrl -lp | awk -v d="$WS" '$2==d{l=tolower($0); if(l ~ /youtube/) print $1}'
@@ -45,7 +49,9 @@ else
     echo "ERROR: ya hay un direct-chat en puerto ${PORT}. Usá otro DC_PORT o USE_EXISTING_DC=1." >&2
     exit 1
   fi
-  python3 scripts/openclaw_direct_chat.py --host 127.0.0.1 --port "${PORT}" >/tmp/openclaw_dc_api_seq.log 2>&1 &
+  DIRECT_CHAT_ISOLATED_WORKSPACE="${DC_ISOLATED_WORKSPACE}" DIRECT_CHAT_WORKSPACE_ID="${DC_WORKSPACE_ID}" \
+    DIRECT_CHAT_FOLLOW_ACTIVE_WORKSPACE="${DC_FOLLOW_ACTIVE_WORKSPACE}" DIRECT_CHAT_TEMP_SWITCH_WORKSPACE="${DC_TEMP_SWITCH_WORKSPACE}" \
+    python3 scripts/openclaw_direct_chat.py --host 127.0.0.1 --port "${PORT}" >/tmp/openclaw_dc_api_seq.log 2>&1 &
   DC_PID="$!"
   STARTED_LOCAL=1
 fi

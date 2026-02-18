@@ -1,5 +1,6 @@
 import os
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -139,6 +140,273 @@ class TestOpenClawYoutubeAndTools(unittest.TestCase):
         wid, status = direct_chat._fallback_profiled_chrome_anchor_for_workspace(0, "Profile 1")
         self.assertEqual(wid, "0xabc")
         self.assertEqual(status, "fallback_active_profiled_chrome")
+
+    @patch.dict(os.environ, {"DIRECT_CHAT_CHROME_USER_DATA_DIR": "/tmp/direct_chat_chrome_ud_test"}, clear=False)
+    @patch("openclaw_direct_chat.subprocess.Popen")
+    @patch("openclaw_direct_chat._find_new_profiled_chrome_window", return_value=("0xabc", 1))
+    @patch("openclaw_direct_chat._wmctrl_list", return_value={})
+    @patch("openclaw_direct_chat._chrome_command", return_value="/usr/bin/google-chrome")
+    def test_spawn_profiled_chrome_uses_user_data_dir_override(
+        self,
+        _mock_cmd,
+        _mock_list,
+        _mock_find,
+        mock_popen,
+    ) -> None:
+        wid, status = direct_chat._spawn_profiled_chrome_anchor_for_workspace(1, "Profile 1")
+        self.assertEqual(wid, "0xabc")
+        self.assertEqual(status, "spawn_profiled_chrome_ok")
+        argv = [str(x) for x in (mock_popen.call_args.args[0] if mock_popen.call_args else [])]
+        self.assertIn("--user-data-dir=/tmp/direct_chat_chrome_ud_test", argv)
+
+    @patch.dict(os.environ, {"DIRECT_CHAT_WORKSPACE_ID": "2", "DIRECT_CHAT_ISOLATED_WORKSPACE": "1"}, clear=False)
+    @patch("openclaw_direct_chat._wmctrl_desktop_ids", return_value={0, 1, 2, 3})
+    def test_wmctrl_current_desktop_uses_forced_workspace_env(self, _mock_ids) -> None:
+        self.assertEqual(direct_chat._wmctrl_current_desktop(), 2)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_workspace_temp_switch_default_disabled(self) -> None:
+        self.assertFalse(direct_chat._workspace_temp_switch_enabled())
+
+    @patch.dict(os.environ, {"DIRECT_CHAT_TEMP_SWITCH_WORKSPACE": "1"}, clear=False)
+    def test_workspace_temp_switch_can_be_enabled(self) -> None:
+        self.assertTrue(direct_chat._workspace_temp_switch_enabled())
+
+    @patch.dict(
+        os.environ,
+        {
+            "DIRECT_CHAT_WORKSPACE_ID": "",
+            "DIRECT_CHAT_ISOLATED_WORKSPACE": "1",
+            "DIRECT_CHAT_FOLLOW_ACTIVE_WORKSPACE": "0",
+        },
+        clear=False,
+    )
+    @patch("openclaw_direct_chat._wmctrl_desktop_ids", return_value={0, 1, 2, 3})
+    def test_load_locked_workspace_ignores_legacy_follow_active_source(self, _mock_ids) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            lock_path = os.path.join(td, "lock.json")
+            with open(lock_path, "w", encoding="utf-8") as fh:
+                fh.write('{"workspace": 2, "source": "auto_follow_active_workspace"}')
+            with patch.object(direct_chat, "WORKSPACE_LOCK_PATH", direct_chat.Path(lock_path)):
+                self.assertIsNone(direct_chat._load_locked_workspace_id())
+
+    @patch.dict(os.environ, {"DIRECT_CHAT_WORKSPACE_ID": "", "DIRECT_CHAT_ISOLATED_WORKSPACE": "1"}, clear=False)
+    @patch("openclaw_direct_chat._save_locked_workspace_id")
+    @patch("openclaw_direct_chat._load_locked_workspace_id", return_value=3)
+    @patch("openclaw_direct_chat._wmctrl_active_desktop", return_value=1)
+    def test_wmctrl_current_desktop_prefers_locked_workspace(
+        self,
+        _mock_active,
+        _mock_locked,
+        mock_save,
+    ) -> None:
+        self.assertEqual(direct_chat._wmctrl_current_desktop(), 3)
+        mock_save.assert_not_called()
+
+    @patch.dict(os.environ, {"DIRECT_CHAT_WORKSPACE_ID": "", "DIRECT_CHAT_ISOLATED_WORKSPACE": "1"}, clear=False)
+    @patch("openclaw_direct_chat._save_locked_workspace_id")
+    @patch("openclaw_direct_chat._load_locked_workspace_id", return_value=None)
+    @patch("openclaw_direct_chat._wmctrl_active_desktop", return_value=1)
+    def test_wmctrl_current_desktop_autolocks_active_workspace(
+        self,
+        _mock_active,
+        _mock_locked,
+        mock_save,
+    ) -> None:
+        self.assertEqual(direct_chat._wmctrl_current_desktop(), 1)
+        mock_save.assert_called_once_with(1, source="auto_active_workspace")
+
+    @patch.dict(
+        os.environ,
+        {
+            "DIRECT_CHAT_WORKSPACE_ID": "",
+            "DIRECT_CHAT_ISOLATED_WORKSPACE": "1",
+            "DIRECT_CHAT_FOLLOW_ACTIVE_WORKSPACE": "1",
+        },
+        clear=False,
+    )
+    @patch("openclaw_direct_chat._save_locked_workspace_id")
+    @patch("openclaw_direct_chat._load_locked_workspace_id", return_value=0)
+    @patch("openclaw_direct_chat._wmctrl_active_desktop", return_value=2)
+    def test_wmctrl_current_desktop_follow_active_workspace(
+        self,
+        _mock_active,
+        _mock_locked,
+        mock_save,
+    ) -> None:
+        self.assertEqual(direct_chat._wmctrl_current_desktop(), 2)
+        mock_save.assert_called_once_with(2, source="auto_follow_active_workspace")
+
+    @patch.dict(
+        os.environ,
+        {
+            "DIRECT_CHAT_WORKSPACE_ID": "",
+            "DIRECT_CHAT_ISOLATED_WORKSPACE": "1",
+            "DIRECT_CHAT_FOLLOW_ACTIVE_WORKSPACE": "0",
+        },
+        clear=False,
+    )
+    @patch("openclaw_direct_chat._save_locked_workspace_id")
+    @patch("openclaw_direct_chat._load_locked_workspace_id", return_value=3)
+    @patch("openclaw_direct_chat._wmctrl_active_desktop", return_value=1)
+    def test_wmctrl_current_desktop_follow_active_can_be_disabled(
+        self,
+        _mock_active,
+        _mock_locked,
+        mock_save,
+    ) -> None:
+        self.assertEqual(direct_chat._wmctrl_current_desktop(), 3)
+        mock_save.assert_not_called()
+
+    @patch("openclaw_direct_chat._save_locked_workspace_id")
+    @patch("openclaw_direct_chat._wmctrl_active_desktop", return_value=2)
+    def test_local_action_sets_isolated_workspace(
+        self,
+        _mock_active,
+        mock_save,
+    ) -> None:
+        out = direct_chat._maybe_handle_local_action(
+            "fijá workspace aislado",
+            {"firefox", "web_search", "desktop", "model"},
+            "sess_test",
+        )
+        self.assertIsNotNone(out)
+        self.assertIn("workspace aislado", str(out.get("reply", "")).lower())
+        mock_save.assert_called_once_with(2, source="manual_chat_command")
+
+    @patch.dict(os.environ, {"DIRECT_CHAT_ISOLATED_WORKSPACE": "1"}, clear=False)
+    @patch("openclaw_direct_chat.web_ask.extract_web_ask_request", return_value=("chatgpt", "hora en madrid", []))
+    def test_web_ask_blocked_in_isolated_workspace_mode(self, _mock_web_req) -> None:
+        out = direct_chat._maybe_handle_local_action(
+            "preguntale a chatgpt que hora es en madrid",
+            {"firefox", "web_search", "web_ask", "desktop", "model"},
+            "sess_test",
+        )
+        self.assertIsNotNone(out)
+        self.assertIn("workspace aislado estricto", str(out.get("reply", "")).lower())
+
+    @patch("openclaw_direct_chat._spawn_profiled_chrome_anchor_for_workspace")
+    @patch("openclaw_direct_chat._fallback_profiled_chrome_anchor_for_workspace", return_value=(None, "fallback_none"))
+    @patch("openclaw_direct_chat._trusted_or_autodetected_dc_anchor", return_value=(None, "anchor_none"))
+    @patch("openclaw_direct_chat._wmctrl_windows_for_desktop", return_value=[])
+    @patch("openclaw_direct_chat._wmctrl_current_desktop", return_value=1)
+    @patch("openclaw_direct_chat._workspace_lock_enabled", return_value=True)
+    def test_open_url_with_context_does_not_spawn_in_isolated_mode(
+        self,
+        _mock_lock,
+        _mock_desktop,
+        _mock_windows,
+        _mock_anchor,
+        _mock_fallback,
+        mock_spawn,
+    ) -> None:
+        with patch("openclaw_direct_chat._load_browser_profile_config", return_value={"_default": {"browser": "chrome", "profile": "diego"}}):
+            err = direct_chat._open_url_with_site_context("https://www.youtube.com/", "youtube", session_id="sess")
+        self.assertIsInstance(err, str)
+        self.assertIn("workspace aislado", err.lower())
+        mock_spawn.assert_not_called()
+
+    @patch("openclaw_direct_chat._load_browser_profile_config", return_value={"_default": {"browser": "chrome", "profile": "diego"}})
+    @patch("openclaw_direct_chat._expected_profile_directory_for_site", return_value="Profile 1")
+    @patch("openclaw_direct_chat._wmctrl_current_desktop", return_value=1)
+    @patch("openclaw_direct_chat._wmctrl_windows_for_desktop", return_value=[])
+    @patch("openclaw_direct_chat._trusted_or_autodetected_dc_anchor", return_value=(None, "anchor_none"))
+    @patch("openclaw_direct_chat._fallback_profiled_chrome_anchor_for_workspace", return_value=("0xabc", "fallback_ok"))
+    @patch("openclaw_direct_chat._xdotool_command", return_value=(0, "ok"))
+    @patch("openclaw_direct_chat._wait_window_title_contains", return_value=(True, "YouTube - Google Chrome"))
+    @patch("openclaw_direct_chat._wmctrl_list", return_value={"0xabc": "YouTube - Google Chrome"})
+    @patch("openclaw_direct_chat._workspace_lock_enabled", return_value=True)
+    @patch("openclaw_direct_chat._wmctrl_active_desktop", return_value=1)
+    def test_open_url_with_context_strict_activates_target_window(
+        self,
+        _mock_active_desk,
+        _mock_lock,
+        _mock_wmctrl_list,
+        _mock_wait_title,
+        mock_xdotool,
+        _mock_fallback,
+        _mock_anchor,
+        _mock_windows,
+        _mock_desktop,
+        _mock_profile,
+        _mock_cfg,
+    ) -> None:
+        err = direct_chat._open_url_with_site_context("https://www.youtube.com/", "youtube", session_id="sess")
+        self.assertIsNone(err)
+        verbs = [str(c.args[0][0]) for c in mock_xdotool.call_args_list if c.args and c.args[0]]
+        self.assertIn("windowactivate", verbs)
+        self.assertIn("key", verbs)
+
+    @patch("openclaw_direct_chat._workspace_lock_enabled", return_value=True)
+    @patch("openclaw_direct_chat._xdotool_command", return_value=(0, "ok"))
+    @patch("openclaw_direct_chat._wmctrl_current_desktop_site_windows", return_value=[("0xabc", "YouTube - Google Chrome")])
+    @patch("openclaw_direct_chat._pick_active_site_window_id", return_value=(None, "not_active"))
+    @patch("openclaw_direct_chat._expected_profile_directory_for_site", return_value="Profile 1")
+    def test_youtube_transport_strict_activates_target_window(
+        self,
+        _mock_profile,
+        _mock_pick_active,
+        _mock_ws_windows,
+        mock_xdotool,
+        _mock_lock,
+    ) -> None:
+        ok, _detail = direct_chat._youtube_transport_action("pause", close_window=False, session_id="sess")
+        self.assertTrue(ok)
+        verbs = [str(c.args[0][0]) for c in mock_xdotool.call_args_list if c.args and c.args[0]]
+        self.assertIn("windowactivate", verbs)
+        self.assertIn("key", verbs)
+
+    @patch("openclaw_direct_chat._workspace_lock_enabled", return_value=True)
+    @patch("openclaw_direct_chat._workspace_temp_switch_enabled", return_value=False)
+    @patch("openclaw_direct_chat._wmctrl_current_desktop", return_value=0)
+    @patch("openclaw_direct_chat._wmctrl_active_desktop", return_value=1)
+    def test_youtube_transport_strict_requires_locked_workspace_active(
+        self,
+        _mock_active,
+        _mock_current,
+        _mock_temp_switch,
+        _mock_lock,
+    ) -> None:
+        ok, detail = direct_chat._youtube_transport_action("pause", close_window=False, session_id="sess")
+        self.assertFalse(ok)
+        self.assertIn("isolated_workspace_not_active", detail)
+
+    @patch("openclaw_direct_chat._load_browser_profile_config", return_value={"_default": {"browser": "chrome", "profile": "diego"}})
+    @patch("openclaw_direct_chat._expected_profile_directory_for_site", return_value="Profile 1")
+    @patch("openclaw_direct_chat._wmctrl_current_desktop", return_value=1)
+    @patch("openclaw_direct_chat._wmctrl_windows_for_desktop", return_value=[])
+    @patch("openclaw_direct_chat._trusted_or_autodetected_dc_anchor", return_value=(None, "anchor_none"))
+    @patch("openclaw_direct_chat._fallback_profiled_chrome_anchor_for_workspace", return_value=("0xabc", "fallback_ok"))
+    @patch("openclaw_direct_chat._xdotool_command", return_value=(0, "ok"))
+    @patch("openclaw_direct_chat._wait_window_title_contains", return_value=(False, "about:blank - Google Chrome"))
+    @patch("openclaw_direct_chat._workspace_lock_enabled", return_value=True)
+    @patch("openclaw_direct_chat._wmctrl_active_desktop", return_value=1)
+    def test_open_url_with_context_strict_requires_verified_open(
+        self,
+        _mock_active_desk,
+        _mock_lock,
+        _mock_wait_title,
+        _mock_xdotool,
+        _mock_fallback,
+        _mock_anchor,
+        _mock_windows,
+        _mock_desktop,
+        _mock_profile,
+        _mock_cfg,
+    ) -> None:
+        err = direct_chat._open_url_with_site_context("https://www.youtube.com/", "youtube", session_id="sess")
+        self.assertIsInstance(err, str)
+        self.assertIn("no pude verificar apertura real", err.lower())
+
+    @patch.dict(os.environ, {"DIRECT_CHAT_ISOLATED_WORKSPACE": "1"}, clear=False)
+    def test_gemini_write_blocked_in_isolated_workspace_mode(self) -> None:
+        out = direct_chat._maybe_handle_local_action(
+            "en gemini escribi hola equipo",
+            {"firefox", "web_search", "web_ask", "desktop", "model"},
+            "sess_test",
+        )
+        self.assertIsNotNone(out)
+        self.assertIn("gemini_write deshabilitado", str(out.get("reply", "")).lower())
 
 
 if __name__ == "__main__":

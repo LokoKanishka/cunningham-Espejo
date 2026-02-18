@@ -15,6 +15,13 @@ if [ -f "$ENV_FILE" ]; then
   set +a
 fi
 
+# Workspace policy default: fixed isolated workspace (don't follow active desktop).
+: "${DIRECT_CHAT_FOLLOW_ACTIVE_WORKSPACE:=0}"
+export DIRECT_CHAT_FOLLOW_ACTIVE_WORKSPACE
+# Avoid temporary desktop jumps by default.
+: "${DIRECT_CHAT_TEMP_SWITCH_WORKSPACE:=0}"
+export DIRECT_CHAT_TEMP_SWITCH_WORKSPACE
+
 if [ -f "$PID_FILE" ]; then
   old_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
   if [ -n "${old_pid:-}" ] && kill -0 "$old_pid" 2>/dev/null; then

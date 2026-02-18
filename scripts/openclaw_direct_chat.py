@@ -77,6 +77,7 @@ HTML = UI_HTML
 BROWSER_WINDOWS_PATH = Path.home() / ".openclaw" / "direct_chat_opened_browser_windows.json"
 BROWSER_WINDOWS_LOCK_PATH = Path.home() / ".openclaw" / ".direct_chat_opened_browser_windows.lock"
 TRUSTED_DC_ANCHOR_PATH = Path.home() / ".openclaw" / "direct_chat_trusted_anchor.json"
+WORKSPACE_LOCK_PATH = Path.home() / ".openclaw" / "direct_chat_workspace_lock.json"
 
 
 def _load_local_env_file(path: Path) -> None:
@@ -122,7 +123,26 @@ def _wmctrl_list() -> dict[str, str]:
     return out
 
 
-def _wmctrl_current_desktop() -> int | None:
+def _wmctrl_desktop_ids() -> set[int]:
+    if not shutil.which("wmctrl"):
+        return set()
+    try:
+        proc = subprocess.run(["wmctrl", "-d"], capture_output=True, text=True, timeout=3)
+    except Exception:
+        return set()
+    ids: set[int] = set()
+    for line in (proc.stdout or "").splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        try:
+            ids.add(int(parts[0]))
+        except Exception:
+            continue
+    return ids
+
+
+def _wmctrl_active_desktop() -> int | None:
     if not shutil.which("wmctrl"):
         return None
     try:
@@ -137,6 +157,139 @@ def _wmctrl_current_desktop() -> int | None:
             except Exception:
                 return None
     return None
+
+
+def _workspace_lock_enabled() -> bool:
+    raw = str(os.environ.get("DIRECT_CHAT_ISOLATED_WORKSPACE", "1")).strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _workspace_follow_active_enabled() -> bool:
+    # Default off: keep a fixed workspace lock unless explicitly enabled.
+    raw = str(os.environ.get("DIRECT_CHAT_FOLLOW_ACTIVE_WORKSPACE", "0")).strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _workspace_temp_switch_enabled() -> bool:
+    # Default off: avoid desktop jumps; fail closed if locked workspace is not active.
+    raw = str(os.environ.get("DIRECT_CHAT_TEMP_SWITCH_WORKSPACE", "0")).strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _load_locked_workspace_id() -> int | None:
+    try:
+        if not WORKSPACE_LOCK_PATH.exists():
+            return None
+        raw = json.loads(WORKSPACE_LOCK_PATH.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return None
+        source = str(raw.get("source", "")).strip().lower()
+        # Migration guard: older locks may have been auto-updated to follow the
+        # active workspace. If follow-active is now disabled, treat that lock as
+        # stale and relock on current active workspace.
+        if (not _workspace_follow_active_enabled()) and source == "auto_follow_active_workspace":
+            return None
+        desk = int(raw.get("workspace", -1))
+        ids = _wmctrl_desktop_ids()
+        if ids and desk not in ids:
+            return None
+        return desk
+    except Exception:
+        return None
+
+
+def _save_locked_workspace_id(desktop_idx: int, source: str = "auto") -> None:
+    try:
+        WORKSPACE_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "workspace": int(desktop_idx),
+            "source": str(source),
+            "ts": int(time.time()),
+        }
+        WORKSPACE_LOCK_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        return
+
+
+def _clear_locked_workspace_id() -> None:
+    try:
+        if WORKSPACE_LOCK_PATH.exists():
+            WORKSPACE_LOCK_PATH.unlink()
+    except Exception:
+        return
+
+
+def _wmctrl_current_desktop() -> int | None:
+    # Optional hard override (useful for isolated test runners).
+    forced = str(os.environ.get("DIRECT_CHAT_WORKSPACE_ID", "")).strip()
+    if forced:
+        try:
+            desk = int(forced)
+            ids = _wmctrl_desktop_ids()
+            if ids and desk not in ids:
+                return None
+            return desk
+        except Exception:
+            return None
+
+    if not _workspace_lock_enabled():
+        return _wmctrl_active_desktop()
+
+    active = _wmctrl_active_desktop()
+    # Follow-active mode: isolated behavior, but always in the currently active
+    # workspace instead of a fixed historical lock.
+    if _workspace_follow_active_enabled():
+        if active is not None:
+            _save_locked_workspace_id(active, source="auto_follow_active_workspace")
+            return active
+
+    locked = _load_locked_workspace_id()
+    if locked is not None:
+        return locked
+
+    if active is not None:
+        _save_locked_workspace_id(active, source="auto_active_workspace")
+    return active
+
+
+def _wmctrl_switch_desktop(desktop_idx: int) -> bool:
+    if not shutil.which("wmctrl"):
+        return False
+    try:
+        subprocess.run(
+            ["wmctrl", "-s", str(int(desktop_idx))],
+            timeout=2.5,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return False
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        cur = _wmctrl_active_desktop()
+        if cur is not None and int(cur) == int(desktop_idx):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _ensure_workspace_active_for_ui(desktop_idx: int) -> tuple[bool, int | None, str]:
+    active = _wmctrl_active_desktop()
+    if active is None:
+        return False, None, "active_workspace_not_detected"
+    if int(active) == int(desktop_idx):
+        return True, None, "already_active"
+    if not _workspace_temp_switch_enabled():
+        return False, int(active), f"isolated_workspace_not_active locked={desktop_idx} active={active}"
+    if not _wmctrl_switch_desktop(int(desktop_idx)):
+        return False, int(active), f"workspace_switch_failed locked={desktop_idx} active={active}"
+    return True, int(active), f"workspace_switched_to={desktop_idx}"
+
+
+def _restore_workspace_after_ui(previous_desktop: int | None) -> None:
+    if previous_desktop is None:
+        return
+    _wmctrl_switch_desktop(int(previous_desktop))
 
 
 def _pid_cmd_args(pid_raw: str) -> list[str]:
@@ -264,21 +417,6 @@ def _wait_window_title_contains(win_id: str, terms: list[str], timeout_s: float 
             return True, title
         time.sleep(0.2)
     return False, last
-
-
-def _wmctrl_move_window_to_desktop(win_id: str, desktop_idx: int) -> bool:
-    if not shutil.which("wmctrl"):
-        return False
-    try:
-        subprocess.run(
-            ["wmctrl", "-i", "-r", win_id, "-t", str(int(desktop_idx))],
-            timeout=3,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        return True
-    except Exception:
-        return False
 
 
 def _find_new_profiled_chrome_window(
@@ -620,39 +758,53 @@ def _youtube_transport_action(action: str, close_window: bool = False, session_i
     if not shutil.which("wmctrl") or not shutil.which("xdotool"):
         return False, "missing_wmctrl_or_xdotool"
 
-    expected_profile = _expected_profile_directory_for_site("youtube")
-    win_id, detail = _pick_active_site_window_id("youtube", expected_profile=expected_profile)
-    if not win_id:
-        wins = _wmctrl_current_desktop_site_windows("youtube", expected_profile=expected_profile)
-        if wins:
-            win_id = wins[-1][0]
-            detail = wins[-1][1]
-    if not win_id:
-        win_id, detail = _pick_active_site_window_id("youtube", expected_profile=None)
-    if not win_id:
-        wins = _wmctrl_current_desktop_site_windows("youtube", expected_profile=None)
-        if wins:
-            win_id = wins[-1][0]
-            detail = wins[-1][1]
-    if not win_id:
-        return False, f"youtube_window_not_found_current_workspace profile={expected_profile}"
+    desk = _wmctrl_current_desktop()
+    if desk is None:
+        return False, "workspace_not_detected"
+    strict_isolated = _workspace_lock_enabled()
+    restore_workspace: int | None = None
+    if strict_isolated:
+        ok_ws, restore_workspace, ws_detail = _ensure_workspace_active_for_ui(int(desk))
+        if not ok_ws:
+            return False, ws_detail
 
-    rc_activate, _ = _xdotool_command(["windowactivate", win_id], timeout=2.5)
-    if rc_activate != 0:
-        return False, f"window_activate_failed win={win_id}"
-    time.sleep(0.16)
+    try:
+        expected_profile = _expected_profile_directory_for_site("youtube")
+        win_id, detail = _pick_active_site_window_id("youtube", expected_profile=expected_profile)
+        if not win_id:
+            wins = _wmctrl_current_desktop_site_windows("youtube", expected_profile=expected_profile)
+            if wins:
+                win_id = wins[-1][0]
+                detail = wins[-1][1]
+        if not win_id:
+            win_id, detail = _pick_active_site_window_id("youtube", expected_profile=None)
+        if not win_id:
+            wins = _wmctrl_current_desktop_site_windows("youtube", expected_profile=None)
+            if wins:
+                win_id = wins[-1][0]
+                detail = wins[-1][1]
+        if not win_id:
+            return False, f"youtube_window_not_found_current_workspace profile={expected_profile}"
 
-    # YouTube keyboard control: 'k' toggles play/pause consistently across layouts.
-    rc_key, _ = _xdotool_command(["key", "--window", win_id, "k"], timeout=2.0)
-    if rc_key != 0:
-        return False, f"youtube_key_toggle_failed win={win_id}"
+        rc_activate, _ = _xdotool_command(["windowactivate", win_id], timeout=2.5)
+        if rc_activate != 0:
+            return False, f"window_activate_failed win={win_id}"
+        time.sleep(0.16)
 
-    if close_window:
-        time.sleep(0.15)
-        if not _wmctrl_close_window(win_id):
-            return False, f"youtube_close_failed win={win_id}"
+        # YouTube keyboard control: 'k' toggles play/pause consistently across layouts.
+        rc_key, _ = _xdotool_command(["key", "--window", win_id, "k"], timeout=2.0)
+        if rc_key != 0:
+            return False, f"youtube_key_toggle_failed win={win_id}"
 
-    return True, f"ok action={action} close={int(close_window)} win={win_id} detail={detail[:120]}"
+        if close_window:
+            time.sleep(0.15)
+            if not _wmctrl_close_window(win_id):
+                return False, f"youtube_close_failed win={win_id}"
+
+        return True, f"ok action={action} close={int(close_window)} win={win_id} detail={detail[:120]}"
+    finally:
+        if strict_isolated:
+            _restore_workspace_after_ui(restore_workspace)
 
 
 def _extract_gemini_write_request(message: str) -> str | None:
@@ -1557,6 +1709,18 @@ def _chrome_command() -> str | None:
     return None
 
 
+def _chrome_user_data_dir_override() -> str:
+    raw = str(os.environ.get("DIRECT_CHAT_CHROME_USER_DATA_DIR", "")).strip()
+    if not raw:
+        return ""
+    p = Path(raw).expanduser()
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return ""
+    return str(p)
+
+
 def _resolve_chrome_profile_directory(profile_hint: str) -> str:
     hint = profile_hint.strip()
     if not hint:
@@ -1622,7 +1786,7 @@ def _fallback_profiled_chrome_anchor_for_workspace(
 
 
 def _spawn_profiled_chrome_anchor_for_workspace(
-    desktop_idx: int, expected_profile: str | None
+    desktop_idx: int, expected_profile: str | None, initial_url: str = "about:blank"
 ) -> tuple[str | None, str]:
     chrome_cmd = _chrome_command()
     if not chrome_cmd:
@@ -1631,9 +1795,23 @@ def _spawn_profiled_chrome_anchor_for_workspace(
     if not profile:
         profile = "Default"
     before_ids = set(_wmctrl_list().keys())
+    cmd = [chrome_cmd]
+    user_data_dir = _chrome_user_data_dir_override()
+    if user_data_dir:
+        cmd.append(f"--user-data-dir={user_data_dir}")
+    launch_url = str(initial_url or "").strip() or "about:blank"
+    cmd.extend(
+        [
+            f"--profile-directory={profile}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--new-window",
+            launch_url,
+        ]
+    )
     try:
         subprocess.Popen(
-            [chrome_cmd, f"--profile-directory={profile}", "--new-window", "about:blank"],
+            cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
@@ -1668,60 +1846,129 @@ def _open_url_with_site_context(url: str, site_key: str | None, session_id: str 
         desk = _wmctrl_current_desktop()
         if desk is None:
             return "No pude detectar el workspace actual."
+        strict_isolated = _workspace_lock_enabled()
+        restore_workspace: int | None = None
+        if strict_isolated:
+            ok_ws, restore_workspace, ws_detail = _ensure_workspace_active_for_ui(int(desk))
+            if not ok_ws:
+                return (
+                    "No ejecuté apertura: workspace aislado no activo en pantalla. "
+                    f"({ws_detail}) Con política estricta no cambio de workspace ni foco."
+                )
         wins = _wmctrl_windows_for_desktop(desk)
         anchor, anchor_status = _trusted_or_autodetected_dc_anchor(expected_profile=profile)
         fallback_status = ""
         spawn_status = ""
         if not anchor:
             anchor, fallback_status = _fallback_profiled_chrome_anchor_for_workspace(desk, profile)
+        # In isolated-workspace mode, never spawn a fresh Chrome process because
+        # the window manager may place it in another workspace.
+        spawned_with_target = False
+        if (not anchor) and (not strict_isolated):
+            anchor, spawn_status = _spawn_profiled_chrome_anchor_for_workspace(desk, profile, initial_url=str(url))
+            spawned_with_target = bool(anchor and str(spawn_status).startswith("spawn_"))
         if not anchor:
-            anchor, spawn_status = _spawn_profiled_chrome_anchor_for_workspace(desk, profile)
-        if not anchor:
+            if strict_isolated:
+                return (
+                    "No abrí nada: modo workspace aislado estricto activo y no encontré ancla Chrome válida "
+                    f"en este workspace ({desk}). (anchor={anchor_status}; fallback={fallback_status or 'n/a'})"
+                )
             return (
                 "No abrí nada para evitar mezclar clientes: no encontré cliente Chrome del perfil diego "
                 "en este workspace. "
                 f"(anchor={anchor_status}; fallback={fallback_status or 'n/a'}; spawn={spawn_status or 'n/a'})"
             )
 
-        before_ids = {wid for wid, _, _ in wins}
-        _xdotool_command(["windowactivate", anchor], timeout=2.5)
-        time.sleep(0.18)
-        _xdotool_command(["key", "--window", anchor, "ctrl+n"], timeout=2.0)
+        try:
+            target = anchor
+            skip_typing = False
+            if not strict_isolated:
+                if spawned_with_target:
+                    skip_typing = True
+                    _xdotool_command(["windowactivate", target], timeout=2.5)
+                    time.sleep(0.12)
+                else:
+                    before_ids = {wid for wid, _, _ in wins}
+                    _xdotool_command(["windowactivate", anchor], timeout=2.5)
+                    time.sleep(0.18)
+                    _xdotool_command(["key", "--window", anchor, "ctrl+n"], timeout=2.0)
 
-        target = ""
-        for _ in range(80):
-            now = _wmctrl_windows_for_desktop(desk)
-            for wid, _pid_raw, title in now:
-                t = str(title).lower()
-                if wid in before_ids:
-                    continue
-                if "chrome" in t or "google" in t:
-                    target = wid
-                    break
-            if target:
-                break
-            time.sleep(0.08)
-        if not target:
-            return "No abrí nada para evitar mezclar clientes: no se detectó una nueva ventana desde el cliente diego."
+                    target = ""
+                    for _ in range(80):
+                        now = _wmctrl_windows_for_desktop(desk)
+                        for wid, _pid_raw, title in now:
+                            t = str(title).lower()
+                            if wid in before_ids:
+                                continue
+                            if "chrome" in t or "google" in t:
+                                target = wid
+                                break
+                        if target:
+                            break
+                        time.sleep(0.08)
+                    if not target:
+                        # Some Chrome setups can ignore ctrl+n automation transiently.
+                        # In that case, keep workspace safety and reuse anchor.
+                        target = anchor
 
-        _xdotool_command(["windowactivate", target], timeout=2.5)
-        time.sleep(0.10)
-        _xdotool_command(["key", "--window", target, "ctrl+l"], timeout=2.0)
-        time.sleep(0.06)
-        _xdotool_command(
-            ["type", "--delay", "16", "--clearmodifiers", "--window", target, str(url)],
-            timeout=8.0,
-        )
-        time.sleep(0.06)
-        _xdotool_command(["key", "--window", target, "Return"], timeout=2.0)
+                    _xdotool_command(["windowactivate", target], timeout=2.5)
+                    time.sleep(0.10)
 
-        if session_id:
-            title = _wmctrl_list().get(target, "")
-            _record_browser_windows(
-                session_id,
-                [{"win_id": target, "title": title, "url": url, "site_key": site_key, "ts": time.time()}],
-            )
-        return None
+            rc_a, _ = _xdotool_command(["windowactivate", target], timeout=2.5)
+            if rc_a != 0:
+                return f"No pude activar ventana objetivo en el workspace aislado. (win={target})"
+            time.sleep(0.10)
+
+            if not skip_typing:
+                rc_l, _ = _xdotool_command(["key", "--window", target, "ctrl+l"], timeout=2.0)
+                if rc_l != 0:
+                    return f"No pude enfocar barra de direcciones en el workspace aislado. (win={target})"
+                time.sleep(0.06)
+                rc_t, _ = _xdotool_command(
+                    ["type", "--delay", "16", "--clearmodifiers", "--window", target, str(url)],
+                    timeout=8.0,
+                )
+                if rc_t != 0:
+                    return f"No pude tipear URL en el workspace aislado. (win={target})"
+                time.sleep(0.06)
+                rc_r, _ = _xdotool_command(["key", "--window", target, "Return"], timeout=2.0)
+                if rc_r != 0:
+                    return f"No pude enviar Enter en el workspace aislado. (win={target})"
+
+            terms: list[str] = []
+            sk = str(site_key or "").strip().lower()
+            if sk in ("youtube", "gemini", "chatgpt", "wikipedia", "gmail"):
+                terms.append(sk)
+            try:
+                host = (urlparse(str(url or "")).netloc or "").lower().strip(".")
+                if host:
+                    base = host.split(".")
+                    for tok in (host, base[0] if base else ""):
+                        t = str(tok).strip().lower()
+                        if t and t not in terms:
+                            terms.append(t)
+            except Exception:
+                pass
+            if not terms:
+                terms = ["google", "youtube", "chatgpt", "gemini", "wikipedia", "gmail"]
+            wait_timeout = 12.0 if skip_typing else 7.0
+            ok_title, seen = _wait_window_title_contains(target, terms, timeout_s=wait_timeout)
+            if not ok_title:
+                return (
+                    "No pude verificar apertura real en el workspace aislado "
+                    f"(win={target}, seen_title={seen or '(none)'})."
+                )
+
+            if session_id:
+                title = _wmctrl_list().get(target, "")
+                _record_browser_windows(
+                    session_id,
+                    [{"win_id": target, "title": title, "url": url, "site_key": site_key, "ts": time.time()}],
+                )
+            return None
+        finally:
+            if strict_isolated:
+                _restore_workspace_after_ui(restore_workspace)
 
     try:
         subprocess.Popen(
@@ -2006,6 +2253,15 @@ def _guardrail_block_reply(tool_name: str, detail: str) -> str:
     )
 
 
+def _workspace_isolated_block_reply(action: str) -> str:
+    desk = _wmctrl_current_desktop()
+    where = f" workspace={desk}" if desk is not None else ""
+    return (
+        "Bloqueado por modo workspace aislado estricto: "
+        f"{action}. No ejecuto rutas que puedan abrir/mover ventanas fuera del workspace fijado.{where}"
+    )
+
+
 def _normalize_allowed_tool_name(name: str) -> str:
     t = str(name or "").strip().lower()
     alias = {
@@ -2068,7 +2324,27 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         if desk is None:
             return {"reply": "No pude detectar el workspace de la ventana activa."}
         _save_trusted_dc_anchor(active, desk, title)
+        _save_locked_workspace_id(desk, source="trusted_anchor")
         return {"reply": f"Listo. Fijé este cliente como diego (anchor={active}, workspace={desk})."}
+
+    if ("workspace" in normalized or "escritorio" in normalized) and any(
+        k in normalized for k in ("aislad", "aisla", "isolad")
+    ):
+        if any(k in normalized for k in ("reset", "reinic", "limpia", "libera", "desblo", "unlock", "clear")):
+            _clear_locked_workspace_id()
+            return {"reply": "Listo: liberé el workspace aislado. Tomaré el workspace activo en la próxima acción."}
+        if any(k in normalized for k in ("estado", "cual", "cuál", "mostrar", "ver")):
+            locked = _load_locked_workspace_id()
+            current = _wmctrl_current_desktop()
+            if locked is None:
+                return {"reply": f"Workspace aislado sin lock manual. Workspace operativo actual: {current}."}
+            return {"reply": f"Workspace aislado activo: {locked}. Workspace operativo actual: {current}."}
+        if any(k in normalized for k in ("fij", "set", "usar", "usa", "bloq", "lock", "activa", "activar", "establec")):
+            active = _wmctrl_active_desktop()
+            if active is None:
+                return {"reply": "No pude detectar el workspace activo para fijar el modo aislado."}
+            _save_locked_workspace_id(active, source="manual_chat_command")
+            return {"reply": f"Listo: fijé workspace aislado en {active}. Seguiré trabajando solo ahí."}
 
     yt_transport = _extract_youtube_transport_request(message)
     if yt_transport:
@@ -2187,6 +2463,8 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
     if m_login:
         if ("web_ask" not in allowed_tools) and ("firefox" not in allowed_tools):
             return {"reply": "La herramienta local 'web_ask' está deshabilitada en esta sesión."}
+        if _workspace_lock_enabled():
+            return {"reply": _workspace_isolated_block_reply("login shadow deshabilitado")}
         if not shadow_explicit:
             return {
                 "reply": (
@@ -2215,6 +2493,8 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
     if gemini_ask_text:
         if ("web_ask" not in allowed_tools) and ("firefox" not in allowed_tools):
             return {"reply": "La herramienta local 'gemini write' está deshabilitada en esta sesión."}
+        if _workspace_lock_enabled():
+            return {"reply": _workspace_isolated_block_reply("web_ask gemini deshabilitado")}
         ok_g, gd = _guardrail_check(
             session_id,
             "web_ask",
@@ -2230,6 +2510,8 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
     if gemini_write_text:
         if ("web_ask" not in allowed_tools) and ("firefox" not in allowed_tools):
             return {"reply": "La herramienta local 'gemini write' está deshabilitada en esta sesión."}
+        if _workspace_lock_enabled():
+            return {"reply": _workspace_isolated_block_reply("gemini_write deshabilitado")}
         ok_g, gd = _guardrail_check(
             session_id,
             "browser_vision",
@@ -2248,6 +2530,8 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         # if someone only enabled firefox (old UI), still allow web_ask.
         if ("web_ask" not in allowed_tools) and ("firefox" not in allowed_tools):
             return {"reply": "La herramienta local 'web_ask' está deshabilitada en esta sesión."}
+        if _workspace_lock_enabled():
+            return {"reply": _workspace_isolated_block_reply("web_ask deshabilitado")}
         site_key, prompt, followups = web_req
         site_url = _site_url(site_key) or f"https://{site_key}.com/"
         ok_g, gd = _guardrail_check(
@@ -2287,6 +2571,8 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
 
     # Hard rule: "open Gemini" (or close variants) always executes the same deterministic flow.
     if "firefox" in allowed_tools and _looks_like_direct_gemini_open(normalized) and not wants_search and not wants_new_chat:
+        if _workspace_lock_enabled():
+            return {"reply": _workspace_isolated_block_reply("apertura de gemini deshabilitada")}
         ok_g, gd = _guardrail_check(
             session_id,
             "browser_vision",

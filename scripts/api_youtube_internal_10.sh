@@ -27,8 +27,14 @@ SESSION="api_yt_$(date +%s)"
 OUT_DIR="${HOME}/.openclaw/logs"
 mkdir -p "$OUT_DIR"
 LOG="$OUT_DIR/api_youtube_internal_${SESSION}.log"
+DC_ISOLATED_WORKSPACE="${DIRECT_CHAT_ISOLATED_WORKSPACE:-1}"
+DC_WORKSPACE_ID="${DIRECT_CHAT_WORKSPACE_ID:-$WS}"
+DC_FOLLOW_ACTIVE_WORKSPACE="${DIRECT_CHAT_FOLLOW_ACTIVE_WORKSPACE:-0}"
+DC_TEMP_SWITCH_WORKSPACE="${DIRECT_CHAT_TEMP_SWITCH_WORKSPACE:-0}"
 
-python3 scripts/openclaw_direct_chat.py --host 127.0.0.1 --port 8787 >/tmp/openclaw_dc_api_test.log 2>&1 &
+DIRECT_CHAT_ISOLATED_WORKSPACE="${DC_ISOLATED_WORKSPACE}" DIRECT_CHAT_WORKSPACE_ID="${DC_WORKSPACE_ID}" \
+  DIRECT_CHAT_FOLLOW_ACTIVE_WORKSPACE="${DC_FOLLOW_ACTIVE_WORKSPACE}" DIRECT_CHAT_TEMP_SWITCH_WORKSPACE="${DC_TEMP_SWITCH_WORKSPACE}" \
+  python3 scripts/openclaw_direct_chat.py --host 127.0.0.1 --port 8787 >/tmp/openclaw_dc_api_test.log 2>&1 &
 DC_PID=$!
 cleanup() {
   kill "$DC_PID" >/dev/null 2>&1 || true
