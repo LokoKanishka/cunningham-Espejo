@@ -15,13 +15,6 @@ if [ -f "$ENV_FILE" ]; then
   set +a
 fi
 
-# Workspace policy default: fixed isolated workspace (don't follow active desktop).
-: "${DIRECT_CHAT_FOLLOW_ACTIVE_WORKSPACE:=0}"
-export DIRECT_CHAT_FOLLOW_ACTIVE_WORKSPACE
-# Avoid temporary desktop jumps by default.
-: "${DIRECT_CHAT_TEMP_SWITCH_WORKSPACE:=0}"
-export DIRECT_CHAT_TEMP_SWITCH_WORKSPACE
-
 if [ -f "$PID_FILE" ]; then
   old_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
   if [ -n "${old_pid:-}" ] && kill -0 "$old_pid" 2>/dev/null; then
@@ -30,7 +23,12 @@ if [ -f "$PID_FILE" ]; then
   fi
 fi
 
-nohup python3 scripts/openclaw_direct_chat.py --port "$PORT" >"$LOG" 2>&1 &
+PY_BIN="${DIRECT_CHAT_PYTHON:-$HOME/.openclaw/venvs/xtts/bin/python}"
+if [ ! -x "$PY_BIN" ]; then
+  PY_BIN="python3"
+fi
+
+nohup "$PY_BIN" scripts/openclaw_direct_chat.py --port "$PORT" >"$LOG" 2>&1 &
 pid=$!
 echo "$pid" > "$PID_FILE"
 

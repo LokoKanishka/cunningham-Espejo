@@ -143,6 +143,7 @@ HTML = r"""<!doctype html>
 	      <label><input type="checkbox" id="toolWebSearch" checked /> web_search</label>
 	      <label><input type="checkbox" id="toolWebAsk" checked /> web_ask</label>
 	      <label><input type="checkbox" id="toolDesktop" checked /> escritorio</label>
+	      <label><input type="checkbox" id="toolTts" checked /> voz</label>
       <span class="small">Slash: /new /escritorio</span>
     </div>
 
@@ -170,6 +171,7 @@ HTML = r"""<!doctype html>
 	    const toolWebSearchEl = document.getElementById("toolWebSearch");
 	    const toolWebAskEl = document.getElementById("toolWebAsk");
 	    const toolDesktopEl = document.getElementById("toolDesktop");
+	    const toolTtsEl = document.getElementById("toolTts");
 	    const attachEl = document.getElementById("attach");
 	    const attachInfoEl = document.getElementById("attachInfo");
 	    const meterEl = document.getElementById("meter");
@@ -213,6 +215,7 @@ HTML = r"""<!doctype html>
 	      if (toolWebSearchEl.checked) out.push("web_search");
 	      if (toolWebAskEl.checked) out.push("web_ask");
 	      if (toolDesktopEl.checked) out.push("desktop");
+	      if (toolTtsEl.checked) out.push("tts");
 	      out.push("model");
 	      return out;
 	    }

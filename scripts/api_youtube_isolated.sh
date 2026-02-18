@@ -16,7 +16,6 @@ Examples:
 
 Notes:
   - Runs YouTube API tests inside an isolated display (no host workspace spill).
-  - Defaults to DIRECT_CHAT_ISOLATED_WORKSPACE=0 inside the isolated display.
   - Uses DIRECT_CHAT_CHROME_USER_DATA_DIR (or ~/.openclaw/chrome_isolated/google-chrome).
   - visible mode requires ISO_ALLOW_UNSTABLE_VISIBLE=1.
 USAGE
@@ -114,13 +113,10 @@ if [[ -d "$src_root/$profile_dir" && ! -d "$chrome_ud/$profile_dir" ]]; then
   fi
 fi
 
-dc_isolated="${DIRECT_CHAT_ISOLATED_WORKSPACE:-0}"
-
 echo "API_YOUTUBE_ISOLATED mode=$mode suite=$suite"
-echo "API_YOUTUBE_ISOLATED env DIRECT_CHAT_ISOLATED_WORKSPACE=$dc_isolated DIRECT_CHAT_CHROME_USER_DATA_DIR=$chrome_ud DIRECT_CHAT_PROFILE_HINT=$profile_hint profile_dir=$profile_dir"
+echo "API_YOUTUBE_ISOLATED env DIRECT_CHAT_CHROME_USER_DATA_DIR=$chrome_ud DIRECT_CHAT_PROFILE_HINT=$profile_hint profile_dir=$profile_dir"
 
 ./scripts/display_isolation.sh run "$mode" -- \
   env \
-    DIRECT_CHAT_ISOLATED_WORKSPACE="$dc_isolated" \
     DIRECT_CHAT_CHROME_USER_DATA_DIR="$chrome_ud" \
     "$target_script"
