@@ -178,7 +178,7 @@ def _alltalk_base_url() -> str:
 
 
 def _alltalk_health_path() -> str:
-    path = str(os.environ.get("DIRECT_CHAT_ALLTALK_HEALTH_PATH", "/health")).strip()
+    path = str(os.environ.get("DIRECT_CHAT_ALLTALK_HEALTH_PATH", "/ready")).strip()
     if not path.startswith("/"):
         path = "/" + path
     return path
@@ -271,7 +271,15 @@ def _tts_speak_alltalk(text: str, state: dict) -> tuple[bool, str]:
         "character_voice_gen": _alltalk_character_voice(),
         "language": str(os.environ.get("DIRECT_CHAT_ALLTALK_LANGUAGE", "es")).strip() or "es",
         "text_filtering": str(os.environ.get("DIRECT_CHAT_ALLTALK_TEXT_FILTERING", "standard")).strip() or "standard",
+        "narrator_enabled": str(_env_flag("DIRECT_CHAT_ALLTALK_NARRATOR_ENABLED", False)).lower(),
+        "narrator_voice_gen": str(os.environ.get("DIRECT_CHAT_ALLTALK_NARRATOR_VOICE", _alltalk_character_voice())).strip()
+        or _alltalk_character_voice(),
+        "text_not_inside": str(os.environ.get("DIRECT_CHAT_ALLTALK_TEXT_NOT_INSIDE", "character")).strip() or "character",
+        "output_file_name": str(os.environ.get("DIRECT_CHAT_ALLTALK_OUTPUT_NAME", "openclaw_direct_chat")).strip()
+        or "openclaw_direct_chat",
+        "output_file_timestamp": str(_env_flag("DIRECT_CHAT_ALLTALK_OUTPUT_TIMESTAMP", True)).lower(),
         "autoplay": "false",
+        "autoplay_volume": str(os.environ.get("DIRECT_CHAT_ALLTALK_AUTOPLAY_VOLUME", "1.0")).strip() or "1.0",
     }
     timeout_s = float(_int_env("DIRECT_CHAT_ALLTALK_TIMEOUT_SEC", 60))
     base_url = _alltalk_base_url() + "/"
