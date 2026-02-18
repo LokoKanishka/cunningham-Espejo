@@ -228,7 +228,7 @@ def _tts_speak_alltalk(text: str, state: dict) -> tuple[bool, str]:
         speaker = str(state.get("speaker", "")).strip()
         if speaker and speaker.lower().endswith(".wav"):
             return speaker
-        return "ref_lucy.wav"
+        return str(os.environ.get("DIRECT_CHAT_ALLTALK_DEFAULT_VOICE", "female_01.wav")).strip() or "female_01.wav"
 
     def _save_tmp_wav(content: bytes) -> Path:
         out = Path("/tmp") / f"openclaw_alltalk_{int(time.time() * 1000)}.wav"
@@ -266,14 +266,14 @@ def _tts_speak_alltalk(text: str, state: dict) -> tuple[bool, str]:
         except Exception as e:
             return False, f"player_spawn_failed:{e}"
 
-    payload = {
+    default_voice = str(os.environ.get("DIRECT_CHAT_ALLTALK_DEFAULT_VOICE", "female_01.wav")).strip() or "female_01.wav"
+    primary_voice = _alltalk_character_voice()
+    narrator_voice = str(os.environ.get("DIRECT_CHAT_ALLTALK_NARRATOR_VOICE", "")).strip()
+    base_payload = {
         "text_input": msg,
-        "character_voice_gen": _alltalk_character_voice(),
         "language": str(os.environ.get("DIRECT_CHAT_ALLTALK_LANGUAGE", "es")).strip() or "es",
         "text_filtering": str(os.environ.get("DIRECT_CHAT_ALLTALK_TEXT_FILTERING", "standard")).strip() or "standard",
         "narrator_enabled": str(_env_flag("DIRECT_CHAT_ALLTALK_NARRATOR_ENABLED", False)).lower(),
-        "narrator_voice_gen": str(os.environ.get("DIRECT_CHAT_ALLTALK_NARRATOR_VOICE", _alltalk_character_voice())).strip()
-        or _alltalk_character_voice(),
         "text_not_inside": str(os.environ.get("DIRECT_CHAT_ALLTALK_TEXT_NOT_INSIDE", "character")).strip() or "character",
         "output_file_name": str(os.environ.get("DIRECT_CHAT_ALLTALK_OUTPUT_NAME", "openclaw_direct_chat")).strip()
         or "openclaw_direct_chat",
@@ -285,33 +285,57 @@ def _tts_speak_alltalk(text: str, state: dict) -> tuple[bool, str]:
     base_url = _alltalk_base_url() + "/"
     req_url = _alltalk_base_url() + _alltalk_tts_path()
 
-    payload = {
-        k: v for k, v in payload.items() if str(v).strip()
-    }
+    voices_to_try = [primary_voice]
+    if default_voice and default_voice not in voices_to_try:
+        voices_to_try.append(default_voice)
 
     try:
-        resp = requests.post(req_url, data=payload, timeout=max(2.0, timeout_s))
-        resp.raise_for_status()
-        ctype = str(resp.headers.get("Content-Type", "")).lower()
+        last_http_detail = ""
+        for idx, voice_name in enumerate(voices_to_try):
+            payload = dict(base_payload)
+            payload["character_voice_gen"] = voice_name
+            payload["narrator_voice_gen"] = narrator_voice or voice_name
+            payload = {k: v for k, v in payload.items() if str(v).strip()}
 
-        if "application/json" in ctype:
-            info = resp.json() if resp.content else {}
-            if not isinstance(info, dict):
-                return False, "alltalk_invalid_json"
-            out_url = str(info.get("output_file_url") or info.get("output_cache_url") or "").strip()
-            if not out_url:
-                return False, f"alltalk_no_output_url:{info.get('status', 'unknown')}"
-            download_url = urllib.parse.urljoin(base_url, out_url)
-            audio_resp = requests.get(download_url, timeout=max(2.0, timeout_s))
-            audio_resp.raise_for_status()
-            audio_bytes = audio_resp.content
-        else:
-            audio_bytes = resp.content
+            resp = requests.post(req_url, data=payload, timeout=max(2.0, timeout_s))
+            if resp.status_code >= 400:
+                detail = (resp.text or "")[:220].replace("\n", " ")
+                last_http_detail = f"alltalk_http_error:{resp.status_code}:{detail}"
+                print(f"[voice] AllTalk HTTP {resp.status_code} (voice={voice_name}): {detail}", file=sys.stderr)
+                if idx + 1 < len(voices_to_try):
+                    continue
+                return False, last_http_detail
 
-        if not audio_bytes:
-            return False, "alltalk_empty_audio"
-        out_file = _save_tmp_wav(audio_bytes)
-        return _play_audio_async(out_file)
+            ctype = str(resp.headers.get("Content-Type", "")).lower()
+            if "application/json" in ctype:
+                info = resp.json() if resp.content else {}
+                if not isinstance(info, dict):
+                    if idx + 1 < len(voices_to_try):
+                        continue
+                    return False, "alltalk_invalid_json"
+                out_url = str(info.get("output_file_url") or info.get("output_cache_url") or "").strip()
+                if not out_url:
+                    if idx + 1 < len(voices_to_try):
+                        continue
+                    return False, f"alltalk_no_output_url:{info.get('status', 'unknown')}"
+                download_url = urllib.parse.urljoin(base_url, out_url)
+                audio_resp = requests.get(download_url, timeout=max(2.0, timeout_s))
+                audio_resp.raise_for_status()
+                audio_bytes = audio_resp.content
+            else:
+                audio_bytes = resp.content
+
+            if not audio_bytes:
+                if idx + 1 < len(voices_to_try):
+                    continue
+                return False, "alltalk_empty_audio"
+
+            out_file = _save_tmp_wav(audio_bytes)
+            return _play_audio_async(out_file)
+
+        if last_http_detail:
+            return False, last_http_detail
+        return False, "alltalk_retry_exhausted"
     except requests.exceptions.RequestException as e:
         print(f"[voice] AllTalk request failed: {e}", file=sys.stderr)
         return False, f"alltalk_request_failed:{e}"

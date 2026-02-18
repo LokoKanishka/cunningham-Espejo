@@ -6,8 +6,8 @@ Migramos la voz de `Molbot Direct Chat` a **AllTalk TTS** en Docker.
 
 - Compose: `apps/alltalk/compose.yaml`
 - Base: `erew123/alltalk_tts:latest`
-- Build local: `apps/alltalk/Dockerfile` (reinstala PyTorch CUDA 12.4 para RTX 5090)
-- Compatibilidad PyTorch 2.6: `TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1`
+- Build local: `apps/alltalk/Dockerfile` (PyTorch/Torchaudio `2.7.1+cu128` + `ffmpeg` para RTX 5090)
+- Compatibilidad checkpoints legacy: `TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1`
 - Puerto local: `127.0.0.1:7851`
 
 Levantar:
@@ -30,7 +30,8 @@ docker compose -f apps/alltalk/compose.yaml down
 - `DIRECT_CHAT_ALLTALK_HEALTH_PATH` (default `/ready`)
 - `DIRECT_CHAT_ALLTALK_TTS_PATH` (default `/api/tts-generate`)
 - `DIRECT_CHAT_ALLTALK_TIMEOUT_SEC` (default `60`)
-- `DIRECT_CHAT_ALLTALK_CHARACTER_VOICE` (default `ref_lucy.wav`)
+- `DIRECT_CHAT_ALLTALK_CHARACTER_VOICE` (si se define, fuerza esa voz)
+- `DIRECT_CHAT_ALLTALK_DEFAULT_VOICE` (default `female_01.wav`)
 
 ## Nota de migracion
 
