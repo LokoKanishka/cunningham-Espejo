@@ -174,7 +174,7 @@ HTML = r"""<!doctype html>
 	      </div>
 	      <div class="row">
 	        <div class="meter" id="meter">RAM: <strong>...</strong> | Proc: <strong>...</strong> | VRAM: <strong>...</strong></div>
-	        <input id="model" value="openai-codex/gpt-5.1-codex-mini" style="min-width:260px" />
+	        <select id="model" style="min-width:320px"></select>
         <button class="alt" id="clearChat">Limpiar chat</button>
         <button class="alt" id="newSession">Nueva sesion</button>
       </div>
@@ -223,6 +223,7 @@ HTML = r"""<!doctype html>
 	    const meterEl = document.getElementById("meter");
 
     const SESSION_KEY = "molbot_direct_chat_session_id";
+    const MODEL_KEY = "molbot_direct_chat_model_id";
     let sessionId = localStorage.getItem(SESSION_KEY) || crypto.randomUUID();
     localStorage.setItem(SESSION_KEY, sessionId);
 
@@ -230,6 +231,7 @@ HTML = r"""<!doctype html>
 	    let pendingAttachments = [];
       let voiceEnabled = true;
       let speakingTimer = null;
+      let activeStreamController = null;
 
 	    function fmtMb(mb) {
 	      if (mb == null || Number.isNaN(mb)) return "?";
@@ -267,6 +269,69 @@ HTML = r"""<!doctype html>
 	      out.push("model");
 	      return out;
 	    }
+
+    function selectedModel() {
+      const value = (modelEl.value || "").trim();
+      const opt = modelEl.selectedOptions && modelEl.selectedOptions[0];
+      const backend = (opt?.dataset?.backend || "").trim() || "cloud";
+      return { model: value, model_backend: backend };
+    }
+
+    function modelExists(id) {
+      const wanted = (id || "").trim();
+      if (!wanted) return false;
+      return Array.from(modelEl.options).some((o) => o.value === wanted);
+    }
+
+    async function refreshModels(force = false) {
+      const qs = force ? "?refresh=1" : "";
+      let payload = { default_model: "openai-codex/gpt-5.1-codex-mini", models: [] };
+      try {
+        const r = await fetch(`/api/models${qs}`);
+        if (r.ok) payload = await r.json();
+      } catch {}
+
+      const models = Array.isArray(payload.models) ? payload.models : [];
+      modelEl.innerHTML = "";
+
+      for (const m of models) {
+        const opt = document.createElement("option");
+        const id = (m?.id || "").toString();
+        if (!id) continue;
+        const backend = (m?.backend || "cloud").toString();
+        const available = !!m?.available;
+        opt.value = id;
+        opt.dataset.backend = backend;
+        opt.dataset.available = available ? "1" : "0";
+        const missing = backend === "local" && !available ? " (no instalado)" : "";
+        opt.textContent = `${id} [${backend}]${missing}`;
+        modelEl.appendChild(opt);
+      }
+
+      if (!modelEl.options.length) {
+        const fallback = document.createElement("option");
+        fallback.value = payload.default_model || "openai-codex/gpt-5.1-codex-mini";
+        fallback.dataset.backend = "cloud";
+        fallback.textContent = fallback.value + " [cloud]";
+        modelEl.appendChild(fallback);
+      }
+
+      const persisted = (localStorage.getItem(MODEL_KEY) || "").trim();
+      const desired = persisted || (payload.default_model || modelEl.options[0].value);
+      const exists = modelExists(desired);
+      if (persisted && !exists) {
+        localStorage.removeItem(MODEL_KEY);
+      }
+      modelEl.value = exists ? desired : modelEl.options[0].value;
+      localStorage.setItem(MODEL_KEY, modelEl.value);
+    }
+
+    function abortCurrentStream() {
+      if (activeStreamController) {
+        activeStreamController.abort();
+        activeStreamController = null;
+      }
+    }
 
     function setVoiceVisual(enabled) {
       voiceEnabled = !!enabled;
@@ -366,24 +431,47 @@ HTML = r"""<!doctype html>
     }
 
     async function saveServerHistory() {
+      const sel = selectedModel();
       try {
         await fetch("/api/history", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ session_id: sessionId, history }),
+          body: JSON.stringify({
+            session_id: sessionId,
+            model: sel.model,
+            model_backend: sel.model_backend,
+            history,
+          }),
         });
       } catch {}
     }
 
     async function loadServerHistory() {
+      const sel = selectedModel();
+      const q = new URLSearchParams({
+        session: sessionId,
+        model: sel.model || "",
+        model_backend: sel.model_backend || "",
+      });
       try {
-        const r = await fetch(`/api/history?session=${encodeURIComponent(sessionId)}`);
+        const r = await fetch(`/api/history?${q.toString()}`);
         const j = await r.json();
         history = Array.isArray(j.history) ? j.history : [];
       } catch {
         history = [];
       }
       draw();
+    }
+
+    async function recoverModelSelection(errorCode) {
+      const msg = errorCode === "MISSING_MODEL"
+        ? "Modelo no instalado; volví al default."
+        : "Modelo ya no disponible; volví al default.";
+      localStorage.removeItem(MODEL_KEY);
+      abortCurrentStream();
+      await refreshModels(true);
+      await loadServerHistory();
+      await push("assistant", msg);
     }
 
     async function sendMessage(rawText) {
@@ -414,10 +502,16 @@ HTML = r"""<!doctype html>
       inputEl.value = "";
       await push("user", text);
       sendEl.disabled = true;
+      abortCurrentStream();
+      const controller = new AbortController();
+      activeStreamController = controller;
+
+      const sel = selectedModel();
 
       const payload = {
         message: text,
-        model: modelEl.value.trim() || "openai-codex/gpt-5.1-codex-mini",
+        model: sel.model || "openai-codex/gpt-5.1-codex-mini",
+        model_backend: sel.model_backend || "cloud",
         history,
         mode: "operativo",
         session_id: sessionId,
@@ -431,8 +525,23 @@ HTML = r"""<!doctype html>
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload),
+            signal: controller.signal,
           });
-          if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+          if (!res.ok) {
+            let errCode = "";
+            let errText = `HTTP ${res.status}`;
+            try {
+              const j = await res.json();
+              errCode = String(j?.error || "").trim();
+              errText = errCode ? `${errCode}` : errText;
+            } catch {}
+            if (errCode === "UNKNOWN_MODEL" || errCode === "MISSING_MODEL") {
+              await recoverModelSelection(errCode);
+              return;
+            }
+            throw new Error(errText);
+          }
+          if (!res.body) throw new Error(`HTTP ${res.status}`);
 
           startAssistantMessage();
           const reader = res.body.getReader();
@@ -465,8 +574,12 @@ HTML = r"""<!doctype html>
           await saveServerHistory();
         }
       } catch (err) {
+        if (err?.name === "AbortError") return;
         await push("assistant", "Error: " + (err?.message || String(err)));
       } finally {
+        if (activeStreamController === controller) {
+          activeStreamController = null;
+        }
         pendingAttachments = [];
         attachEl.value = "";
         attachInfoEl.textContent = "";
@@ -497,6 +610,16 @@ HTML = r"""<!doctype html>
     });
 
     newSessionEl.addEventListener("click", () => sendMessage("/new"));
+    modelEl.addEventListener("change", async () => {
+      if (!modelExists(modelEl.value)) {
+        localStorage.removeItem(MODEL_KEY);
+        await refreshModels(true);
+      }
+      localStorage.setItem(MODEL_KEY, modelEl.value || "");
+      abortCurrentStream();
+      await loadServerHistory();
+      inputEl.focus();
+    });
     clearChatEl.addEventListener("click", async () => {
       history = [];
       draw();
@@ -510,7 +633,9 @@ HTML = r"""<!doctype html>
     });
 
     syncVoiceState();
-    loadServerHistory().then(() => inputEl.focus());
+    refreshModels()
+      .then(() => loadServerHistory())
+      .then(() => inputEl.focus());
     refreshMeter();
     setInterval(refreshMeter, 2000);
   </script>

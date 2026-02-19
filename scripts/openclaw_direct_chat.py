@@ -28,6 +28,7 @@ from molbot_direct_chat.util import normalize_text as _normalize_text
 from molbot_direct_chat.util import safe_session_id as _safe_session_id
 
 _VRAM_CACHE = {"ts": 0.0, "data": None}
+_MODEL_CATALOG_CACHE = {"ts": 0.0, "data": None}
 
 
 HISTORY_DIR = Path.home() / ".openclaw" / "direct_chat_histories"
@@ -2589,12 +2590,29 @@ def _pick_first_youtube_video_url(query: str) -> tuple[str | None, str]:
         chosen = chosen + ("&" if "?" in chosen else "?") + "autoplay=1"
     return chosen, "ok"
 
-def _history_path(session_id: str) -> Path:
-    return HISTORY_DIR / f"{_safe_session_id(session_id)}.json"
+def _sanitize_history_component(value: str, limit: int = 80) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "_", str(value or "").strip()).strip("._-")
+    if not cleaned:
+        return "default"
+    return cleaned[: max(8, int(limit))]
 
 
-def _load_history(session_id: str) -> list:
-    p = _history_path(session_id)
+def _history_scope_key(session_id: str, model: str | None = None, backend: str | None = None) -> str:
+    base = _safe_session_id(session_id)
+    model_raw = str(model or "").strip()
+    if not model_raw:
+        return base
+    backend_key = _sanitize_history_component(str(backend or "auto"), limit=20)
+    model_key = _sanitize_history_component(model_raw, limit=96)
+    return f"{base}__{backend_key}__{model_key}"
+
+
+def _history_path(session_id: str, model: str | None = None, backend: str | None = None) -> Path:
+    return HISTORY_DIR / f"{_history_scope_key(session_id, model=model, backend=backend)}.json"
+
+
+def _load_history(session_id: str, model: str | None = None, backend: str | None = None) -> list:
+    p = _history_path(session_id, model=model, backend=backend)
     if not p.exists():
         return []
     try:
@@ -2610,8 +2628,8 @@ def _load_history(session_id: str) -> list:
     return []
 
 
-def _save_history(session_id: str, history: list) -> None:
-    p = _history_path(session_id)
+def _save_history(session_id: str, history: list, model: str | None = None, backend: str | None = None) -> None:
+    p = _history_path(session_id, model=model, backend=backend)
     payload = history[-200:]
     p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -3132,6 +3150,302 @@ def _build_system_prompt(mode: str, allowed_tools: set[str]) -> str:
     return " ".join(base)
 
 
+def _split_csv(raw: str) -> list[str]:
+    out: list[str] = []
+    for item in str(raw or "").split(","):
+        val = item.strip()
+        if val:
+            out.append(val)
+    return out
+
+
+def _split_alias_csv(raw: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for item in str(raw or "").split(","):
+        part = item.strip()
+        if not part or "=" not in part:
+            continue
+        alias, target = part.split("=", 1)
+        alias_key = alias.strip()
+        target_val = target.strip()
+        if alias_key and target_val:
+            out[alias_key] = target_val
+    return out
+
+
+def _unique_keep_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def _load_openclaw_config_dict() -> dict:
+    cfg_path = Path.home() / ".openclaw" / "openclaw.json"
+    try:
+        if not cfg_path.exists():
+            return {}
+        return json.loads(cfg_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _discover_cloud_models() -> tuple[str, list[str]]:
+    cfg = _load_openclaw_config_dict()
+    configured: list[str] = []
+    default_model = "openai-codex/gpt-5.1-codex-mini"
+
+    try:
+        default_model = str(cfg.get("agents", {}).get("defaults", {}).get("model", {}).get("primary", default_model)).strip()
+    except Exception:
+        pass
+
+    try:
+        configured_map = cfg.get("agents", {}).get("defaults", {}).get("models", {})
+        if isinstance(configured_map, dict):
+            configured.extend([str(k).strip() for k in configured_map.keys() if str(k).strip()])
+    except Exception:
+        pass
+
+    env_models = _split_csv(str(os.environ.get("DIRECT_CHAT_CLOUD_MODELS", "")).strip())
+    models = _unique_keep_order([default_model] + configured + env_models)
+    if not models:
+        models = [default_model]
+    return default_model, models
+
+
+def _discover_ollama_models() -> list[str]:
+    base = str(os.environ.get("DIRECT_CHAT_OLLAMA_URL", "http://127.0.0.1:11434")).strip().rstrip("/")
+    timeout_s = float(_int_env("DIRECT_CHAT_OLLAMA_LIST_TIMEOUT_SEC", 3))
+    found: list[str] = []
+
+    try:
+        resp = requests.get(f"{base}/api/tags", timeout=max(1.0, timeout_s))
+        if resp.status_code == 200:
+            data = resp.json() if resp.content else {}
+            models = data.get("models", []) if isinstance(data, dict) else []
+            if isinstance(models, list):
+                for item in models:
+                    if not isinstance(item, dict):
+                        continue
+                    name = str(item.get("name", "")).strip() or str(item.get("model", "")).strip()
+                    if name:
+                        found.append(name)
+    except Exception:
+        pass
+
+    if found:
+        return _unique_keep_order(found)
+
+    if shutil.which("ollama"):
+        try:
+            proc = subprocess.run(["ollama", "list"], capture_output=True, text=True, timeout=max(2.0, timeout_s))
+            if proc.returncode == 0:
+                for idx, line in enumerate((proc.stdout or "").splitlines()):
+                    if idx == 0:
+                        continue
+                    parts = line.split()
+                    if parts:
+                        name = str(parts[0]).strip()
+                        if name and name.upper() != "NAME":
+                            found.append(name)
+        except Exception:
+            pass
+
+    return _unique_keep_order(found)
+
+
+def _looks_embedding_model(model_id: str) -> bool:
+    lower = str(model_id or "").strip().lower()
+    if not lower:
+        return False
+    markers = (
+        "embed",
+        "embedding",
+        "rerank",
+        "colbert",
+        "bge-",
+        "e5-",
+    )
+    return any(token in lower for token in markers)
+
+
+def _looks_vision_model(model_id: str) -> bool:
+    return "vision" in str(model_id or "").strip().lower()
+
+
+def _allow_vision_models() -> bool:
+    return _env_flag("DIRECT_CHAT_ALLOW_VISION", False)
+
+
+def _is_chat_selector_model(model_id: str) -> bool:
+    # Direct chat selector should only show chat-capable text models.
+    if _looks_embedding_model(model_id):
+        return False
+    if _looks_vision_model(model_id) and not _allow_vision_models():
+        return False
+    return True
+
+
+def _model_alias_map() -> dict[str, str]:
+    aliases = {
+        "qwen-32b-uncensored-q6": "huihui_ai/qwq-abliterated:32b-Q6_K",
+    }
+    aliases.update(_split_alias_csv(str(os.environ.get("DIRECT_CHAT_LOCAL_MODEL_ALIASES", "")).strip()))
+    return aliases
+
+
+def _model_catalog(force_refresh: bool = False) -> dict:
+    ttl = max(2, _int_env("DIRECT_CHAT_MODEL_CATALOG_TTL_SEC", 8))
+    now = time.time()
+    cached = _MODEL_CATALOG_CACHE.get("data")
+    cache_ts = float(_MODEL_CATALOG_CACHE.get("ts", 0.0) or 0.0)
+    if (not force_refresh) and cached and (now - cache_ts) < ttl:
+        return cached
+
+    default_cloud, cloud_models = _discover_cloud_models()
+    installed_local = _discover_ollama_models()
+    local_candidates = _split_csv(
+        str(
+            os.environ.get(
+                "DIRECT_CHAT_LOCAL_MODEL_CANDIDATES",
+                "dolphin-mixtral:latest,mistral-uncensored,qwen-32b-uncensored-q6",
+            )
+        ).strip()
+    )
+    alias_map = _model_alias_map()
+    filtered_installed_local: list[str] = []
+    candidate_set = set(local_candidates)
+    for mid in installed_local:
+        if (not _is_chat_selector_model(mid)) and mid not in candidate_set:
+            continue
+        filtered_installed_local.append(mid)
+    local_all = _unique_keep_order(local_candidates + filtered_installed_local)
+
+    models: list[dict] = []
+    by_id: dict[str, dict] = {}
+
+    def _add(meta: dict) -> None:
+        mid = str(meta.get("id", "")).strip()
+        if not mid or mid in by_id:
+            return
+        by_id[mid] = meta
+        models.append(meta)
+
+    for mid in cloud_models:
+        _add(
+            {
+                "id": mid,
+                "label": mid,
+                "backend": "cloud",
+                "available": True,
+            }
+        )
+
+    installed_set = set(installed_local)
+    for mid in local_all:
+        runtime_id = alias_map.get(mid, mid)
+        is_available = runtime_id in installed_set
+        if (not _is_chat_selector_model(mid)) and (not is_available):
+            continue
+        _add(
+            {
+                "id": mid,
+                "label": mid,
+                "backend": "local",
+                "available": is_available,
+                "runtime_model": runtime_id,
+                "alias_of": runtime_id if runtime_id != mid else "",
+            }
+        )
+
+    default_model = str(os.environ.get("DIRECT_CHAT_DEFAULT_MODEL", "")).strip() or default_cloud
+    if default_model not in by_id:
+        default_model = default_cloud if default_cloud in by_id else (models[0]["id"] if models else "openai-codex/gpt-5.1-codex-mini")
+
+    data = {
+        "default_model": default_model,
+        "models": models,
+        "by_id": by_id,
+        "ts": now,
+    }
+    _MODEL_CATALOG_CACHE["ts"] = now
+    _MODEL_CATALOG_CACHE["data"] = data
+    return data
+
+
+class _ModelSelectionError(Exception):
+    def __init__(self, code: str, model: str, detail: str):
+        super().__init__(detail)
+        self.code = code
+        self.model = model
+        self.detail = detail
+
+    def as_payload(self) -> dict:
+        return {
+            "error": self.code,
+            "model": self.model,
+            "detail": self.detail,
+        }
+
+
+def _resolve_model_request(model: str, model_backend: str | None = None) -> dict:
+    catalog = _model_catalog()
+    requested_model = str(model or "").strip() or str(catalog.get("default_model", "")).strip()
+    requested_backend = str(model_backend or "").strip().lower()
+    by_id = catalog.get("by_id", {})
+    known = by_id.get(requested_model) if isinstance(by_id, dict) else None
+
+    if not requested_model or not isinstance(known, dict):
+        raise _ModelSelectionError(
+            "UNKNOWN_MODEL",
+            requested_model,
+            "El modelo solicitado no existe en el catálogo actual.",
+        )
+
+    backend = str(known.get("backend", "")).strip().lower()
+    available = bool(known.get("available", False))
+    runtime_model = str(known.get("runtime_model", "")).strip() or requested_model
+
+    if not available:
+        raise _ModelSelectionError(
+            "MISSING_MODEL",
+            requested_model,
+            "El modelo solicitado está en catálogo pero no está disponible/instalado.",
+        )
+
+    return {
+        "requested_model": requested_model,
+        "resolved_model": runtime_model,
+        "resolved_backend": backend if backend in ("cloud", "local") else "cloud",
+        "requested_backend": requested_backend if requested_backend in ("cloud", "local") else "",
+    }
+
+
+def _extract_reply_text(response_data: dict) -> str:
+    if not isinstance(response_data, dict):
+        return ""
+    choices = response_data.get("choices", [])
+    if isinstance(choices, list) and choices:
+        msg = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
+        content = msg.get("content", "") if isinstance(msg, dict) else ""
+        if isinstance(content, str):
+            return content
+    message = response_data.get("message", {})
+    if isinstance(message, dict):
+        content = message.get("content", "")
+        if isinstance(content, str):
+            return content
+    content = response_data.get("response", "")
+    if isinstance(content, str):
+        return content
+    return ""
+
+
 def load_gateway_token() -> str:
     cfg_path = Path.home() / ".openclaw" / "openclaw.json"
     if not cfg_path.exists():
@@ -3201,11 +3515,35 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/history":
             query = parse_qs(parsed.query)
             sid = _safe_session_id((query.get("session", ["default"])[0]))
-            self._json(200, {"session_id": sid, "history": _load_history(sid)})
+            model = str(query.get("model", [""])[0]).strip()
+            model_backend = str(query.get("model_backend", [""])[0]).strip().lower()
+            hist = _load_history(sid, model=model, backend=model_backend)
+            self._json(
+                200,
+                {
+                    "session_id": sid,
+                    "model": model,
+                    "model_backend": model_backend,
+                    "history": hist,
+                },
+            )
             return
 
         if path == "/api/metrics":
             self._json(200, self._metrics_payload())
+            return
+
+        if path == "/api/models":
+            force = str(parse_qs(parsed.query).get("refresh", ["0"])[0]).strip().lower() in ("1", "true", "yes")
+            catalog = _model_catalog(force_refresh=force)
+            self._json(
+                200,
+                {
+                    "default_model": str(catalog.get("default_model", "")),
+                    "models": catalog.get("models", []),
+                    "updated_ts": catalog.get("ts"),
+                },
+            )
             return
 
         if path == "/api/voice":
@@ -3284,6 +3622,63 @@ class Handler(BaseHTTPRequestHandler):
         with urlopen(req, timeout=120) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
+    def _call_ollama(self, payload: dict) -> dict:
+        base = str(os.environ.get("DIRECT_CHAT_OLLAMA_URL", "http://127.0.0.1:11434")).strip().rstrip("/")
+        timeout_s = max(10.0, float(_int_env("DIRECT_CHAT_OLLAMA_TIMEOUT_SEC", 120)))
+
+        v1_payload = dict(payload)
+        v1_payload["stream"] = False
+
+        try:
+            r = requests.post(f"{base}/v1/chat/completions", json=v1_payload, timeout=timeout_s)
+            if r.status_code < 400:
+                out = r.json() if r.content else {}
+                if isinstance(out, dict):
+                    return out
+            if r.status_code not in (400, 404, 405):
+                detail = (r.text or "")[:300].replace("\n", " ")
+                raise RuntimeError(f"ollama_http_error:{r.status_code}:{detail}")
+        except requests.exceptions.RequestException as e:
+            # Fallback below to legacy Ollama API.
+            last_err = f"ollama_request_failed:{e}"
+        else:
+            last_err = ""
+
+        legacy_payload = {
+            "model": str(payload.get("model", "")).strip(),
+            "messages": payload.get("messages", []),
+            "stream": False,
+        }
+        temp = payload.get("temperature")
+        if temp is not None:
+            legacy_payload["options"] = {"temperature": temp}
+
+        try:
+            r2 = requests.post(f"{base}/api/chat", json=legacy_payload, timeout=timeout_s)
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(last_err or f"ollama_request_failed:{e}") from e
+
+        if r2.status_code >= 400:
+            detail = (r2.text or "")[:320].replace("\n", " ")
+            raise RuntimeError(f"ollama_http_error:{r2.status_code}:{detail}")
+
+        raw = r2.json() if r2.content else {}
+        content = _extract_reply_text(raw)
+        if not content.strip():
+            content = str(raw.get("response", "") if isinstance(raw, dict) else "")
+        return {
+            "id": raw.get("id", "ollama-local"),
+            "model": str(payload.get("model", "")).strip(),
+            "choices": [{"message": {"role": "assistant", "content": content}}],
+            "provider": "ollama",
+            "raw": raw,
+        }
+
+    def _call_model_backend(self, backend: str, payload: dict) -> dict:
+        if backend == "local":
+            return self._call_ollama(payload)
+        return self._call_gateway(payload)
+
     def do_POST(self):
         if self.path == "/api/voice":
             try:
@@ -3315,6 +3710,10 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 payload = self._parse_payload()
                 sid = _safe_session_id(str(payload.get("session_id", "default")))
+                model = str(payload.get("model", "")).strip()
+                model_backend = str(payload.get("model_backend", "")).strip().lower()
+                if model_backend not in ("cloud", "local"):
+                    model_backend = ""
                 history = payload.get("history", [])
                 if not isinstance(history, list):
                     history = []
@@ -3322,8 +3721,8 @@ class Handler(BaseHTTPRequestHandler):
                 for item in history[-200:]:
                     if isinstance(item, dict) and item.get("role") in ("user", "assistant") and isinstance(item.get("content"), str):
                         safe.append({"role": item["role"], "content": item["content"]})
-                _save_history(sid, safe)
-                self._json(200, {"ok": True})
+                _save_history(sid, safe, model=model, backend=model_backend)
+                self._json(200, {"ok": True, "session_id": sid, "model": model, "model_backend": model_backend})
             except Exception as e:
                 self._json(500, {"error": str(e)})
             return
@@ -3337,6 +3736,15 @@ class Handler(BaseHTTPRequestHandler):
             payload = self._parse_payload()
             message = str(payload.get("message", "")).strip()
             model = str(payload.get("model", "openai-codex/gpt-5.1-codex-mini")).strip()
+            requested_backend = str(payload.get("model_backend", "")).strip().lower()
+            try:
+                model_resolution = _resolve_model_request(model=model, model_backend=requested_backend)
+            except _ModelSelectionError as e:
+                self._json(400, e.as_payload())
+                return
+            model = str(model_resolution.get("requested_model", "")).strip() or model
+            routed_model = str(model_resolution.get("resolved_model", "")).strip() or model
+            resolved_backend = str(model_resolution.get("resolved_backend", "")).strip() or "cloud"
             history = payload.get("history", [])
             session_id = _safe_session_id(str(payload.get("session_id", "default")))
             mode = str(payload.get("mode", "operativo"))
@@ -3448,12 +3856,12 @@ class Handler(BaseHTTPRequestHandler):
                 # Robust pseudo-stream: avoids hanging when upstream SSE behavior
                 # changes and still gives progressive UX.
                 req_payload = {
-                    "model": model,
+                    "model": routed_model,
                     "messages": messages,
                     "temperature": 0.2,
                 }
-                response_data = self._call_gateway(req_payload)
-                full = response_data.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
+                response_data = self._call_model_backend(resolved_backend, req_payload)
+                full = _extract_reply_text(response_data) or ""
                 if not full.strip():
                     full = (
                         "No recibí texto del modelo en esta vuelta. "
@@ -3480,12 +3888,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             req_payload = {
-                "model": model,
+                "model": routed_model,
                 "messages": messages,
                 "temperature": 0.2,
             }
-            response_data = self._call_gateway(req_payload)
-            reply = response_data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            response_data = self._call_model_backend(resolved_backend, req_payload)
+            reply = _extract_reply_text(response_data)
             if not isinstance(reply, str) or not reply.strip():
                 reply = (
                     "No recibí texto del modelo en esta vuelta. "
@@ -3502,9 +3910,17 @@ class Handler(BaseHTTPRequestHandler):
                         merged.append({"role": item["role"], "content": item["content"]})
             merged.append({"role": "user", "content": message})
             merged.append({"role": "assistant", "content": reply})
-            _save_history(session_id, merged)
+            _save_history(session_id, merged, model=model, backend=resolved_backend)
 
-            self._json(200, {"reply": reply, "raw": response_data})
+            self._json(
+                200,
+                {
+                    "reply": reply,
+                    "raw": response_data,
+                    "model": model,
+                    "model_backend": resolved_backend,
+                },
+            )
         except HTTPError as e:
             detail = e.read().decode("utf-8", errors="replace")
             self._json(e.code, {"error": f"Gateway HTTP {e.code}", "detail": detail})
