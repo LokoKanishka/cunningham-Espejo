@@ -39,3 +39,29 @@ Laboratorio desde cero para Moltbot upstream + modelos externos + cambio de mode
 - Modo español persistente: `./scripts/set_spanish_mode.sh`
 - Chat con salida por voz: `./scripts/chat_voice_es.sh "tu pregunta"`
 - Doc: `DOCS/UX_SPANISH_VOICE.md`
+
+<!-- DC_OPS_SECURITY_BEGIN -->
+## Direct Chat: Ops & Security
+
+### systemd (no más choques de puerto)
+Direct Chat corre como servicios de usuario:
+
+- `openclaw-direct-chat.service`
+- `openclaw-gateway.service`
+
+Comandos útiles:
+
+```bash
+systemctl --user status openclaw-direct-chat.service --no-pager
+systemctl --user status openclaw-gateway.service --no-pager
+systemctl --user restart openclaw-direct-chat.service openclaw-gateway.service
+journalctl --user -u openclaw-direct-chat.service -n 200 --no-pager
+journalctl --user -u openclaw-gateway.service -n 200 --no-pager
+```
+
+### seguridad (exec deshabilitado por defecto)
+
+Para evitar que el modelo ejecute comandos arbitrarios, `exec` queda denegado por defecto
+en `~/.openclaw/openclaw.json` (deny: `exec`, `bash`; allow: sin `exec`).
+<!-- DC_OPS_SECURITY_END -->
+
