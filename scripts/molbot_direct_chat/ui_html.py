@@ -232,6 +232,10 @@ HTML = r"""<!doctype html>
       let voiceEnabled = true;
       let speakingTimer = null;
       let activeStreamController = null;
+      let sttPollTimer = null;
+      let sttSending = false;
+      let sttLastText = "";
+      let sttLastTextAtMs = 0;
 
 	    function fmtMb(mb) {
 	      if (mb == null || Number.isNaN(mb)) return "?";
@@ -333,11 +337,76 @@ HTML = r"""<!doctype html>
       }
     }
 
+    function stopSttPolling() {
+      if (sttPollTimer) {
+        clearInterval(sttPollTimer);
+        sttPollTimer = null;
+      }
+    }
+
+    function shouldAcceptSttText(text) {
+      const t = (text || "").trim();
+      if (t.length < 3) return false;
+      const now = Date.now();
+      if (t === sttLastText && (now - sttLastTextAtMs) < 4000) return false;
+      sttLastText = t;
+      sttLastTextAtMs = now;
+      return true;
+    }
+
+    async function pollSttOnce() {
+      if (!voiceEnabled) return;
+      if (sendEl.disabled || sttSending) return;
+      try {
+        const q = new URLSearchParams({ session_id: sessionId, limit: "2" });
+        const r = await fetch(`/api/stt/poll?${q.toString()}`);
+        if (!r.ok) return;
+        const j = await r.json();
+        const items = Array.isArray(j?.items) ? j.items : [];
+        for (const item of items) {
+          const text = String(item?.text || "").trim();
+          if (!shouldAcceptSttText(text)) continue;
+          sttSending = true;
+          try {
+            await sendMessage(text);
+          } finally {
+            sttSending = false;
+          }
+          break;
+        }
+      } catch {}
+    }
+
+    function startSttPolling() {
+      if (!voiceEnabled) return;
+      if (sttPollTimer) return;
+      sttPollTimer = setInterval(() => {
+        pollSttOnce();
+      }, 700);
+      pollSttOnce();
+    }
+
+    async function claimVoiceOwner() {
+      if (!voiceEnabled) return;
+      try {
+        await fetch("/api/voice", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_id: sessionId }),
+        });
+      } catch {}
+    }
+
     function setVoiceVisual(enabled) {
       voiceEnabled = !!enabled;
       voiceToggleEl.dataset.on = voiceEnabled ? "1" : "0";
       voiceToggleTextEl.textContent = voiceEnabled ? "VOZ ON" : "VOZ OFF";
       localStorage.setItem("molbot_voice_enabled", voiceEnabled ? "1" : "0");
+      if (voiceEnabled) {
+        startSttPolling();
+      } else {
+        stopSttPolling();
+      }
     }
 
     function markSpeaking(active) {
@@ -353,6 +422,9 @@ HTML = r"""<!doctype html>
         const r = await fetch("/api/voice");
         const j = await r.json();
         setVoiceVisual(!!j.enabled);
+        if (j.enabled) {
+          await claimVoiceOwner();
+        }
         return;
       } catch {}
       const ls = localStorage.getItem("molbot_voice_enabled");
@@ -365,7 +437,7 @@ HTML = r"""<!doctype html>
         await fetch("/api/voice", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ enabled: !!enabled }),
+          body: JSON.stringify({ enabled: !!enabled, session_id: sessionId }),
         });
       } catch {}
     }
@@ -485,6 +557,9 @@ HTML = r"""<!doctype html>
         history = [];
         draw();
         await saveServerHistory();
+        if (voiceEnabled) {
+          await claimVoiceOwner();
+        }
         inputEl.value = "";
         return;
       }
