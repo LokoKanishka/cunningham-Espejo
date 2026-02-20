@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import atexit
 import argparse
 import fcntl
 import html
@@ -176,11 +177,12 @@ def _save_voice_state(state: dict) -> None:
         return
 
 
-def _set_voice_enabled(enabled: bool) -> None:
+def _set_voice_enabled(enabled: bool, session_id: str = "") -> None:
     with _VOICE_LOCK:
         state = _load_voice_state()
         state["enabled"] = bool(enabled)
         _save_voice_state(state)
+    _sync_stt_with_voice(enabled=bool(enabled), session_id=session_id if enabled else "")
 
 
 def _voice_enabled() -> bool:
@@ -195,6 +197,220 @@ def _int_env(name: str, default: int) -> int:
         return int(raw)
     except Exception:
         return int(default)
+
+
+class STTManager:
+    _RETRY_DELAYS_SEC = (2.0, 5.0, 10.0)
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._worker = None
+        self._queue: queue.Queue[dict] = queue.Queue(maxsize=max(1, self._env_int("DIRECT_CHAT_STT_QUEUE_SIZE", 24)))
+        self._enabled = False
+        self._owner_session_id = ""
+        self._last_error = ""
+        self._retry_idx = 0
+        self._next_retry_mono = 0.0
+
+    @staticmethod
+    def _env_int(name: str, default: int) -> int:
+        raw = str(os.environ.get(name, "")).strip()
+        if not raw:
+            return int(default)
+        try:
+            return int(raw)
+        except Exception:
+            return int(default)
+
+    @staticmethod
+    def _env_float(name: str, default: float) -> float:
+        raw = str(os.environ.get(name, "")).strip()
+        if not raw:
+            return float(default)
+        try:
+            return float(raw)
+        except Exception:
+            return float(default)
+
+    def _log(self, msg: str) -> None:
+        try:
+            print(msg, file=sys.stderr)
+        except Exception:
+            return
+
+    def _clear_queue_locked(self) -> None:
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                return
+
+    def _should_listen(self) -> bool:
+        with self._lock:
+            enabled = bool(self._enabled)
+        if not enabled:
+            return False
+        return not _tts_is_playing()
+
+    def _build_worker_locked(self):
+        from molbot_direct_chat import stt_local
+
+        cfg = stt_local.STTConfig(
+            sample_rate=max(8000, self._env_int("DIRECT_CHAT_STT_SAMPLE_RATE", 16000)),
+            channels=max(1, self._env_int("DIRECT_CHAT_STT_CHANNELS", 1)),
+            device=str(os.environ.get("DIRECT_CHAT_STT_DEVICE", "")).strip() or None,
+            frame_ms=max(10, min(30, self._env_int("DIRECT_CHAT_STT_FRAME_MS", 30))),
+            vad_mode=max(0, min(3, self._env_int("DIRECT_CHAT_STT_VAD_MODE", 2))),
+            min_speech_ms=max(120, self._env_int("DIRECT_CHAT_STT_MIN_SPEECH_MS", 350)),
+            max_silence_ms=max(200, self._env_int("DIRECT_CHAT_STT_MAX_SILENCE_MS", 900)),
+            max_segment_s=max(2.0, self._env_float("DIRECT_CHAT_STT_MAX_SEGMENT_SEC", 20.0)),
+            language=str(os.environ.get("DIRECT_CHAT_STT_LANGUAGE", "es")).strip() or "es",
+            model=str(os.environ.get("DIRECT_CHAT_STT_MODEL", "small")).strip() or "small",
+            fw_device=str(os.environ.get("DIRECT_CHAT_STT_FW_DEVICE", "cpu")).strip() or "cpu",
+            fw_compute_type=str(os.environ.get("DIRECT_CHAT_STT_FW_COMPUTE_TYPE", "int8")).strip() or "int8",
+            initial_prompt=str(os.environ.get("DIRECT_CHAT_STT_INITIAL_PROMPT", "")).strip(),
+            min_chars=max(1, self._env_int("DIRECT_CHAT_STT_MIN_CHARS", 3)),
+        )
+        return stt_local.STTWorker(cfg, self._queue, should_listen=self._should_listen, logger=self._log)
+
+    def _schedule_retry_locked(self, now_mono: float) -> None:
+        idx = min(self._retry_idx, len(self._RETRY_DELAYS_SEC) - 1)
+        delay = float(self._RETRY_DELAYS_SEC[idx])
+        self._retry_idx += 1
+        self._next_retry_mono = now_mono + max(0.2, delay)
+
+    def _sync_worker_locked(self, now_mono: float) -> None:
+        if self._worker is not None and not self._worker.is_running():
+            last_error = str(getattr(self._worker, "last_error", "")).strip()
+            if last_error:
+                self._last_error = last_error
+            self._worker = None
+
+        if not self._enabled:
+            return
+        if self._worker is not None and self._worker.is_running():
+            return
+        if now_mono < self._next_retry_mono:
+            return
+
+        try:
+            worker = self._build_worker_locked()
+        except Exception as e:
+            self._last_error = f"stt_init_failed:{e}"
+            self._schedule_retry_locked(now_mono)
+            self._log(f"[stt] {self._last_error}")
+            return
+
+        worker.start()
+        if worker.is_running():
+            self._worker = worker
+            self._last_error = ""
+            self._retry_idx = 0
+            self._next_retry_mono = 0.0
+            return
+
+        self._last_error = str(getattr(worker, "last_error", "")).strip() or "stt_start_failed"
+        self._worker = None
+        self._schedule_retry_locked(now_mono)
+        self._log(f"[stt] {self._last_error}")
+
+    def enable(self, session_id: str = "") -> None:
+        sid = _safe_session_id(session_id) if session_id else ""
+        with self._lock:
+            self._enabled = True
+            if sid and sid != "default" and sid != self._owner_session_id:
+                self._owner_session_id = sid
+                self._clear_queue_locked()
+            self._sync_worker_locked(time.monotonic())
+
+    def claim_owner(self, session_id: str) -> None:
+        sid = _safe_session_id(session_id)
+        if not sid or sid == "default":
+            return
+        with self._lock:
+            if sid != self._owner_session_id:
+                self._owner_session_id = sid
+                self._clear_queue_locked()
+            if self._enabled:
+                self._sync_worker_locked(time.monotonic())
+
+    def disable(self) -> None:
+        worker = None
+        with self._lock:
+            self._enabled = False
+            self._owner_session_id = ""
+            worker = self._worker
+            self._worker = None
+            self._retry_idx = 0
+            self._next_retry_mono = 0.0
+            self._clear_queue_locked()
+        if worker is not None:
+            try:
+                worker.stop(timeout=2.0)
+            except Exception:
+                pass
+
+    def poll(self, session_id: str, limit: int = 3) -> list[dict]:
+        sid = _safe_session_id(session_id)
+        if limit <= 0:
+            limit = 1
+        limit = min(limit, 12)
+
+        with self._lock:
+            self._sync_worker_locked(time.monotonic())
+            if not self._enabled:
+                return []
+            if sid and sid != "default" and not self._owner_session_id:
+                self._owner_session_id = sid
+                self._clear_queue_locked()
+            if sid != self._owner_session_id:
+                return []
+
+        out: list[dict] = []
+        for _ in range(limit):
+            try:
+                item = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if isinstance(item, dict):
+                text = str(item.get("text", "")).strip()
+                if not text:
+                    continue
+                out.append({"text": text, "ts": float(item.get("ts", time.time()))})
+        return out
+
+    def status(self) -> dict:
+        with self._lock:
+            now = time.monotonic()
+            self._sync_worker_locked(now)
+            running = bool(self._worker is not None and self._worker.is_running())
+            retry_in = 0.0
+            if self._next_retry_mono > now:
+                retry_in = max(0.0, self._next_retry_mono - now)
+            return {
+                "stt_enabled": bool(self._enabled),
+                "stt_running": running,
+                "stt_owner_session_id": str(self._owner_session_id),
+                "stt_last_error": str(self._last_error),
+                "stt_retry_in_sec": round(retry_in, 3),
+            }
+
+    def shutdown(self) -> None:
+        self.disable()
+
+
+_STT_MANAGER = STTManager()
+atexit.register(_STT_MANAGER.shutdown)
+
+
+def _sync_stt_with_voice(enabled: bool, session_id: str = "") -> None:
+    try:
+        if enabled:
+            _STT_MANAGER.enable(session_id=session_id)
+            return
+        _STT_MANAGER.disable()
+    except Exception as e:
+        print(f"[stt] sync_failed:{e}", file=sys.stderr)
 
 
 def _alltalk_base_url() -> str:
@@ -2784,13 +3000,13 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
 
     if "tts" in allowed_tools:
         if any(k in normalized for k in ("voz off", "silenciar voz", "mute voz", "apaga la voz", "desactiva voz")):
-            _set_voice_enabled(False)
+            _set_voice_enabled(False, session_id=session_id)
             return {"reply": "Listo: desactivé la voz."}
         if any(k in normalized for k in ("voz on", "activa voz", "encende voz", "enciende voz")):
-            _set_voice_enabled(True)
+            _set_voice_enabled(True, session_id=session_id)
             return {"reply": "Listo: activé la voz."}
         if any(k in normalized for k in ("voz test", "proba voz", "probar voz", "test de voz")):
-            _set_voice_enabled(True)
+            _set_voice_enabled(True, session_id=session_id)
             _speak_reply_async("Prueba de voz activada. Sistema listo.")
             return {"reply": "Ejecuté prueba de voz."}
 
@@ -3613,6 +3829,23 @@ class Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         return json.loads(body.decode("utf-8") or "{}")
 
+    def _voice_payload(self, state: dict) -> dict:
+        enabled = bool(state.get("enabled", False))
+        _sync_stt_with_voice(enabled=enabled)
+        stt_status = _STT_MANAGER.status()
+        server_ok, server_detail = _alltalk_health(timeout_s=0.35)
+        return {
+            "enabled": enabled,
+            "speaker": str(state.get("speaker", "")),
+            "speaker_wav": str(state.get("speaker_wav", "")),
+            "provider": "alltalk",
+            "server_url": _alltalk_base_url(),
+            "server_ok": bool(server_ok),
+            "server_detail": str(server_detail),
+            "last_status": _VOICE_LAST_STATUS,
+            **stt_status,
+        }
+
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
@@ -3665,22 +3898,28 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
-        if path == "/api/voice":
-            state = _load_voice_state()
-            server_ok, server_detail = _alltalk_health(timeout_s=0.35)
+        if path == "/api/stt/poll":
+            query = parse_qs(parsed.query)
+            sid = _safe_session_id((query.get("session_id", ["default"])[0]))
+            try:
+                limit = int(str(query.get("limit", ["3"])[0]).strip() or "3")
+            except Exception:
+                limit = 3
+            items = _STT_MANAGER.poll(session_id=sid, limit=limit)
+            stt_status = _STT_MANAGER.status()
             self._json(
                 200,
                 {
-                    "enabled": bool(state.get("enabled", False)),
-                    "speaker": str(state.get("speaker", "")),
-                    "speaker_wav": str(state.get("speaker_wav", "")),
-                    "provider": "alltalk",
-                    "server_url": _alltalk_base_url(),
-                    "server_ok": bool(server_ok),
-                    "server_detail": str(server_detail),
-                    "last_status": _VOICE_LAST_STATUS,
+                    "session_id": sid,
+                    "items": items,
+                    **stt_status,
                 },
             )
+            return
+
+        if path == "/api/voice":
+            state = _load_voice_state()
+            self._json(200, self._voice_payload(state))
             return
 
         self.send_response(404)
@@ -3803,8 +4042,14 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 payload = self._parse_payload()
                 state = _load_voice_state()
+                session_id = _safe_session_id(str(payload.get("session_id", "default")))
                 if "enabled" in payload:
-                    state["enabled"] = bool(payload.get("enabled"))
+                    requested_enabled = bool(payload.get("enabled"))
+                    _set_voice_enabled(requested_enabled, session_id=session_id if requested_enabled else "")
+                    state = _load_voice_state()
+                elif bool(state.get("enabled", False)) and session_id != "default":
+                    _STT_MANAGER.claim_owner(session_id)
+
                 speaker = str(payload.get("speaker", "")).strip()
                 if speaker:
                     state["speaker"] = speaker
@@ -3816,9 +4061,7 @@ class Handler(BaseHTTPRequestHandler):
                     200,
                     {
                         "ok": True,
-                        "enabled": bool(state.get("enabled", False)),
-                        "speaker": str(state.get("speaker", "")),
-                        "speaker_wav": str(state.get("speaker_wav", "")),
+                        **self._voice_payload(state),
                     },
                 )
             except Exception as e:
