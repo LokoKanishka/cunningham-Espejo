@@ -1,0 +1,20 @@
+# ip_route
+# generated_at=2026-02-20T17:34:31-03:00
+# cmd=ip route show
+
+default via 192.168.0.1 dev eno1 proto dhcp src 192.168.0.3 metric 100 
+172.17.0.0/16 dev docker0 proto kernel scope link src 172.17.0.1 
+172.18.0.0/16 dev br-63797dcdb614 proto kernel scope link src 172.18.0.1 linkdown 
+172.19.0.0/16 dev br-d733fc0994c8 proto kernel scope link src 172.19.0.1 linkdown 
+172.20.0.0/16 dev br-a7244d250481 proto kernel scope link src 172.20.0.1 
+172.21.0.0/16 dev br-a7803b6e967d proto kernel scope link src 172.21.0.1 linkdown 
+172.22.0.0/16 dev br-18ed85680521 proto kernel scope link src 172.22.0.1 linkdown 
+172.23.0.0/16 dev br-c49a9a62d8e6 proto kernel scope link src 172.23.0.1 linkdown 
+172.24.0.0/16 dev br-1ea40cfdf3a4 proto kernel scope link src 172.24.0.1 
+172.25.0.0/16 dev br-f2d16d34d87a proto kernel scope link src 172.25.0.1 
+172.26.0.0/16 dev br-a91b9f10d4aa proto kernel scope link src 172.26.0.1 
+172.27.0.0/16 dev br-4734f1760ae5 proto kernel scope link src 172.27.0.1 linkdown 
+172.28.0.0/16 dev br-cbc8c3a7a4df proto kernel scope link src 172.28.0.1 linkdown 
+172.29.0.0/16 dev br-aaa8ced8fffc proto kernel scope link src 172.29.0.1 linkdown 
+172.30.0.0/16 dev br-bcb66a79f073 proto kernel scope link src 172.30.0.1 
+192.168.0.0/24 dev eno1 proto kernel scope link src 192.168.0.3 metric 100 

@@ -1,0 +1,11 @@
+# pactl_sources
+# generated_at=2026-02-20T17:34:31-03:00
+# cmd=pactl list short sources
+
+50	alsa_output.usb-C-Media_Electronics_Inc._Redragon_Gaming_Headset_999-00.analog-stereo.monitor	PipeWire	s16le 2ch 48000Hz	SUSPENDED
+51	alsa_input.usb-C-Media_Electronics_Inc._Redragon_Gaming_Headset_999-00.mono-fallback	PipeWire	s16le 1ch 48000Hz	SUSPENDED
+52	alsa_output.usb-Generic_USB_Audio-00.HiFi__hw_Audio_2__sink.monitor	PipeWire	s24le 2ch 48000Hz	SUSPENDED
+53	alsa_output.usb-Generic_USB_Audio-00.HiFi__hw_Audio_1__sink.monitor	PipeWire	s32le 2ch 48000Hz	SUSPENDED
+54	alsa_output.usb-Generic_USB_Audio-00.HiFi__hw_Audio__sink.monitor	PipeWire	s32le 2ch 48000Hz	SUSPENDED
+55	alsa_input.usb-Generic_USB_Audio-00.HiFi__hw_Audio_2__source	PipeWire	s24le 2ch 48000Hz	SUSPENDED
+56	alsa_input.usb-Generic_USB_Audio-00.HiFi__hw_Audio_1__source	PipeWire	s24le 2ch 48000Hz	SUSPENDED

@@ -1,0 +1,6 @@
+# nmcli_general
+# generated_at=2026-02-20T17:34:31-03:00
+# cmd=nmcli general status
+
+STATE      CONNECTIVITY  WIFI-HW  WIFI     WWAN-HW  WWAN    
+connected  full          enabled  enabled  missing  enabled 

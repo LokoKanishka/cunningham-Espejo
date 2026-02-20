@@ -1,0 +1,47 @@
+# repo_tree
+# generated_at=2026-02-20T17:34:32-03:00
+# shell=cd '/home/lucy-ubuntu/Escritorio/cunningham-Espejo' && find . -maxdepth 3 -type d | LC_ALL=C sort
+
+.
+./.git
+./.git/branches
+./.git/gk
+./.git/hooks
+./.git/info
+./.git/logs
+./.git/logs/refs
+./.git/objects
+./.git/objects/info
+./.git/objects/pack
+./.git/refs
+./.git/refs/heads
+./.git/refs/remotes
+./.git/refs/tags
+./1
+./DOCS
+./DOCS/HOST_AUDIT
+./DOCS/HOST_AUDIT/20260220_173350
+./DOCS/HOST_AUDIT/20260220_173410
+./DOCS/HOST_AUDIT/20260220_173431
+./DOCS/RUNS
+./antigravity
+./apps
+./apps/alltalk
+./apps/dockge
+./apps/dockge/data
+./apps/lucy_panel
+./apps/lucy_panel/app
+./assets
+./assets/icons
+./config
+./contracts
+./docs
+./ipc
+./ipc/envelopes
+./prometheus
+./scripts
+./scripts/molbot_direct_chat
+./systemd
+./tests
+./tickets
+./tools

@@ -1,0 +1,8 @@
+# pactl_sinks
+# generated_at=2026-02-20T17:34:31-03:00
+# cmd=pactl list short sinks
+
+50	alsa_output.usb-C-Media_Electronics_Inc._Redragon_Gaming_Headset_999-00.analog-stereo	PipeWire	s16le 2ch 48000Hz	SUSPENDED
+52	alsa_output.usb-Generic_USB_Audio-00.HiFi__hw_Audio_2__sink	PipeWire	s24le 2ch 48000Hz	SUSPENDED
+53	alsa_output.usb-Generic_USB_Audio-00.HiFi__hw_Audio_1__sink	PipeWire	s32le 2ch 48000Hz	SUSPENDED
+54	alsa_output.usb-Generic_USB_Audio-00.HiFi__hw_Audio__sink	PipeWire	s32le 2ch 48000Hz	SUSPENDED

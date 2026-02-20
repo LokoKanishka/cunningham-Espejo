@@ -1,0 +1,5 @@
+# uname
+# generated_at=2026-02-20T17:34:31-03:00
+# cmd=uname -a
+
+Linux lucy-ubuntu-System-Product-Name 6.17.0-14-generic #14~24.04.1-Ubuntu SMP PREEMPT_DYNAMIC Thu Jan 15 15:52:10 UTC 2 x86_64 x86_64 x86_64 GNU/Linux

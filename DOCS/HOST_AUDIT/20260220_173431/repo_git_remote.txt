@@ -1,0 +1,8 @@
+# repo_git_remote
+# generated_at=2026-02-20T17:34:32-03:00
+# shell=cd '/home/lucy-ubuntu/Escritorio/cunningham-Espejo' && git remote -v
+
+espejo	https://github.com/LokoKanishka/Cunningham-de-otro-lado-del-espejo.git (fetch)
+espejo	https://github.com/LokoKanishka/Cunningham-de-otro-lado-del-espejo.git (push)
+origin	https://github.com/LokoKanishka/cunningham-Espejo.git (fetch)
+origin	https://github.com/LokoKanishka/cunningham-Espejo.git (push)

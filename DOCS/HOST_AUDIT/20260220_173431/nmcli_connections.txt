@@ -1,0 +1,23 @@
+# nmcli_connections
+# generated_at=2026-02-20T17:34:31-03:00
+# cmd=nmcli connection show
+
+NAME                      UUID                                  TYPE      DEVICE          
+netplan-eno1              10838d80-caeb-349e-ba73-08ed16d4d666  ethernet  eno1            
+br-1ea40cfdf3a4           e4ffe334-6fcb-42a0-a08f-fed39d1d7c46  bridge    br-1ea40cfdf3a4 
+br-a7244d250481           71ed8dd7-176d-46a3-97be-e1fd5cf38c93  bridge    br-a7244d250481 
+br-a91b9f10d4aa           49fa0a33-cdcb-4f27-97be-62eb27be7402  bridge    br-a91b9f10d4aa 
+br-bcb66a79f073           b0906c4f-c23d-48d1-976c-d0d5426274e8  bridge    br-bcb66a79f073 
+br-f2d16d34d87a           0ef8450d-ee67-43ca-9aa3-24cce57c476e  bridge    br-f2d16d34d87a 
+docker0                   837efd20-3fd5-4d33-bce1-598bb143df33  bridge    docker0         
+lo                        5b1b3d78-b072-445f-bf91-77ae50200fc2  loopback  lo              
+br-18ed85680521           2954d560-2444-4434-9d54-87d1259d1b8f  bridge    br-18ed85680521 
+br-4734f1760ae5           6fb787c5-9efc-4724-b1ec-b70236691e93  bridge    br-4734f1760ae5 
+br-63797dcdb614           88313f7a-97e9-477c-a569-43d50cf0d453  bridge    br-63797dcdb614 
+br-a7803b6e967d           3dde237d-e2fb-4134-94f8-7ddbd23894a7  bridge    br-a7803b6e967d 
+br-aaa8ced8fffc           6567076f-ab0b-4d88-a690-2e46ff2a56df  bridge    br-aaa8ced8fffc 
+br-c49a9a62d8e6           3ac07fd1-ee91-4489-abb7-f3547fc29a00  bridge    br-c49a9a62d8e6 
+br-cbc8c3a7a4df           a5342e05-8da6-4d8a-9936-82cdb24ae4b9  bridge    br-cbc8c3a7a4df 
+br-d733fc0994c8           924aa578-4247-4bbd-a6da-c86e91944e51  bridge    br-d733fc0994c8 
+Fibertel Wifi125 2.4 Ghz  3c4f0d20-6c44-4fac-9497-81d0414176a6  wifi      --              
+Perfil 1                  851ac805-379d-4853-b6a3-79aade3f37b9  ethernet  --              

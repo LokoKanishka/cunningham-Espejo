@@ -1,0 +1,5 @@
+# blkid
+# generated_at=2026-02-20T17:34:31-03:00
+# cmd=blkid
+
+/dev/sda2: UUID="fc7ea308-093e-4408-90c7-4aed32580245" BLOCK_SIZE="4096" TYPE="ext4" PARTUUID="5ca2198b-9786-4a77-b9a5-40813f030829"

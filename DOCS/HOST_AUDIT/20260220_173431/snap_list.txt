@@ -1,0 +1,22 @@
+# snap_list
+# generated_at=2026-02-20T17:34:31-03:00
+# shell=snap list
+
+Name                       Version                         Rev    Tracking         Publisher    Notes
+bare                       1.0                             5      latest/stable    canonical**  base
+core20                     20260105                        2717   latest/stable    canonical**  base
+core22                     20260113                        2292   latest/stable    canonical**  base
+core24                     20260107                        1349   latest/stable    canonical**  base
+curl                       8.18.0                          2384   latest/stable    aoilinux     -
+firefox                    147.0.4-1                       7836   latest/stable/…  mozilla**    -
+firmware-updater           0+git.0052f6b                   210    1/stable/…       canonical**  -
+gnome-3-38-2004            0+git.efb213a                   143    latest/stable    canonical**  -
+gnome-42-2204              0+git.c1d3d69-sdk0+git.015db9a  247    latest/stable/…  canonical**  -
+gnome-46-2404              0+git.f1cd5fa-sdk0+git.ca9c59c  153    latest/stable    canonical**  -
+gtk-common-themes          0.1-81-g442e511                 1535   latest/stable/…  canonical**  -
+kf5-core22                 5.116.0                         3      latest/stable    kde**        -
+mesa-2404                  25.0.7-snap211                  1165   latest/stable    canonical**  -
+snap-store                 0+git.90575829                  1270   2/stable/…       canonical**  -
+snapd                      2.73                            25935  latest/stable    canonical**  snapd
+snapd-desktop-integration  0.9                             343    latest/stable/…  canonical**  -
+spotify                    1.2.82.428.g0ac8be2b            92     latest/stable    spotify**    -

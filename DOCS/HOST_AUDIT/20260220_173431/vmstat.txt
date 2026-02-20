@@ -1,0 +1,32 @@
+# vmstat
+# generated_at=2026-02-20T17:34:31-03:00
+# shell=vmstat -s
+
+    131025028 K total memory
+     27082412 K used memory
+     79904728 K active memory
+      9326780 K inactive memory
+     38815752 K free memory
+      1130312 K buffer memory
+     65515056 K swap cache
+      8388604 K total swap
+            0 K used swap
+      8388604 K free swap
+       586201 non-nice user cpu ticks
+          547 nice user cpu ticks
+       408397 system cpu ticks
+     16532478 idle cpu ticks
+        73055 IO-wait cpu ticks
+            0 IRQ cpu ticks
+         1360 softirq cpu ticks
+            0 stolen cpu ticks
+            0 non-nice guest cpu ticks
+            0 nice guest cpu ticks
+     63129679 K paged in
+      8612538 K paged out
+            0 pages swapped in
+            0 pages swapped out
+    151041352 interrupts
+    191055286 CPU context switches
+   1771614143 boot time
+       163542 forks

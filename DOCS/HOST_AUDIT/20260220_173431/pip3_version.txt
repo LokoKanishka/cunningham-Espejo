@@ -1,0 +1,5 @@
+# pip3_version
+# generated_at=2026-02-20T17:34:31-03:00
+# cmd=pip3 --version
+
+pip 24.0 from /usr/lib/python3/dist-packages/pip (python 3.12)

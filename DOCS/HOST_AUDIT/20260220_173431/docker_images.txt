@@ -1,0 +1,33 @@
+# docker_images
+# generated_at=2026-02-20T17:34:31-03:00
+# cmd=docker images
+
+WARNING: This output is designed for human readability. For machine-readable output, please use --format.
+IMAGE                                  ID             DISK USAGE   CONTENT SIZE   EXTRA
+alltalk-alltalk:latest                 ab88e2f275a0       21.5GB             0B   U    
+erew123/alltalk_tts:latest             b9e934791ebd       14.7GB             0B        
+ghcr.io/open-webui/open-webui:latest   23f47d28bfc3       4.65GB             0B   U    
+ghcr.io/open-webui/open-webui:main     23f47d28bfc3       4.65GB             0B   U    
+grafana/grafana-oss:latest             aa786575ad94        747MB             0B   U    
+louislam/dockge:1                      e85d511b2a8b        755MB             0B   U    
+lucy_antigravity:latest                4935bfed0627        281MB             0B   U    
+lucy_antigravity:local                 770f86737d3d        373MB             0B   U    
+lucy_ui_panel:local                    9f686432a102        449MB             0B   U    
+n8nio/n8n:2.4.4                        f5b36596919f        961MB             0B   U    
+n8nio/n8n:latest                       f5b36596919f        961MB             0B   U    
+n8nio/runners:latest                   f304345f4d23        355MB             0B   U    
+node:22-alpine                         463254b4a812        162MB             0B        
+pgvector/pgvector:pg16                 68f823d56bc9        507MB             0B   U    
+prom/prometheus:latest                 937690d77350        367MB             0B   U    
+python:3.12-slim                       c78a70d7588f        119MB             0B        
+qdrant/qdrant:latest                   d2ea76deb232        189MB             0B        
+quay.io/keycloak/keycloak:24.0.1       5eeffc72205f        458MB             0B   U    
+rayproject/ray:latest-gpu              52fc66fd803f       11.6GB             0B        
+redis:7-alpine                         13105d2858de       41.4MB             0B        
+redis:alpine                           778c3ea605c2       94.7MB             0B   U    
+searxng/searxng:latest                 37223afea1ae        168MB             0B   U    
+tecnativa/docker-socket-proxy:latest   16bbd1209742       32.3MB             0B   U    
+vllm/vllm-openai:latest                4c6ca1ff8a82       19.7GB             0B        
+vllm/vllm-openai:nightly               aec7dd09614c       20.1GB             0B        
+vllm/vllm-openai:v0.12.0               0c19f07f0c86       19.5GB             0B        
+vllm/vllm-openai:v0.14.0               ae9b9fa502de       19.7GB             0B        

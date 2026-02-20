@@ -1,0 +1,7 @@
+# repo_git_status
+# generated_at=2026-02-20T17:34:32-03:00
+# shell=cd '/home/lucy-ubuntu/Escritorio/cunningham-Espejo' && git status --short --branch
+
+## main...origin/main
+?? DOCS/HOST_AUDIT/
+?? scripts/host_audit_full.sh

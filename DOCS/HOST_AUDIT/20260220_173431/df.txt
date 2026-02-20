@@ -1,0 +1,12 @@
+# df
+# generated_at=2026-02-20T17:34:31-03:00
+# cmd=df -hT
+
+Filesystem     Type      Size  Used Avail Use% Mounted on
+tmpfs          tmpfs      13G  4.1M   13G   1% /run
+/dev/sda2      ext4      457G  364G   70G  85% /
+tmpfs          tmpfs      63G  226M   63G   1% /dev/shm
+tmpfs          tmpfs     5.0M   20K  5.0M   1% /run/lock
+efivarfs       efivarfs  128K   69K   55K  56% /sys/firmware/efi/efivars
+/dev/sda1      vfat      1.1G  6.2M  1.1G   1% /boot/efi
+tmpfs          tmpfs      13G  148K   13G   1% /run/user/1000

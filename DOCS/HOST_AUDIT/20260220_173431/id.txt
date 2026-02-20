@@ -1,0 +1,5 @@
+# id
+# generated_at=2026-02-20T17:34:31-03:00
+# cmd=id
+
+uid=1000(lucy-ubuntu) gid=1000(lucy-ubuntu) groups=1000(lucy-ubuntu),4(adm),24(cdrom),27(sudo),30(dip),46(plugdev),100(users),114(lpadmin),983(docker),984(ollama)

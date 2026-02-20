@@ -1,0 +1,5 @@
+# git_version
+# generated_at=2026-02-20T17:34:31-03:00
+# cmd=git --version
+
+git version 2.43.0

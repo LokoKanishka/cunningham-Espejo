@@ -1,0 +1,7 @@
+# free
+# generated_at=2026-02-20T17:34:31-03:00
+# cmd=free -h
+
+               total        used        free      shared  buff/cache   available
+Mem:           124Gi        25Gi        37Gi       264Mi        63Gi        99Gi
+Swap:          8.0Gi          0B       8.0Gi

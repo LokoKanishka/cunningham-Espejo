@@ -65,3 +65,8 @@ Para evitar que el modelo ejecute comandos arbitrarios, `exec` queda denegado po
 en `~/.openclaw/openclaw.json` (deny: `exec`, `bash`; allow: sin `exec`).
 <!-- DC_OPS_SECURITY_END -->
 
+## Contexto de esta maquina (DC/CUN)
+- Glosario: `DC` = interfaz Direct Chat; `CUN`/`Lucy` = IA Lucy Cunningham.
+- Auditoria local completa en `DOCS/HOST_AUDIT/`.
+- Ultimo snapshot: ver `DOCS/HOST_AUDIT/LATEST` y la carpeta correspondiente.
+- Regenerar snapshot: `./scripts/host_audit_full.sh`

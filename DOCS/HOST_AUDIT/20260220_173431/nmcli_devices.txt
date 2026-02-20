@@ -1,0 +1,34 @@
+# nmcli_devices
+# generated_at=2026-02-20T17:34:31-03:00
+# cmd=nmcli device status
+
+DEVICE           TYPE      STATE                   CONNECTION      
+eno1             ethernet  connected               netplan-eno1    
+br-1ea40cfdf3a4  bridge    connected (externally)  br-1ea40cfdf3a4 
+br-a7244d250481  bridge    connected (externally)  br-a7244d250481 
+br-a91b9f10d4aa  bridge    connected (externally)  br-a91b9f10d4aa 
+br-bcb66a79f073  bridge    connected (externally)  br-bcb66a79f073 
+br-f2d16d34d87a  bridge    connected (externally)  br-f2d16d34d87a 
+docker0          bridge    connected (externally)  docker0         
+lo               loopback  connected (externally)  lo              
+br-18ed85680521  bridge    connected (externally)  br-18ed85680521 
+br-4734f1760ae5  bridge    connected (externally)  br-4734f1760ae5 
+br-63797dcdb614  bridge    connected (externally)  br-63797dcdb614 
+br-a7803b6e967d  bridge    connected (externally)  br-a7803b6e967d 
+br-aaa8ced8fffc  bridge    connected (externally)  br-aaa8ced8fffc 
+br-c49a9a62d8e6  bridge    connected (externally)  br-c49a9a62d8e6 
+br-cbc8c3a7a4df  bridge    connected (externally)  br-cbc8c3a7a4df 
+br-d733fc0994c8  bridge    connected (externally)  br-d733fc0994c8 
+wlp9s0           wifi      disconnected            --              
+p2p-dev-wlp9s0   wifi-p2p  disconnected            --              
+veth0dc380d      ethernet  unmanaged               --              
+veth4859893      ethernet  unmanaged               --              
+veth49cba33      ethernet  unmanaged               --              
+veth6538ea7      ethernet  unmanaged               --              
+veth7250e91      ethernet  unmanaged               --              
+veth8ae00d4      ethernet  unmanaged               --              
+vethab27e0a      ethernet  unmanaged               --              
+vethc1a28ce      ethernet  unmanaged               --              
+vethc6b995f      ethernet  unmanaged               --              
+vethefed728      ethernet  unmanaged               --              
+vethf600418      ethernet  unmanaged               --              

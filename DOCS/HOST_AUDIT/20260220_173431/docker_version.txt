@@ -1,0 +1,5 @@
+# docker_version
+# generated_at=2026-02-20T17:34:31-03:00
+# cmd=docker --version
+
+Docker version 29.2.1, build a5c7197

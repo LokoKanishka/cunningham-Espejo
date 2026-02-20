@@ -1,0 +1,11 @@
+# timedatectl
+# generated_at=2026-02-20T17:34:31-03:00
+# cmd=timedatectl
+
+               Local time: Fri 2026-02-20 17:34:31 -03
+           Universal time: Fri 2026-02-20 20:34:31 UTC
+                 RTC time: Fri 2026-02-20 20:34:31
+                Time zone: America/Argentina/Buenos_Aires (-03, -0300)
+System clock synchronized: yes
+              NTP service: active
+          RTC in local TZ: no

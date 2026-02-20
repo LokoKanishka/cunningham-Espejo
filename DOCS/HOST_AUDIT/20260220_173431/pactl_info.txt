@@ -1,0 +1,19 @@
+# pactl_info
+# generated_at=2026-02-20T17:34:31-03:00
+# cmd=pactl info
+
+Server String: /run/user/1000/pulse/native
+Library Protocol Version: 35
+Server Protocol Version: 35
+Is Local: yes
+Client Index: 556
+Tile Size: 65472
+User Name: lucy-ubuntu
+Host Name: lucy-ubuntu-System-Product-Name
+Server Name: PulseAudio (on PipeWire 1.0.5)
+Server Version: 15.0.0
+Default Sample Specification: float32le 2ch 48000Hz
+Default Channel Map: front-left,front-right
+Default Sink: alsa_output.usb-C-Media_Electronics_Inc._Redragon_Gaming_Headset_999-00.analog-stereo
+Default Source: alsa_input.usb-C-Media_Electronics_Inc._Redragon_Gaming_Headset_999-00.mono-fallback
+Cookie: 9656:9fff

@@ -1,0 +1,41 @@
+# lsblk
+# generated_at=2026-02-20T17:34:31-03:00
+# cmd=lsblk -a -f
+
+NAME        FSTYPE   FSVER LABEL UUID                                 FSAVAIL FSUSE% MOUNTPOINTS
+loop0       squashfs 4.0                                                    0   100% /snap/bare/5
+loop1       squashfs 4.0                                                    0   100% /snap/core20/2686
+loop2       squashfs 4.0                                                    0   100% /snap/core20/2717
+loop3       squashfs 4.0                                                    0   100% /snap/core22/2216
+loop4       squashfs 4.0                                                    0   100% /snap/core22/2292
+loop5       squashfs 4.0                                                    0   100% /snap/core24/1267
+loop6       squashfs 4.0                                                    0   100% /snap/core24/1349
+loop7       squashfs 4.0                                                    0   100% /snap/curl/2369
+loop8       squashfs 4.0                                                    0   100% /snap/curl/2384
+loop9       squashfs 4.0                                                    0   100% /snap/firefox/7766
+loop10      squashfs 4.0                                                    0   100% /snap/firmware-updater/210
+loop11      squashfs 4.0                                                    0   100% /snap/firefox/7836
+loop12      squashfs 4.0                                                    0   100% /snap/firmware-updater/216
+loop13      squashfs 4.0                                                    0   100% /snap/gnome-3-38-2004/143
+loop14      squashfs 4.0                                                    0   100% /snap/gnome-42-2204/226
+loop15      squashfs 4.0                                                    0   100% /snap/gnome-42-2204/247
+loop16      squashfs 4.0                                                    0   100% /snap/gtk-common-themes/1535
+loop17      squashfs 4.0                                                    0   100% /snap/kf5-core22/3
+loop18      squashfs 4.0                                                    0   100% /snap/snap-store/1270
+loop19      squashfs 4.0                                                    0   100% /snap/snapd/25577
+loop20      squashfs 4.0                                                    0   100% /snap/snapd/25935
+loop21      squashfs 4.0                                                    0   100% /snap/snapd-desktop-integration/315
+loop22      squashfs 4.0                                                    0   100% /snap/snapd-desktop-integration/343
+loop23                                                                               
+loop24      squashfs 4.0                                                    0   100% /snap/spotify/89
+loop25      squashfs 4.0                                                    0   100% /snap/spotify/92
+loop26      squashfs 4.0                                                    0   100% /snap/mesa-2404/1165
+loop27      squashfs 4.0                                                    0   100% /snap/gnome-46-2404/153
+sda                                                                                  
+├─sda1      vfat     FAT32       C8AD-5CC2                                 1G     1% /boot/efi
+└─sda2      ext4     1.0         fc7ea308-093e-4408-90c7-4aed32580245   69.3G    80% /
+nvme0n1                                                                              
+├─nvme0n1p1 vfat     FAT32       50B6-E111                                           
+├─nvme0n1p2                                                                          
+├─nvme0n1p3 ntfs                 E4DEB884DEB85092                                    
+└─nvme0n1p4 ntfs                 5A02D57702D55899                                    

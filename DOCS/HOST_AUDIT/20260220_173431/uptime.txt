@@ -1,0 +1,5 @@
+# uptime
+# generated_at=2026-02-20T17:34:31-03:00
+# cmd=uptime
+
+ 17:34:31 up  1:32,  1 user,  load average: 1.68, 1.69, 1.76

@@ -1,0 +1,5 @@
+# glxinfo
+# generated_at=2026-02-20T17:34:31-03:00
+# cmd=glxinfo -B
+
+command_not_found: glxinfo

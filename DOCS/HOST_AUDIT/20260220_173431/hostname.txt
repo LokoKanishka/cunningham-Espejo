@@ -1,0 +1,5 @@
+# hostname
+# generated_at=2026-02-20T17:34:31-03:00
+# cmd=hostname
+
+lucy-ubuntu-System-Product-Name
