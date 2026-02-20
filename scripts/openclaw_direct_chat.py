@@ -91,6 +91,24 @@ _TTS_STREAM_LOCK = threading.Lock()
 _TTS_STREAM_ID = 0
 _TTS_STOP_EVENT = threading.Event()
 _TTS_ACTIVE_QUEUE = None
+_TTS_PLAYING_EVENT = threading.Event()
+_TTS_PLAYING_STREAM_ID = 0
+_TTS_LAST_ACTIVITY_MONO = 0.0
+_TTS_ECHO_GUARD_SEC = 0.8
+
+
+def _tts_touch() -> None:
+    global _TTS_LAST_ACTIVITY_MONO
+    _TTS_LAST_ACTIVITY_MONO = time.monotonic()
+
+
+def _tts_is_playing() -> bool:
+    if _TTS_PLAYING_EVENT.is_set():
+        return True
+    with _TTS_STREAM_LOCK:
+        if _TTS_PLAYBACK_PROC is not None:
+            return True
+    return (time.monotonic() - _TTS_LAST_ACTIVITY_MONO) < _TTS_ECHO_GUARD_SEC
 
 
 def _load_local_env_file(path: Path) -> None:
@@ -332,6 +350,7 @@ def _stop_playback_process() -> None:
     with _TTS_STREAM_LOCK:
         proc = _TTS_PLAYBACK_PROC
         _TTS_PLAYBACK_PROC = None
+    _tts_touch()
     if proc is None:
         return
     try:
@@ -416,6 +435,7 @@ def _play_audio_blocking(path: Path, stop_event: threading.Event) -> tuple[bool,
                     pass
                 return False, "playback_interrupted"
             _TTS_PLAYBACK_PROC = proc
+            _tts_touch()
 
         while True:
             rc = proc.poll()
@@ -440,6 +460,7 @@ def _play_audio_blocking(path: Path, stop_event: threading.Event) -> tuple[bool,
         with _TTS_STREAM_LOCK:
             if _TTS_PLAYBACK_PROC is proc:
                 _TTS_PLAYBACK_PROC = None
+        _tts_touch()
 
 
 def _tts_speak_alltalk(text: str, state: dict) -> tuple[Path | None, str]:
@@ -560,6 +581,14 @@ def _speak_reply_async(text: str) -> None:
         return
 
     def _run() -> None:
+        global _TTS_PLAYING_STREAM_ID
+        with _TTS_STREAM_LOCK:
+            if stream_id != _TTS_STREAM_ID:
+                return
+            _TTS_PLAYING_STREAM_ID = stream_id
+            _TTS_PLAYING_EVENT.set()
+        _tts_touch()
+
         state = _load_voice_state()
         tts_queue: queue.Queue[Path | None] = queue.Queue(maxsize=max(1, _int_env("DIRECT_CHAT_TTS_QUEUE_SIZE", 3)))
         _set_tts_queue(stream_id, tts_queue)
@@ -640,6 +669,11 @@ def _speak_reply_async(text: str) -> None:
         finally:
             producer_thread.join(timeout=1.0)
             _set_tts_queue(stream_id, None)
+            with _TTS_STREAM_LOCK:
+                if _TTS_PLAYING_STREAM_ID == stream_id:
+                    _TTS_PLAYING_STREAM_ID = 0
+                    _TTS_PLAYING_EVENT.clear()
+            _tts_touch()
 
         if interrupted:
             _set_voice_status(stream_id, False, "playback_interrupted")
