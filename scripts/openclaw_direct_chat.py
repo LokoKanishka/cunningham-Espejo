@@ -382,7 +382,6 @@ class STTManager:
     def status(self) -> dict:
         with self._lock:
             now = time.monotonic()
-            self._sync_worker_locked(now)
             running = bool(self._worker is not None and self._worker.is_running())
             retry_in = 0.0
             if self._next_retry_mono > now:
@@ -3831,7 +3830,6 @@ class Handler(BaseHTTPRequestHandler):
 
     def _voice_payload(self, state: dict) -> dict:
         enabled = bool(state.get("enabled", False))
-        _sync_stt_with_voice(enabled=enabled)
         stt_status = _STT_MANAGER.status()
         server_ok, server_detail = _alltalk_health(timeout_s=0.35)
         return {
@@ -4048,7 +4046,7 @@ class Handler(BaseHTTPRequestHandler):
                     _set_voice_enabled(requested_enabled, session_id=session_id if requested_enabled else "")
                     state = _load_voice_state()
                 elif bool(state.get("enabled", False)) and session_id != "default":
-                    _STT_MANAGER.claim_owner(session_id)
+                    _STT_MANAGER.enable(session_id=session_id)
 
                 speaker = str(payload.get("speaker", "")).strip()
                 if speaker:
