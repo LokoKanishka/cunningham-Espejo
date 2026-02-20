@@ -1,7 +1,9 @@
 import os
+import io
 import sys
 import time
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
 
 
@@ -45,7 +47,9 @@ class TestVoiceSttManager(unittest.TestCase):
     def test_set_voice_enabled_ignores_stt_start_errors(self, mock_manager, _mock_load, _mock_save) -> None:
         mock_manager.enable.side_effect = RuntimeError("boom")
         # Must not raise: TTS path should remain unaffected even if STT init fails.
-        direct_chat._set_voice_enabled(True, session_id="sess_a")
+        buf = io.StringIO()
+        with redirect_stderr(buf), redirect_stdout(buf):
+            direct_chat._set_voice_enabled(True, session_id="sess_a")
 
     def test_stt_manager_poll_requires_owner_and_drains_queue(self) -> None:
         mgr = direct_chat.STTManager()
