@@ -344,6 +344,9 @@ HTML = r"""<!doctype html>
       }
     }
 
+    let sttLastSendAtMs = 0;
+    const STT_MIN_SEND_INTERVAL_MS = 1500;
+
     function shouldAcceptSttText(text) {
       const t = (text || "").trim();
       if (t.length < 3) return false;
@@ -366,6 +369,9 @@ HTML = r"""<!doctype html>
         for (const item of items) {
           const text = String(item?.text || "").trim();
           if (!shouldAcceptSttText(text)) continue;
+          const nowSend = Date.now();
+          if ((nowSend - sttLastSendAtMs) < STT_MIN_SEND_INTERVAL_MS) break;
+          sttLastSendAtMs = nowSend;
           sttSending = true;
           try {
             await sendMessage(text);
@@ -422,7 +428,7 @@ HTML = r"""<!doctype html>
         const r = await fetch("/api/voice");
         const j = await r.json();
         setVoiceVisual(!!j.enabled);
-        if (j.enabled) {
+        if (j.enabled && String(j.stt_owner_session_id || "").trim() === "" && sessionId !== "default") {
           await claimVoiceOwner();
         }
         return;
