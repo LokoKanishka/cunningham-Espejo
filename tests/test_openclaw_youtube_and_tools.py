@@ -177,11 +177,12 @@ class TestOpenClawYoutubeAndTools(unittest.TestCase):
     @patch("openclaw_direct_chat.web_ask.run_web_ask", return_value={"status": "ok", "answer": "12:00"})
     @patch("openclaw_direct_chat.web_ask.format_web_ask_reply", return_value="ok")
     def test_web_ask_not_blocked_in_isolated_workspace_mode(self, _mock_fmt, _mock_run, _mock_web_req) -> None:
-        out = direct_chat._maybe_handle_local_action(
-            "preguntale a chatgpt que hora es en madrid",
-            {"firefox", "web_search", "web_ask", "desktop", "model"},
-            "sess_test",
-        )
+        with patch("openclaw_direct_chat._guardrail_check", return_value=(True, "GUARDRAIL_OK")):
+            out = direct_chat._maybe_handle_local_action(
+                "preguntale a chatgpt que hora es en madrid",
+                {"firefox", "web_search", "web_ask", "desktop", "model"},
+                "sess_test",
+            )
         self.assertIsNotNone(out)
         self.assertEqual(str(out.get("reply", "")), "ok")
 
