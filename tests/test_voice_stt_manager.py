@@ -109,6 +109,35 @@ class TestVoiceSttManager(unittest.TestCase):
         self.assertEqual(status.get("stt_owner_session_id"), "sess_a")
         mgr.disable()
 
+    @patch("openclaw_direct_chat._set_voice_status")
+    @patch("openclaw_direct_chat._stop_playback_process")
+    def test_request_tts_stop_sets_event_and_updates_bargein_stats(self, mock_stop_playback, mock_set_voice_status) -> None:
+        prev_stop_event = direct_chat._TTS_STOP_EVENT
+        prev_stream = direct_chat._TTS_PLAYING_STREAM_ID
+        prev_stats = dict(direct_chat._BARGEIN_STATS)
+        try:
+            direct_chat._TTS_STOP_EVENT = direct_chat.threading.Event()
+            direct_chat._TTS_PLAYING_STREAM_ID = 77
+            direct_chat._BARGEIN_STATS = {"count": 0, "last_ts": 0.0, "last_keyword": "", "last_detail": "not_started"}
+            direct_chat._request_tts_stop(reason="barge_in_triggered", keyword="detenete")
+            self.assertTrue(direct_chat._TTS_STOP_EVENT.is_set())
+            st = direct_chat._bargein_status()
+            self.assertEqual(int(st.get("barge_in_count", 0)), 1)
+            self.assertEqual(str(st.get("barge_in_last_keyword", "")), "detenete")
+            mock_stop_playback.assert_called_once()
+            mock_set_voice_status.assert_called_once()
+        finally:
+            direct_chat._TTS_STOP_EVENT = prev_stop_event
+            direct_chat._TTS_PLAYING_STREAM_ID = prev_stream
+            direct_chat._BARGEIN_STATS = prev_stats
+
+    @patch("openclaw_direct_chat._stop_bargein_monitor")
+    @patch.object(direct_chat, "_STT_MANAGER")
+    def test_sync_stt_with_voice_disable_stops_barge_monitor(self, mock_manager, mock_stop_barge) -> None:
+        direct_chat._sync_stt_with_voice(enabled=False, session_id="")
+        mock_stop_barge.assert_called_once()
+        mock_manager.disable.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

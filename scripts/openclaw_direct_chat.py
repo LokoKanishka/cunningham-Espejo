@@ -96,6 +96,9 @@ _TTS_PLAYING_EVENT = threading.Event()
 _TTS_PLAYING_STREAM_ID = 0
 _TTS_LAST_ACTIVITY_MONO = 0.0
 _TTS_ECHO_GUARD_SEC = 0.8
+_BARGEIN_LOCK = threading.Lock()
+_BARGEIN_MONITOR = None
+_BARGEIN_STATS = {"count": 0, "last_ts": 0.0, "last_keyword": "", "last_detail": "not_started"}
 
 
 def _tts_touch() -> None:
@@ -110,6 +113,172 @@ def _tts_is_playing() -> bool:
         if _TTS_PLAYBACK_PROC is not None:
             return True
     return (time.monotonic() - _TTS_LAST_ACTIVITY_MONO) < _TTS_ECHO_GUARD_SEC
+
+
+def _bargein_status() -> dict:
+    with _BARGEIN_LOCK:
+        return {
+            "barge_in_count": int(_BARGEIN_STATS.get("count", 0) or 0),
+            "barge_in_last_ts": float(_BARGEIN_STATS.get("last_ts", 0.0) or 0.0),
+            "barge_in_last_keyword": str(_BARGEIN_STATS.get("last_keyword", "")),
+            "barge_in_last_detail": str(_BARGEIN_STATS.get("last_detail", "")),
+        }
+
+
+def _bargein_mark(detail: str, keyword: str = "") -> None:
+    with _BARGEIN_LOCK:
+        _BARGEIN_STATS["last_ts"] = time.time()
+        _BARGEIN_STATS["last_detail"] = str(detail)
+        if keyword:
+            _BARGEIN_STATS["last_keyword"] = str(keyword)
+        if str(detail) == "triggered":
+            _BARGEIN_STATS["count"] = int(_BARGEIN_STATS.get("count", 0) or 0) + 1
+
+
+def _request_tts_stop(reason: str = "barge_in", keyword: str = "") -> None:
+    _bargein_mark("triggered", keyword=keyword)
+    _tts_touch()
+    with _TTS_STREAM_LOCK:
+        _TTS_STOP_EVENT.set()
+    _stop_playback_process()
+    _set_voice_status(_TTS_PLAYING_STREAM_ID, False, str(reason))
+
+
+class _BargeInMonitor:
+    def __init__(self, stream_id: int, stop_event: threading.Event):
+        self.stream_id = int(stream_id)
+        self.stop_event = stop_event
+        self._stop = threading.Event()
+        self._th = None
+
+    @staticmethod
+    def _enabled() -> bool:
+        return _env_flag("DIRECT_CHAT_BARGEIN_ENABLED", True)
+
+    @staticmethod
+    def _keywords() -> list[str]:
+        raw = str(os.environ.get("DIRECT_CHAT_BARGEIN_KEYWORDS", "detenete,detente,para,pará,stop")).strip()
+        parts = [p.strip().lower() for p in raw.split(",") if p.strip()]
+        return parts or ["detenete"]
+
+    def start(self) -> None:
+        if not self._enabled():
+            _bargein_mark("disabled")
+            return
+        if self._th and self._th.is_alive():
+            return
+        self._stop.clear()
+        self._th = threading.Thread(target=self._run, daemon=True)
+        self._th.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        th = self._th
+        if th:
+            th.join(timeout=1.0)
+
+    def _run(self) -> None:
+        try:
+            import numpy as np  # type: ignore
+            import sounddevice as sd  # type: ignore
+            import webrtcvad  # type: ignore
+        except Exception as e:
+            _bargein_mark(f"deps_unavailable:{e}")
+            return
+
+        sample_rate = max(8000, _int_env("DIRECT_CHAT_BARGEIN_SAMPLE_RATE", 16000))
+        frame_ms = max(10, min(30, _int_env("DIRECT_CHAT_BARGEIN_FRAME_MS", 30)))
+        frame_samples = int(sample_rate * frame_ms / 1000)
+        vad_mode = max(0, min(3, _int_env("DIRECT_CHAT_BARGEIN_VAD_MODE", 2)))
+        min_frames = max(2, _int_env("DIRECT_CHAT_BARGEIN_MIN_VOICE_FRAMES", 8))
+        rms_threshold = max(0.001, float(os.environ.get("DIRECT_CHAT_BARGEIN_RMS_THRESHOLD", "0.012")))
+        cooldown_sec = max(0.2, float(os.environ.get("DIRECT_CHAT_BARGEIN_COOLDOWN_SEC", "1.5")))
+        device = str(os.environ.get("DIRECT_CHAT_BARGEIN_DEVICE", "")).strip() or None
+        keywords = self._keywords()
+        last_trigger_mono = 0.0
+        consecutive = 0
+
+        vad = webrtcvad.Vad(vad_mode)
+        try:
+            stream = sd.RawInputStream(
+                samplerate=sample_rate,
+                channels=1,
+                dtype="int16",
+                blocksize=frame_samples,
+                device=device,
+            )
+        except Exception as e:
+            _bargein_mark(f"stream_open_failed:{e}")
+            return
+
+        try:
+            with stream:
+                _bargein_mark("monitor_started")
+                while (not self._stop.is_set()) and (not self.stop_event.is_set()):
+                    if self.stream_id != _TTS_PLAYING_STREAM_ID:
+                        break
+                    if not _tts_is_playing():
+                        consecutive = 0
+                        time.sleep(0.03)
+                        continue
+                    try:
+                        data, overflowed = stream.read(frame_samples)
+                        if overflowed:
+                            pass
+                    except Exception as e:
+                        _bargein_mark(f"stream_read_failed:{e}")
+                        break
+                    if not data:
+                        continue
+                    try:
+                        is_speech = bool(vad.is_speech(data, sample_rate))
+                    except Exception:
+                        is_speech = False
+                    pcm = np.frombuffer(data, dtype=np.int16).astype(np.float32)
+                    if getattr(pcm, "size", 0) == 0:
+                        continue
+                    rms = float(np.sqrt(np.mean((pcm / 32768.0) ** 2)))
+                    if is_speech and rms >= rms_threshold:
+                        consecutive += 1
+                    else:
+                        consecutive = max(0, consecutive - 1)
+                    if consecutive < min_frames:
+                        continue
+                    now = time.monotonic()
+                    if (now - last_trigger_mono) < cooldown_sec:
+                        continue
+                    last_trigger_mono = now
+                    keyword = keywords[0]
+                    _request_tts_stop(reason="barge_in_triggered", keyword=keyword)
+                    break
+        finally:
+            _bargein_mark("monitor_stopped")
+
+
+def _start_bargein_monitor(stream_id: int, stop_event: threading.Event) -> None:
+    global _BARGEIN_MONITOR
+    with _BARGEIN_LOCK:
+        prev = _BARGEIN_MONITOR
+        mon = _BARGEIN_MONITOR = _BargeInMonitor(stream_id=stream_id, stop_event=stop_event)
+    if prev is not None:
+        try:
+            prev.stop()
+        except Exception:
+            pass
+    mon.start()
+
+
+def _stop_bargein_monitor() -> None:
+    global _BARGEIN_MONITOR
+    with _BARGEIN_LOCK:
+        mon = _BARGEIN_MONITOR
+        _BARGEIN_MONITOR = None
+    if mon is None:
+        return
+    try:
+        mon.stop()
+    except Exception:
+        return
 
 
 def _load_local_env_file(path: Path) -> None:
@@ -407,6 +576,7 @@ def _sync_stt_with_voice(enabled: bool, session_id: str = "") -> None:
         if enabled:
             _STT_MANAGER.enable(session_id=session_id)
             return
+        _stop_bargein_monitor()
         _STT_MANAGER.disable()
     except Exception as e:
         print(f"[stt] sync_failed:{e}", file=sys.stderr)
@@ -803,6 +973,7 @@ def _speak_reply_async(text: str) -> None:
             _TTS_PLAYING_STREAM_ID = stream_id
             _TTS_PLAYING_EVENT.set()
         _tts_touch()
+        _start_bargein_monitor(stream_id, stop_event)
 
         state = _load_voice_state()
         tts_queue: queue.Queue[Path | None] = queue.Queue(maxsize=max(1, _int_env("DIRECT_CHAT_TTS_QUEUE_SIZE", 3)))
@@ -884,6 +1055,7 @@ def _speak_reply_async(text: str) -> None:
         finally:
             producer_thread.join(timeout=1.0)
             _set_tts_queue(stream_id, None)
+            _stop_bargein_monitor()
             with _TTS_STREAM_LOCK:
                 if _TTS_PLAYING_STREAM_ID == stream_id:
                     _TTS_PLAYING_STREAM_ID = 0
@@ -3836,6 +4008,7 @@ class Handler(BaseHTTPRequestHandler):
             "server_ok": bool(server_ok),
             "server_detail": str(server_detail),
             "last_status": _VOICE_LAST_STATUS,
+            **_bargein_status(),
             **stt_status,
         }
 

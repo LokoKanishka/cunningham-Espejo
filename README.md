@@ -8,6 +8,7 @@ Glosario:
 
 ## Estado actual
 - Voz en DC integrada sin cambios visuales (STT local + TTS + anti-eco).
+- Barge-in por voz durante TTS habilitado (corte de playback por detector local).
 - `GET /api/voice` es de solo lectura.
 - El estado STT se gobierna con `POST /api/voice` y `GET /api/stt/poll`.
 - Router con fallback local solo a modelos realmente instalados.
@@ -26,7 +27,7 @@ Incluye:
 
 Además, para cambios de voz/sesión/guardrails/workspace/router, ejecutar prueba humana en DC:
 1. VOZ ON, hablar 5 frases.
-2. Confirmar que durante TTS no se autocapture eco.
+2. Durante TTS: probar “detenete” y confirmar corte de playback (< 0.5s).
 3. VOZ OFF, confirmar que no hay nuevas capturas.
 4. Revisar `journalctl -f` sin errores críticos.
 
@@ -69,6 +70,17 @@ systemctl --user restart openclaw-direct-chat.service
 ```bash
 curl -s 'http://127.0.0.1:8787/api/stt/poll?session_id=debug&limit=1'
 ```
+
+## Configuración de barge-in
+Variables útiles (opcionales):
+- `DIRECT_CHAT_BARGEIN_ENABLED` (`true`/`false`, default `true`)
+- `DIRECT_CHAT_BARGEIN_KEYWORDS` (lista CSV; para telemetría/intent)
+- `DIRECT_CHAT_BARGEIN_SAMPLE_RATE` (default `16000`)
+- `DIRECT_CHAT_BARGEIN_FRAME_MS` (default `30`)
+- `DIRECT_CHAT_BARGEIN_VAD_MODE` (0..3, default `2`)
+- `DIRECT_CHAT_BARGEIN_MIN_VOICE_FRAMES` (default `8`)
+- `DIRECT_CHAT_BARGEIN_RMS_THRESHOLD` (default `0.012`)
+- `DIRECT_CHAT_BARGEIN_COOLDOWN_SEC` (default `1.5`)
 
 ## Documentación clave
 - `DOCS/PLAN.md` — roadmap operativo vigente (DC + Espejo-de-Lucy).
