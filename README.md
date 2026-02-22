@@ -45,6 +45,31 @@ journalctl --user -u openclaw-direct-chat.service -n 200 --no-pager
 journalctl --user -u openclaw-gateway.service -n 200 --no-pager
 ```
 
+## Preflight de voz (STT local)
+Si VOZ ON habla pero no escucha micrófono:
+
+1. Confirmar que Direct Chat corre desde este repo:
+```bash
+systemctl --user cat openclaw-direct-chat.service
+```
+`WorkingDirectory` y `ExecStart` deben apuntar a `cunningham-Espejo`.
+
+2. Instalar dependencias STT:
+```bash
+python3 -m pip install --user --break-system-packages -r scripts/requirements-direct-chat-stt.txt
+```
+
+3. Reiniciar servicio:
+```bash
+systemctl --user daemon-reload
+systemctl --user restart openclaw-direct-chat.service
+```
+
+4. Verificar endpoint STT:
+```bash
+curl -s 'http://127.0.0.1:8787/api/stt/poll?session_id=debug&limit=1'
+```
+
 ## Documentación clave
 - `DOCS/PLAN.md` — roadmap operativo vigente (DC + Espejo-de-Lucy).
 - `docs/SECURITY_CHECKLIST.md` — checklist de seguridad.
