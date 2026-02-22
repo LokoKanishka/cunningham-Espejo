@@ -1438,12 +1438,6 @@ def _pick_active_site_window_id(
 
 def _youtube_transport_action(action: str, close_window: bool = False, session_id: str | None = None) -> tuple[bool, str]:
     _ = session_id  # Reserved for future per-session telemetry.
-    if not shutil.which("wmctrl") or not shutil.which("xdotool"):
-        return False, "missing_wmctrl_or_xdotool"
-
-    desk = _wmctrl_current_desktop()
-    if desk is None:
-        return False, "workspace_not_detected"
     expected_profile = _expected_profile_directory_for_site("youtube")
     win_id, detail = _pick_active_site_window_id("youtube", expected_profile=expected_profile)
     if not win_id:
@@ -2918,7 +2912,8 @@ def _guardrail_check(session_id: str, tool_name: str, params: dict | None = None
         return True, f"guardrail_bypass_exec_error: {e}"
     detail = (proc.stderr or proc.stdout or "").strip()
     if proc.returncode != 0:
-        if (not fail_closed) and detail.startswith("GUARDRAIL_ERROR:"):
+        # Infra failures may include noisy stderr before GUARDRAIL_ERROR.
+        if (not fail_closed) and ("GUARDRAIL_ERROR:" in detail):
             return True, f"guardrail_bypass_infra_error: {detail}"
         return False, detail or f"guardrail_denied rc={proc.returncode}"
     return True, detail or "guardrail_ok"

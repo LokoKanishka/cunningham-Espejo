@@ -44,6 +44,7 @@ H5 — Interfaz / UX
 Fase 0 — Cerrar voz en DC sin romper UI
 - Objetivo: mergear `feat/voice-tts-playing-flag` en `main` con estabilidad.
 - Botón rojo:
+  - `./scripts/test_smoke.sh`
   - `python3 -m py_compile $(git ls-files '*.py')`
   - `python3 -m unittest tests.test_voice_stt_manager tests.test_openclaw_youtube_and_tools`
   - `pytest -q tests/test_openclaw_youtube_and_tools.py`
