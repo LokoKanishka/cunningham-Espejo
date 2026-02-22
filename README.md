@@ -8,7 +8,7 @@ Glosario:
 
 ## Estado actual
 - Voz en DC integrada sin cambios visuales (STT local + TTS + anti-eco).
-- Barge-in por voz durante TTS habilitado (corte de playback por detector local).
+- Barge-in en modo **fluido por voz humana** durante TTS (no requiere keyword obligatoria).
 - `GET /api/voice` es de solo lectura.
 - El estado STT se gobierna con `POST /api/voice` y `GET /api/stt/poll`.
 - Router con fallback local solo a modelos realmente instalados.
@@ -27,7 +27,7 @@ Incluye:
 
 Además, para cambios de voz/sesión/guardrails/workspace/router, ejecutar prueba humana en DC:
 1. VOZ ON, hablar 5 frases.
-2. Durante TTS: probar “detenete” y confirmar corte de playback (< 0.5s).
+2. Durante TTS: hablar encima y confirmar corte de playback (< 0.5s).
 3. VOZ OFF, confirmar que no hay nuevas capturas.
 4. Revisar `journalctl -f` sin errores críticos.
 
@@ -36,14 +36,17 @@ Servicios:
 - `openclaw-direct-chat.service`
 - `openclaw-gateway.service`
 
-Comandos útiles:
+Runbook mínimo (3 comandos):
 
 ```bash
-systemctl --user status openclaw-direct-chat.service --no-pager
-systemctl --user status openclaw-gateway.service --no-pager
-systemctl --user restart openclaw-direct-chat.service openclaw-gateway.service
-journalctl --user -u openclaw-direct-chat.service -n 200 --no-pager
-journalctl --user -u openclaw-gateway.service -n 200 --no-pager
+# 1) ¿está escuchando/hablando/barge-ineando?
+curl -s http://127.0.0.1:8787/api/voice | python3 -m json.tool | sed -n "1,220p"
+
+# 2) ¿está capturando/transcribiendo STT?
+curl -s "http://127.0.0.1:8787/api/stt/poll?session_id=debug&limit=5" | python3 -m json.tool
+
+# 3) ¿hay errores de servicios?
+journalctl --user -u openclaw-direct-chat.service -u openclaw-gateway.service -n 120 --no-pager
 ```
 
 ## Preflight de voz (STT local)
@@ -71,6 +74,21 @@ systemctl --user restart openclaw-direct-chat.service
 curl -s 'http://127.0.0.1:8787/api/stt/poll?session_id=debug&limit=1'
 ```
 
+
+## Barge-in (modo fluido)
+Semántica operativa:
+- Barge-in corta TTS por **actividad de voz humana** detectada durante playback.
+- No depende de decir una keyword exacta para funcionar.
+- `DIRECT_CHAT_BARGEIN_KEYWORDS` se usa para telemetría (`barge_in_last_keyword`) y trazabilidad.
+
+Diagnóstico rápido:
+```bash
+curl -s http://127.0.0.1:8787/api/voice | python3 -m json.tool | sed -n '1,200p'
+```
+Buscar:
+- `barge_in_mode: "speech"`
+- `barge_in_last_detail` con detalle explícito (`vad`, `rms`, `threshold`, `frames`, `cooldown`).
+
 ## Configuración de barge-in
 Variables útiles (opcionales):
 - `DIRECT_CHAT_BARGEIN_ENABLED` (`true`/`false`, default `true`)
@@ -84,6 +102,7 @@ Variables útiles (opcionales):
 
 ## Documentación clave
 - `DOCS/PLAN.md` — roadmap operativo vigente (DC + Espejo-de-Lucy).
+- `DOCS/VOICE_RUNBOOK.md` — runbook mínimo de operación/diagnóstico de voz.
 - `docs/SECURITY_CHECKLIST.md` — checklist de seguridad.
 - `docs/INTEGRATIONS.md` — integraciones/pinning.
 - `DOCS/UX_SPANISH_VOICE.md` — guía de UX de voz.

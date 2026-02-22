@@ -101,6 +101,18 @@ _BARGEIN_MONITOR = None
 _BARGEIN_STATS = {"count": 0, "last_ts": 0.0, "last_keyword": "", "last_detail": "not_started"}
 
 
+def _bargein_config() -> dict:
+    return {
+        "enabled": _env_flag("DIRECT_CHAT_BARGEIN_ENABLED", True),
+        "sample_rate": max(8000, _int_env("DIRECT_CHAT_BARGEIN_SAMPLE_RATE", 16000)),
+        "frame_ms": max(10, min(30, _int_env("DIRECT_CHAT_BARGEIN_FRAME_MS", 30))),
+        "vad_mode": max(0, min(3, _int_env("DIRECT_CHAT_BARGEIN_VAD_MODE", 2))),
+        "min_voice_frames": max(2, _int_env("DIRECT_CHAT_BARGEIN_MIN_VOICE_FRAMES", 8)),
+        "rms_threshold": max(0.001, float(os.environ.get("DIRECT_CHAT_BARGEIN_RMS_THRESHOLD", "0.012"))),
+        "cooldown_sec": max(0.2, float(os.environ.get("DIRECT_CHAT_BARGEIN_COOLDOWN_SEC", "1.5"))),
+    }
+
+
 def _tts_touch() -> None:
     global _TTS_LAST_ACTIVITY_MONO
     _TTS_LAST_ACTIVITY_MONO = time.monotonic()
@@ -116,12 +128,15 @@ def _tts_is_playing() -> bool:
 
 
 def _bargein_status() -> dict:
+    cfg = _bargein_config()
     with _BARGEIN_LOCK:
         return {
+            "barge_in_mode": "speech",
             "barge_in_count": int(_BARGEIN_STATS.get("count", 0) or 0),
             "barge_in_last_ts": float(_BARGEIN_STATS.get("last_ts", 0.0) or 0.0),
             "barge_in_last_keyword": str(_BARGEIN_STATS.get("last_keyword", "")),
             "barge_in_last_detail": str(_BARGEIN_STATS.get("last_detail", "")),
+            "barge_in_config": cfg,
         }
 
 
@@ -131,12 +146,12 @@ def _bargein_mark(detail: str, keyword: str = "") -> None:
         _BARGEIN_STATS["last_detail"] = str(detail)
         if keyword:
             _BARGEIN_STATS["last_keyword"] = str(keyword)
-        if str(detail) == "triggered":
+        if str(detail).startswith("triggered"):
             _BARGEIN_STATS["count"] = int(_BARGEIN_STATS.get("count", 0) or 0) + 1
 
 
-def _request_tts_stop(reason: str = "barge_in", keyword: str = "") -> None:
-    _bargein_mark("triggered", keyword=keyword)
+def _request_tts_stop(reason: str = "barge_in", keyword: str = "", detail: str = "") -> None:
+    _bargein_mark(detail or "triggered", keyword=keyword)
     _tts_touch()
     with _TTS_STREAM_LOCK:
         _TTS_STOP_EVENT.set()
@@ -186,13 +201,14 @@ class _BargeInMonitor:
             _bargein_mark(f"deps_unavailable:{e}")
             return
 
-        sample_rate = max(8000, _int_env("DIRECT_CHAT_BARGEIN_SAMPLE_RATE", 16000))
-        frame_ms = max(10, min(30, _int_env("DIRECT_CHAT_BARGEIN_FRAME_MS", 30)))
+        cfg = _bargein_config()
+        sample_rate = int(cfg["sample_rate"])
+        frame_ms = int(cfg["frame_ms"])
         frame_samples = int(sample_rate * frame_ms / 1000)
-        vad_mode = max(0, min(3, _int_env("DIRECT_CHAT_BARGEIN_VAD_MODE", 2)))
-        min_frames = max(2, _int_env("DIRECT_CHAT_BARGEIN_MIN_VOICE_FRAMES", 8))
-        rms_threshold = max(0.001, float(os.environ.get("DIRECT_CHAT_BARGEIN_RMS_THRESHOLD", "0.012")))
-        cooldown_sec = max(0.2, float(os.environ.get("DIRECT_CHAT_BARGEIN_COOLDOWN_SEC", "1.5")))
+        vad_mode = int(cfg["vad_mode"])
+        min_frames = int(cfg["min_voice_frames"])
+        rms_threshold = float(cfg["rms_threshold"])
+        cooldown_sec = float(cfg["cooldown_sec"])
         device = str(os.environ.get("DIRECT_CHAT_BARGEIN_DEVICE", "")).strip() or None
         keywords = self._keywords()
         last_trigger_mono = 0.0
@@ -213,7 +229,9 @@ class _BargeInMonitor:
 
         try:
             with stream:
-                _bargein_mark("monitor_started")
+                _bargein_mark(
+                    f"monitor_started:vad={vad_mode};rms={rms_threshold:.3f};min_frames={min_frames};cooldown={cooldown_sec:.2f}"
+                )
                 while (not self._stop.is_set()) and (not self.stop_event.is_set()):
                     if self.stream_id != _TTS_PLAYING_STREAM_ID:
                         break
@@ -249,7 +267,14 @@ class _BargeInMonitor:
                         continue
                     last_trigger_mono = now
                     keyword = keywords[0]
-                    _request_tts_stop(reason="barge_in_triggered", keyword=keyword)
+                    _request_tts_stop(
+                        reason="barge_in_triggered",
+                        keyword=keyword,
+                        detail=(
+                            f"triggered:vad={int(is_speech)};rms={rms:.3f};threshold={rms_threshold:.3f};"
+                            f"frames={consecutive};min_frames={min_frames};cooldown={cooldown_sec:.2f}"
+                        ),
+                    )
                     break
         finally:
             _bargein_mark("monitor_stopped")
