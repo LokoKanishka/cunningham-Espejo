@@ -1,53 +1,37 @@
-# cunningham
+# Cunningham Espejo
 
-Laboratorio desde cero para Moltbot upstream + modelos externos + cambio de modelo + extensiones comunitarias (con trazabilidad y seguridad).
+Repositorio operativo de `Direct Chat` (DC) y Cunningham (CUN/Lucy), con foco en voz local, routing de modelos y validación reproducible.
 
-Glosario: `DC` = interfaz Direct Chat; `CUN`/`Lucy` = IA Lucy Cunningham.
+Glosario:
+- `DC` = `Molbot Direct Chat`
+- `CUN` / `Lucy` = IA Cunningham
 
-## Documentación clave
-- `PLAN.md` — objetivo, reglas, roadmap
-- `docs/SECURITY_CHECKLIST.md` — checklist para integrar comunidad
-- `docs/INTEGRATIONS.md` — registro de integraciones pinneadas
-- `DOCS/ALLTALK_DOCKER.md` — voz neural por Docker (AllTalk)
+## Estado actual
+- Voz en DC integrada sin cambios visuales (STT local + TTS + anti-eco).
+- `GET /api/voice` es de solo lectura.
+- El estado STT se gobierna con `POST /api/voice` y `GET /api/stt/poll`.
+- Router con fallback local solo a modelos realmente instalados.
 
-## Operación rápida
-- Botón rojo: `./scripts/verify_all.sh`
-- Modo amplio (más capacidad de tools): `./scripts/mode_full.sh`
-- Modo seguro (allowlist reducida): `./scripts/mode_safe.sh`
-- UI local opcional del stack (Dockge): `docs/INTERFAZ_STACK_DOCKGE.md`
-- UI funcional del Gateway (Lucy Panel): `docs/LUCY_UI_PANEL.md`
+## Botón rojo (obligatorio)
+Ejecutar:
 
-## Stack autonomía+visión (10)
-- Documento: `DOCS/AUTONOMY_VISION_STACK.md`
-- Verificación del stack: `./scripts/verify_stack10.sh`
-- Botón rojo base (estable): `./scripts/verify_all.sh`
+```bash
+./scripts/test_smoke.sh
+```
 
-## Stack autonomía+visión (next 10)
-- Documento: `DOCS/AUTONOMY_VISION_STACK_NEXT10.md`
-- Verificación: `./scripts/verify_next10.sh`
-- Extras: `./scripts/goals_worker.sh check`, `./scripts/ops_alerts.sh check`, `./scripts/web_research.sh check`
+Incluye:
+- `py_compile`
+- `unittest` focalizado
+- `pytest` focalizado
 
-## Comunidad GitHub (20 descargas, pinneadas)
-- Catálogo: `DOCS/community_mcp_catalog.json`
-- Guía: `DOCS/COMMUNITY_MCP.md`
-- Validar: `./scripts/community_mcp.sh check`
-- Descargar bundle comunitario: `./scripts/community_mcp.sh sync`
-- Bridge MCP top10 (mcporter): `./scripts/community_mcp_bridge.sh setup`
-- Verificar bridge: `./scripts/community_mcp_bridge.sh check`
-- Probar 10/10: `./scripts/community_mcp_bridge.sh probe`
+Además, para cambios de voz/sesión/guardrails/workspace/router, ejecutar prueba humana en DC:
+1. VOZ ON, hablar 5 frases.
+2. Confirmar que durante TTS no se autocapture eco.
+3. VOZ OFF, confirmar que no hay nuevas capturas.
+4. Revisar `journalctl -f` sin errores críticos.
 
-## UX (Consola + Español + Voz)
-- Consola pro: `./scripts/console_pro.sh`
-- Modo español persistente: `./scripts/set_spanish_mode.sh`
-- Chat con salida por voz: `./scripts/chat_voice_es.sh "tu pregunta"`
-- Doc: `DOCS/UX_SPANISH_VOICE.md`
-
-<!-- DC_OPS_SECURITY_BEGIN -->
-## Direct Chat: Ops & Security
-
-### systemd (no más choques de puerto)
-Direct Chat corre como servicios de usuario:
-
+## Operación diaria
+Servicios:
 - `openclaw-direct-chat.service`
 - `openclaw-gateway.service`
 
@@ -61,14 +45,18 @@ journalctl --user -u openclaw-direct-chat.service -n 200 --no-pager
 journalctl --user -u openclaw-gateway.service -n 200 --no-pager
 ```
 
-### seguridad (exec deshabilitado por defecto)
+## Documentación clave
+- `DOCS/PLAN.md` — roadmap operativo vigente (DC + Espejo-de-Lucy).
+- `docs/SECURITY_CHECKLIST.md` — checklist de seguridad.
+- `docs/INTEGRATIONS.md` — integraciones/pinning.
+- `DOCS/UX_SPANISH_VOICE.md` — guía de UX de voz.
+- `docs/LUCY_UI_PANEL.md` — panel funcional del gateway.
 
-Para evitar que el modelo ejecute comandos arbitrarios, `exec` queda denegado por defecto
-en `~/.openclaw/openclaw.json` (deny: `exec`, `bash`; allow: sin `exec`).
-<!-- DC_OPS_SECURITY_END -->
+## Scripts importantes
+- `scripts/test_smoke.sh` — validación mínima obligatoria.
+- `scripts/model_router.sh` — selección y fallback de modelo.
+- `scripts/verify_all.sh` — verificación general legacy.
+- `scripts/host_audit_full.sh` — snapshot de host.
 
-## Contexto de esta maquina (DC/CUN)
-- Glosario: `DC` = interfaz Direct Chat; `CUN`/`Lucy` = IA Lucy Cunningham.
-- Auditoria local completa en `DOCS/HOST_AUDIT/`.
-- Ultimo snapshot: ver `DOCS/HOST_AUDIT/LATEST` y la carpeta correspondiente.
-- Regenerar snapshot: `./scripts/host_audit_full.sh`
+## Seguridad
+Por defecto, `exec`/`bash` deben mantenerse denegados en la política local de OpenClaw para evitar ejecución arbitraria.
