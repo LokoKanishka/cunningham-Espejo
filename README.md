@@ -116,3 +116,7 @@ Variables útiles (opcionales):
 
 ## Seguridad
 Por defecto, `exec`/`bash` deben mantenerse denegados en la política local de OpenClaw para evitar ejecución arbitraria.
+
+Controles operativos:
+- `./scripts/mode_safe.sh` aplica perfil seguro con `exec` fuera de `allow` y explícitamente en `deny`.
+- `./scripts/policy_engine.sh check` falla si `mode_safe` vuelve a permitir `exec` o deja de denegarlo.

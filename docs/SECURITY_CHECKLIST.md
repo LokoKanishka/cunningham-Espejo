@@ -11,3 +11,9 @@ Antes de integrar:
   - permisos y rutas peligrosas
 - Pin por tag o commit hash
 - Registrar en `docs/INTEGRATIONS.md`
+
+## Hardening local de políticas
+- `mode_safe` debe mantener `exec` denegado (no permitido en `allow`).
+- Verificación rápida:
+  - `bash -n scripts/mode_safe.sh scripts/policy_engine.sh`
+  - `./scripts/policy_engine.sh check` (debe devolver `POLICY_ENGINE_OK`)
