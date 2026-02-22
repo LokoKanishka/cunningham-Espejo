@@ -26,7 +26,6 @@ if (!main) {
 main.tools = main.tools || {};
 main.tools.allow = [
   "read",
-  "exec",
   "web_fetch",
   "web_search",
   "memory_search",
@@ -35,6 +34,7 @@ main.tools.allow = [
   "llm-task"
 ];
 main.tools.deny = [
+  "exec",
   "write",
   "edit",
   "process",
