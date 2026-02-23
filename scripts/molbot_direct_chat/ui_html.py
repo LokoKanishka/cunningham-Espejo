@@ -189,7 +189,7 @@ HTML = r"""<!doctype html>
           <span class="voice-dot"></span>
           <span id="voiceToggleText">VOZ OFF</span>
         </button>
-      <span class="small">Slash: /new /escritorio</span>
+      <span class="small">Slash: /new /escritorio /lib /rescan /read N /next /repeat /status /help reader</span>
     </div>
 
     <div id="chat" class="chat"></div>
@@ -503,8 +503,31 @@ HTML = r"""<!doctype html>
     function parseSlash(text) {
       const t = text.trim();
       if (!t.startsWith("/")) return null;
-      if (t === "/new") return { kind: "new" };
-      if (t === "/escritorio") return { kind: "message", text: "decime que carpetas y archivos hay en mi escritorio" };
+
+      const parts = t.split(/\s+/).filter(Boolean);
+      const cmd = (parts[0] || "").toLowerCase();
+
+      if (cmd === "/new") return { kind: "new" };
+      if (cmd === "/escritorio") return { kind: "message", text: "decime que carpetas y archivos hay en mi escritorio" };
+
+      // Reader UX v0.2 (UI convenience -> backend local-action)
+      if (cmd === "/lib") return { kind: "message", text: "biblioteca" };
+      if (cmd === "/rescan") return { kind: "message", text: "biblioteca rescan" };
+      if (cmd === "/next") return { kind: "message", text: "seguí" };
+      if (cmd === "/repeat") return { kind: "message", text: "repetir" };
+      if (cmd === "/status") return { kind: "message", text: "estado lectura" };
+
+      if (cmd === "/help") {
+        const topic = (parts[1] || "").toLowerCase();
+        if (topic === "reader" || topic === "lectura") return { kind: "message", text: "ayuda lectura" };
+      }
+
+      if (cmd === "/read") {
+        const n = parseInt(parts[1] || "", 10);
+        if (Number.isFinite(n) && n > 0) return { kind: "message", text: `leer libro ${n}` };
+        return { kind: "message", text: "ayuda lectura" };
+      }
+
       return { kind: "unknown" };
     }
 
@@ -571,7 +594,7 @@ HTML = r"""<!doctype html>
       }
       if (slash?.kind === "message") text = slash.text;
       if (slash?.kind === "unknown") {
-        await push("assistant", "Comando desconocido. Usá /new /escritorio");
+        await push("assistant", "Comando desconocido. Usá /new /escritorio /lib /rescan /read N /next /repeat /status /help reader");
         inputEl.value = "";
         return;
       }
