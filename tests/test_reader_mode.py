@@ -101,6 +101,8 @@ class TestReaderHttpEndpoints(unittest.TestCase):
         self._state_path = base / "reading_sessions.json"
         self._lock_path = base / ".reading_sessions.lock"
         self._prev_store = direct_chat._READER_STORE
+        self._prev_tts_dry_run = os.environ.get("DIRECT_CHAT_TTS_DRY_RUN")
+        os.environ["DIRECT_CHAT_TTS_DRY_RUN"] = "1"
         direct_chat._READER_STORE = direct_chat.ReaderSessionStore(
             state_path=self._state_path,
             lock_path=self._lock_path,
@@ -119,6 +121,10 @@ class TestReaderHttpEndpoints(unittest.TestCase):
             self._httpd.server_close()
             self._thread.join(timeout=1.0)
         finally:
+            if self._prev_tts_dry_run is None:
+                os.environ.pop("DIRECT_CHAT_TTS_DRY_RUN", None)
+            else:
+                os.environ["DIRECT_CHAT_TTS_DRY_RUN"] = self._prev_tts_dry_run
             direct_chat._READER_STORE = self._prev_store
             self._tmp.cleanup()
 
@@ -185,6 +191,35 @@ class TestReaderHttpEndpoints(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertTrue(committed.get("committed"))
         self.assertEqual(int(committed.get("cursor", -1)), 1)
+
+    def test_next_with_speak_and_autocommit_advances_cursor_after_tts_end(self) -> None:
+        code, started = self._request(
+            "POST",
+            "/api/reader/session/start",
+            {"session_id": "auto_sess", "chunks": ["uno", "dos"], "reset": True},
+        )
+        self.assertEqual(code, 200)
+        self.assertTrue(started.get("ok"))
+
+        code, first = self._request(
+            "GET",
+            "/api/reader/session/next?session_id=auto_sess&speak=1&autocommit=1",
+        )
+        self.assertEqual(code, 200)
+        self.assertTrue(first.get("ok"))
+        self.assertTrue(first.get("speak_started"))
+        self.assertTrue(first.get("autocommit_registered"))
+
+        status = {}
+        for _ in range(60):
+            code, status = self._request("GET", "/api/reader/session?session_id=auto_sess")
+            self.assertEqual(code, 200)
+            if int(status.get("cursor", -1)) == 1 and status.get("pending") is None:
+                break
+            time.sleep(0.05)
+
+        self.assertEqual(int(status.get("cursor", -1)), 1)
+        self.assertIsNone(status.get("pending"))
 
 
 if __name__ == "__main__":

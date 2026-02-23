@@ -105,6 +105,8 @@ _TTS_ECHO_GUARD_SEC = 0.8
 _BARGEIN_LOCK = threading.Lock()
 _BARGEIN_MONITOR = None
 _BARGEIN_STATS = {"count": 0, "last_ts": 0.0, "last_keyword": "", "last_detail": "not_started"}
+_READER_AUTOCOMMIT_LOCK = threading.Lock()
+_READER_AUTOCOMMIT_BY_STREAM: dict[int, dict] = {}
 
 
 def _bargein_config() -> dict:
@@ -163,6 +165,45 @@ def _request_tts_stop(reason: str = "barge_in", keyword: str = "", detail: str =
         _TTS_STOP_EVENT.set()
     _stop_playback_process()
     _set_voice_status(_TTS_PLAYING_STREAM_ID, False, str(reason))
+
+
+def _reader_autocommit_register(
+    stream_id: int,
+    session_id: str,
+    chunk_id: str,
+    chunk_index: int,
+) -> None:
+    sid = _safe_session_id(session_id)
+    cid = str(chunk_id or "").strip()
+    if stream_id <= 0 or not sid or not cid:
+        return
+    with _READER_AUTOCOMMIT_LOCK:
+        _READER_AUTOCOMMIT_BY_STREAM[int(stream_id)] = {
+            "session_id": sid,
+            "chunk_id": cid,
+            "chunk_index": int(chunk_index),
+            "created_mono": time.monotonic(),
+        }
+
+
+def _reader_autocommit_finalize(stream_id: int, ok: bool | None) -> None:
+    if stream_id <= 0 or ok is None:
+        return
+    with _READER_AUTOCOMMIT_LOCK:
+        pending = _READER_AUTOCOMMIT_BY_STREAM.pop(int(stream_id), None)
+    if not pending:
+        return
+    if ok is not True:
+        return
+    try:
+        _READER_STORE.commit(
+            str(pending.get("session_id", "default")),
+            chunk_id=str(pending.get("chunk_id", "")),
+            chunk_index=int(pending.get("chunk_index", 0)),
+            reason="tts_end_autocommit",
+        )
+    except Exception:
+        return
 
 
 class _BargeInMonitor:
@@ -755,6 +796,7 @@ def _chunk_text_for_tts(text: str, max_len: int = 250) -> list[str]:
 
 def _set_voice_status(stream_id: int, ok: bool | None, detail: str) -> None:
     global _VOICE_LAST_STATUS
+    _reader_autocommit_finalize(stream_id, ok)
     with _TTS_STREAM_LOCK:
         if stream_id != _TTS_STREAM_ID:
             return
@@ -821,6 +863,14 @@ def _set_tts_queue(stream_id: int, tts_queue: queue.Queue | None) -> None:
 
 def _play_audio_blocking(path: Path, stop_event: threading.Event) -> tuple[bool, str]:
     global _TTS_PLAYBACK_PROC
+    if _env_flag("DIRECT_CHAT_TTS_DRY_RUN", False):
+        if stop_event.is_set():
+            return False, "playback_interrupted"
+        _tts_touch()
+        time.sleep(0.01)
+        if stop_event.is_set():
+            return False, "playback_interrupted"
+        return True, "ok_player_dry_run"
     paplay = shutil.which("paplay")
     ffplay = shutil.which("ffplay")
     if paplay:
@@ -987,14 +1037,49 @@ def _tts_speak_alltalk(text: str, state: dict) -> tuple[Path | None, str]:
         return None, f"alltalk_request_error:{e}"
 
 
-def _speak_reply_async(text: str) -> None:
+def _speak_reply_async(text: str) -> int:
     stream_id, stop_event = _start_new_tts_stream()
     _set_voice_status(stream_id, None, "queued")
 
     chunks = _chunk_text_for_tts(text, max_len=_int_env("DIRECT_CHAT_TTS_CHUNK_MAX_LEN", 250))
     if not chunks:
         _set_voice_status(stream_id, False, "empty_text")
-        return
+        return stream_id
+
+    if _env_flag("DIRECT_CHAT_TTS_DRY_RUN", False):
+        def _run_dry() -> None:
+            global _TTS_PLAYING_STREAM_ID
+            with _TTS_STREAM_LOCK:
+                if stream_id != _TTS_STREAM_ID:
+                    return
+                _TTS_PLAYING_STREAM_ID = stream_id
+                _TTS_PLAYING_EVENT.set()
+            _tts_touch()
+            interrupted = False
+            try:
+                for _ in chunks:
+                    if stop_event.is_set():
+                        interrupted = True
+                        break
+                    _tts_touch()
+                    time.sleep(0.01)
+            finally:
+                with _TTS_STREAM_LOCK:
+                    if _TTS_PLAYING_STREAM_ID == stream_id:
+                        _TTS_PLAYING_STREAM_ID = 0
+                        _TTS_PLAYING_EVENT.clear()
+                _tts_touch()
+            if interrupted:
+                _set_voice_status(stream_id, False, "playback_interrupted")
+                return
+            _set_voice_status(stream_id, True, "ok_player_dry_run")
+
+        try:
+            th = threading.Thread(target=_run_dry, daemon=True)
+            th.start()
+        except Exception:
+            _set_voice_status(stream_id, False, "tts_thread_start_failed")
+        return stream_id
 
     def _run() -> None:
         global _TTS_PLAYING_STREAM_ID
@@ -1109,6 +1194,7 @@ def _speak_reply_async(text: str) -> None:
         th.start()
     except Exception:
         _set_voice_status(stream_id, False, "tts_thread_start_failed")
+    return stream_id
 
 
 def _maybe_speak_reply(reply: str, allowed_tools: set[str]) -> None:
@@ -4488,7 +4574,34 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/reader/session/next":
             query = parse_qs(parsed.query)
             sid = _safe_session_id(str(query.get("session_id", query.get("session", ["default"]))[0]))
+            speak = str(query.get("speak", ["0"])[0]).strip().lower() in ("1", "true", "yes")
+            autocommit = str(query.get("autocommit", ["0"])[0]).strip().lower() in ("1", "true", "yes")
             out = _READER_STORE.next_chunk(sid)
+            if out.get("ok") and speak:
+                chunk = out.get("chunk")
+                stream_id = 0
+                if isinstance(chunk, dict):
+                    text = str(chunk.get("text", "")).strip()
+                    if text:
+                        stream_id = int(_speak_reply_async(text) or 0)
+                        out["speak_started"] = stream_id > 0
+                        out["tts_stream_id"] = stream_id
+                    else:
+                        out["speak_started"] = False
+                        out["speak_detail"] = "reader_chunk_empty_text"
+                    if autocommit and stream_id > 0:
+                        _reader_autocommit_register(
+                            stream_id=stream_id,
+                            session_id=sid,
+                            chunk_id=str(chunk.get("chunk_id", "")),
+                            chunk_index=int(chunk.get("chunk_index", 0) or 0),
+                        )
+                        out["autocommit_registered"] = True
+                else:
+                    out["speak_started"] = False
+                    out["speak_detail"] = "reader_no_chunk"
+                    if autocommit:
+                        out["autocommit_registered"] = False
             status = 200 if out.get("ok") else 404
             self._json(status, out)
             return
