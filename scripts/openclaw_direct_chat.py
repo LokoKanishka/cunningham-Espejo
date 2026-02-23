@@ -2,6 +2,7 @@
 import atexit
 import argparse
 import fcntl
+import hashlib
 import html
 import json
 import os
@@ -19,6 +20,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
 from urllib.parse import quote_plus
 from urllib.request import Request, urlopen
+from datetime import datetime, timezone
 
 import requests
 
@@ -89,6 +91,16 @@ READER_STATE_PATH = Path(
 )
 READER_LOCK_PATH = Path(
     os.environ.get("DIRECT_CHAT_READER_LOCK_PATH", str(Path.home() / ".openclaw" / ".reading_sessions.lock"))
+)
+READER_LIBRARY_DIR = Path(os.environ.get("LUCY_LIBRARY_DIR", str(Path.home() / "Lucy_Library")))
+READER_LIBRARY_INDEX_PATH = Path(
+    os.environ.get("DIRECT_CHAT_READER_LIBRARY_INDEX_PATH", str(Path.home() / ".openclaw" / "reader_library_index.json"))
+)
+READER_LIBRARY_LOCK_PATH = Path(
+    os.environ.get("DIRECT_CHAT_READER_LIBRARY_LOCK_PATH", str(Path.home() / ".openclaw" / ".reader_library_index.lock"))
+)
+READER_CACHE_DIR = Path(
+    os.environ.get("DIRECT_CHAT_READER_CACHE_DIR", str(Path.home() / ".openclaw" / "reader_cache"))
 )
 
 _VOICE_LOCK = threading.Lock()
@@ -3589,6 +3601,253 @@ class ReaderSessionStore:
 _READER_STORE = ReaderSessionStore()
 
 
+class ReaderLibraryIndex:
+    def __init__(
+        self,
+        library_dir: Path | None = None,
+        index_path: Path | None = None,
+        lock_path: Path | None = None,
+        cache_dir: Path | None = None,
+    ) -> None:
+        self.library_dir = Path(library_dir or READER_LIBRARY_DIR)
+        self.index_path = Path(index_path or READER_LIBRARY_INDEX_PATH)
+        self.lock_path = Path(lock_path or READER_LIBRARY_LOCK_PATH)
+        self.cache_dir = Path(cache_dir or READER_CACHE_DIR)
+
+    @staticmethod
+    def _now_iso() -> str:
+        return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    def _default_state(self) -> dict:
+        return {
+            "version": 1,
+            "library_dir": str(self.library_dir),
+            "updated_at": self._now_iso(),
+            "books": {},
+        }
+
+    def _load_state_unlocked(self) -> dict:
+        if not self.index_path.exists():
+            return self._default_state()
+        try:
+            raw = json.loads(self.index_path.read_text(encoding="utf-8") or "{}")
+        except Exception:
+            return self._default_state()
+        if not isinstance(raw, dict):
+            return self._default_state()
+        books = raw.get("books")
+        if not isinstance(books, dict):
+            books = {}
+        return {
+            "version": int(raw.get("version", 1) or 1),
+            "library_dir": str(raw.get("library_dir", str(self.library_dir))),
+            "updated_at": str(raw.get("updated_at", "")),
+            "books": books,
+        }
+
+    def _save_state_unlocked(self, state: dict) -> None:
+        self.index_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(state, ensure_ascii=False, indent=2)
+        tmp = self.index_path.with_suffix(".json.tmp")
+        tmp.write_text(payload, encoding="utf-8")
+        tmp.replace(self.index_path)
+
+    def _with_state(self, write: bool, func):
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.lock_path.open("a+", encoding="utf-8") as lockf:
+            mode = fcntl.LOCK_EX if write else fcntl.LOCK_SH
+            fcntl.flock(lockf.fileno(), mode)
+            state = self._load_state_unlocked()
+            out = func(state)
+            if write:
+                state["updated_at"] = self._now_iso()
+                state["library_dir"] = str(self.library_dir)
+                self._save_state_unlocked(state)
+            return out
+
+    @staticmethod
+    def _format_for_path(path: Path) -> str:
+        ext = path.suffix.lower()
+        if ext == ".txt":
+            return "txt"
+        if ext == ".pdf":
+            return "pdf"
+        if ext == ".epub":
+            return "epub"
+        return "unknown"
+
+    @staticmethod
+    def _book_id(path: Path, size: int, mtime_ns: int) -> str:
+        digest = hashlib.sha256(f"{path.resolve()}:{int(size)}:{int(mtime_ns)}".encode("utf-8")).hexdigest()
+        return digest[:32]
+
+    @staticmethod
+    def _extract_pdf_text(path: Path) -> tuple[str, str]:
+        try:
+            from pypdf import PdfReader  # type: ignore
+        except Exception:
+            return "", "pdf_extractor_unavailable"
+        try:
+            reader = PdfReader(str(path))
+            parts: list[str] = []
+            for page in reader.pages:
+                txt = page.extract_text() if page is not None else ""
+                if txt:
+                    parts.append(str(txt))
+            joined = "\n\n".join(parts).strip()
+            if not joined:
+                return "", "pdf_no_text"
+            return joined, ""
+        except Exception as e:
+            return "", f"pdf_extract_failed:{e}"
+
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        raw = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+        paras = [re.sub(r"[ \t]+", " ", p).strip() for p in raw.split("\n")]
+        lines = [p for p in paras if p]
+        return "\n".join(lines).strip()
+
+    def _extract_text(self, path: Path, fmt: str) -> tuple[str, str]:
+        if fmt == "txt":
+            try:
+                return self._normalize_text(path.read_text(encoding="utf-8", errors="replace")), ""
+            except Exception as e:
+                return "", f"txt_read_failed:{e}"
+        if fmt == "pdf":
+            txt, err = self._extract_pdf_text(path)
+            if err:
+                return "", err
+            return self._normalize_text(txt), ""
+        if fmt == "epub":
+            return "", "not_implemented_epub"
+        return "", "unsupported_format"
+
+    def _book_view(self, item: dict) -> dict:
+        chars = int(item.get("chars", 0) or 0)
+        approx_chunks = int((chars + 239) / 240) if chars > 0 else 0
+        out = {
+            "book_id": str(item.get("book_id", "")),
+            "title": str(item.get("title", "")),
+            "format": str(item.get("format", "")),
+            "source_path": str(item.get("source_path", "")),
+            "updated_at": str(item.get("updated_at", "")),
+            "chars": chars,
+            "approx_chunks": approx_chunks,
+        }
+        err = str(item.get("error", "")).strip()
+        if err:
+            out["error"] = err
+        return out
+
+    def list_books(self) -> dict:
+        def _read(state: dict) -> dict:
+            books_raw = state.get("books", {})
+            books: list[dict] = []
+            if isinstance(books_raw, dict):
+                for item in books_raw.values():
+                    if isinstance(item, dict):
+                        books.append(self._book_view(item))
+            books.sort(key=lambda b: (str(b.get("title", "")).lower(), str(b.get("book_id", ""))))
+            return {
+                "ok": True,
+                "library_dir": str(self.library_dir),
+                "index_path": str(self.index_path),
+                "updated_at": str(state.get("updated_at", "")),
+                "count": len(books),
+                "books": books,
+            }
+
+        return self._with_state(False, _read)
+
+    def get_book_text(self, book_id: str) -> dict:
+        bid = str(book_id or "").strip()
+        if not bid:
+            return {"ok": False, "error": "reader_book_id_required"}
+
+        def _read(state: dict) -> dict:
+            books_raw = state.get("books", {})
+            if not isinstance(books_raw, dict):
+                return {"ok": False, "error": "reader_book_not_found", "book_id": bid}
+            item = books_raw.get(bid)
+            if not isinstance(item, dict):
+                return {"ok": False, "error": "reader_book_not_found", "book_id": bid}
+            cache_path = Path(str(item.get("cached_text_path", "")))
+            if not cache_path.exists():
+                return {"ok": False, "error": "reader_book_cache_missing", "book_id": bid}
+            try:
+                text = cache_path.read_text(encoding="utf-8")
+            except Exception as e:
+                return {"ok": False, "error": f"reader_book_cache_read_failed:{e}", "book_id": bid}
+            return {"ok": True, "book_id": bid, "text": text, "book": self._book_view(item)}
+
+        return self._with_state(False, _read)
+
+    def rescan(self) -> dict:
+        def _write(state: dict) -> dict:
+            self.library_dir.mkdir(parents=True, exist_ok=True)
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            books: dict[str, dict] = {}
+            scanned = 0
+            cached = 0
+            errors = 0
+            for path in sorted(self.library_dir.rglob("*")):
+                if not path.is_file():
+                    continue
+                fmt = self._format_for_path(path)
+                if fmt not in ("txt", "pdf", "epub"):
+                    continue
+                scanned += 1
+                try:
+                    st = path.stat()
+                except Exception:
+                    continue
+                bid = self._book_id(path, st.st_size, st.st_mtime_ns)
+                cache_path = self.cache_dir / f"{bid}.txt"
+                text, err = self._extract_text(path, fmt)
+                chars = len(text)
+                if text:
+                    cache_path.write_text(text, encoding="utf-8")
+                    cached += 1
+                else:
+                    err = err or "empty_text"
+                    errors += 1
+                    try:
+                        cache_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                item = {
+                    "book_id": bid,
+                    "title": path.stem.strip() or path.name,
+                    "format": fmt,
+                    "source_path": str(path.resolve()),
+                    "size": int(st.st_size),
+                    "mtime_ns": int(st.st_mtime_ns),
+                    "cached_text_path": str(cache_path),
+                    "chars": int(chars),
+                    "updated_at": self._now_iso(),
+                }
+                if err:
+                    item["error"] = err
+                books[bid] = item
+            state["books"] = books
+            return {
+                "ok": True,
+                "library_dir": str(self.library_dir),
+                "scanned_files": scanned,
+                "cached_books": cached,
+                "errors": errors,
+                "count": len(books),
+            }
+
+        out = self._with_state(True, _write)
+        out["books"] = self.list_books().get("books", [])
+        return out
+
+
+_READER_LIBRARY = ReaderLibraryIndex()
+
+
 def _guardrail_check(session_id: str, tool_name: str, params: dict | None = None) -> tuple[bool, str]:
     if str(os.environ.get("GUARDRAIL_ENABLED", "1")).strip().lower() not in ("1", "true", "yes"):
         return True, "guardrail_disabled"
@@ -4562,6 +4821,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, _READER_STORE.summary(include_sessions=include))
             return
 
+        if path == "/api/reader/books":
+            self._json(200, _READER_LIBRARY.list_books())
+            return
+
         if path == "/api/reader/session":
             query = parse_qs(parsed.query)
             sid = _safe_session_id(str(query.get("session_id", query.get("session", ["default"]))[0]))
@@ -4780,6 +5043,14 @@ class Handler(BaseHTTPRequestHandler):
         return self._call_gateway(payload)
 
     def do_POST(self):
+        if self.path == "/api/reader/rescan":
+            try:
+                out = _READER_LIBRARY.rescan()
+                self._json(200, out)
+            except Exception as e:
+                self._json(500, {"ok": False, "error": str(e)})
+            return
+
         if self.path == "/api/reader/session/start":
             try:
                 payload = self._parse_payload()
@@ -4788,6 +5059,26 @@ class Handler(BaseHTTPRequestHandler):
                 text = str(payload.get("text", ""))
                 reset = bool(payload.get("reset", True))
                 metadata = payload.get("metadata")
+                book_id = str(payload.get("book_id", "")).strip()
+                if book_id:
+                    loaded = _READER_LIBRARY.get_book_text(book_id)
+                    if not loaded.get("ok"):
+                        err = str(loaded.get("error", "reader_book_not_found"))
+                        status = 404 if err in ("reader_book_not_found", "reader_book_cache_missing") else 400
+                        self._json(status, loaded)
+                        return
+                    text = str(loaded.get("text", ""))
+                    chunks = []
+                    meta = {}
+                    if isinstance(metadata, dict):
+                        meta.update(metadata)
+                    book_meta = loaded.get("book")
+                    if isinstance(book_meta, dict):
+                        meta["book_id"] = str(book_meta.get("book_id", ""))
+                        meta["book_title"] = str(book_meta.get("title", ""))
+                        meta["book_format"] = str(book_meta.get("format", ""))
+                        meta["book_source_path"] = str(book_meta.get("source_path", ""))
+                    metadata = meta
                 out = _READER_STORE.start_session(sid, chunks=chunks, text=text, reset=reset, metadata=metadata)
                 self._json(200, out)
             except ValueError as e:

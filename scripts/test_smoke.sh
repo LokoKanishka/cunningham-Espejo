@@ -12,14 +12,17 @@ python3 -m unittest \
   tests.test_voice_stt_manager \
   tests.test_openclaw_youtube_and_tools \
   tests.test_model_router_script \
-  tests.test_reader_mode
+  tests.test_reader_mode \
+  tests.test_reader_library
 
 echo "[smoke] 3/3 pytest focalizado"
 pytest -q \
   tests/test_openclaw_youtube_and_tools.py \
   tests/test_model_router_script.py \
-  tests/test_reader_mode.py
+  tests/test_reader_mode.py \
+  tests/test_reader_library.py
 
 ./scripts/verify_reader_mode_v01.sh
+./scripts/verify_reader_library.sh
 
 echo "SMOKE_OK"
