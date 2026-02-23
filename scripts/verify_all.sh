@@ -14,6 +14,9 @@ echo "== verify_capabilities ==" >&2
 echo "== verify_reader_mode ==" >&2
 ./scripts/verify_reader_mode.sh
 
+echo "== verify_reader_mode_v01 ==" >&2
+./scripts/verify_reader_mode_v01.sh
+
 echo "== verify_codex_subscription ==" >&2
 ./scripts/verify_codex_subscription.sh
 

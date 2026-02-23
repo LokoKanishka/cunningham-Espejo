@@ -20,4 +20,6 @@ pytest -q \
   tests/test_model_router_script.py \
   tests/test_reader_mode.py
 
+./scripts/verify_reader_mode_v01.sh
+
 echo "SMOKE_OK"
