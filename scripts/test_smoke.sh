@@ -24,5 +24,6 @@ pytest -q \
 
 ./scripts/verify_reader_mode_v01.sh
 ./scripts/verify_reader_library.sh
+./scripts/verify_reader_ux_dc.sh
 
 echo "SMOKE_OK"

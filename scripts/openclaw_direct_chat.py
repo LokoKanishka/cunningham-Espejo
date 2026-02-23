@@ -3347,6 +3347,9 @@ class ReaderSessionStore:
             "created_ts": float(session.get("created_ts", 0.0) or 0.0),
             "last_commit_ts": float(session.get("last_commit_ts", 0.0) or 0.0),
         }
+        meta = session.get("metadata")
+        if isinstance(meta, dict):
+            payload["metadata"] = {str(k): v for k, v in meta.items() if isinstance(k, str) and isinstance(v, (str, int, float, bool))}
         if include_chunks:
             payload["chunks"] = [
                 {"id": str(item.get("id", "")), "text": str(item.get("text", ""))}
@@ -3960,6 +3963,144 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
             _set_voice_enabled(True, session_id=session_id)
             _speak_reply_async("Prueba de voz activada. Sistema listo.")
             return {"reply": "Ejecuté prueba de voz."}
+
+    # Reader UX v0: local commands in DC chat, no model round-trip needed.
+    if any(k in normalized for k in ("ayuda lectura", "help lectura")):
+        return {
+            "reply": (
+                "Comandos de lectura:\n"
+                "- biblioteca\n"
+                "- biblioteca rescan\n"
+                "- leer libro <n>\n"
+                "- segui\n"
+                "- repetir\n"
+                "- estado lectura"
+            ),
+            "no_auto_tts": True,
+        }
+
+    if any(k in normalized for k in ("biblioteca rescan", "actualizar biblioteca", "rescan biblioteca")):
+        out = _READER_LIBRARY.rescan()
+        return {
+            "reply": (
+                f"Biblioteca actualizada. Libros: {int(out.get('count', 0))}. "
+                f"Archivos escaneados: {int(out.get('scanned_files', 0))}. "
+                f"Errores: {int(out.get('errors', 0))}."
+            ),
+            "no_auto_tts": True,
+        }
+
+    if any(k in normalized for k in ("biblioteca", "mis libros", "lista de libros", "libros")):
+        out = _READER_LIBRARY.list_books()
+        books = out.get("books", []) if isinstance(out, dict) else []
+        if not isinstance(books, list) or not books:
+            return {
+                "reply": "No encontré libros indexados. Decí: biblioteca rescan",
+                "no_auto_tts": True,
+            }
+        lines = []
+        for idx, item in enumerate(books[:12], start=1):
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title", "sin_titulo")).strip() or "sin_titulo"
+            fmt = str(item.get("format", "unknown")).strip() or "unknown"
+            short_id = str(item.get("book_id", ""))[:8]
+            lines.append(f"{idx}) {title} ({fmt}) [{short_id}]")
+        total = len(books)
+        body = "\n".join(lines)
+        more = f"\n... y {total - 12} más." if total > 12 else ""
+        return {
+            "reply": f"Biblioteca ({total}):\n{body}{more}\nDecí: leer libro <n>",
+            "no_auto_tts": True,
+        }
+
+    m_read = re.search(r"(?:leer|abrir)\s+(?:el\s+)?(?:libro\s+)?(\d+)\b", normalized, flags=re.IGNORECASE)
+    if m_read:
+        out = _READER_LIBRARY.list_books()
+        books = out.get("books", []) if isinstance(out, dict) else []
+        try:
+            idx = int(m_read.group(1))
+        except Exception:
+            idx = 0
+        if (not isinstance(books, list)) or idx < 1 or idx > len(books):
+            limit = len(books) if isinstance(books, list) else 0
+            return {"reply": f"Índice de libro inválido. Rango disponible: 1..{limit}.", "no_auto_tts": True}
+        item = books[idx - 1] if isinstance(books[idx - 1], dict) else {}
+        book_id = str(item.get("book_id", "")).strip()
+        if not book_id:
+            return {"reply": "No pude resolver ese libro. Decí: biblioteca", "no_auto_tts": True}
+        loaded = _READER_LIBRARY.get_book_text(book_id)
+        if not loaded.get("ok"):
+            return {"reply": f"No pude abrir el libro ({loaded.get('error', 'reader_book_error')}).", "no_auto_tts": True}
+        book_meta = loaded.get("book", {})
+        title = str(book_meta.get("title", item.get("title", "libro"))).strip() if isinstance(book_meta, dict) else "libro"
+        started = _READER_STORE.start_session(
+            session_id,
+            chunks=[],
+            text=str(loaded.get("text", "")),
+            reset=True,
+            metadata=book_meta if isinstance(book_meta, dict) else None,
+        )
+        if not started.get("ok"):
+            return {"reply": f"No pude iniciar lectura ({started.get('error', 'reader_start_failed')}).", "no_auto_tts": True}
+        return {"reply": f"Listo: abrí '{title}'. Decí 'seguí' para leer.", "no_auto_tts": True}
+
+    if any(k in normalized for k in ("estado lectura", "donde voy", "status lectura")):
+        st = _READER_STORE.get_session(session_id, include_chunks=False)
+        if not st.get("ok"):
+            return {"reply": "No hay sesión de lectura activa en este chat.", "no_auto_tts": True}
+        meta = st.get("metadata", {}) if isinstance(st.get("metadata"), dict) else {}
+        title = str(meta.get("book_title", "")).strip()
+        label = f"'{title}' | " if title else ""
+        return {
+            "reply": (
+                f"Estado lectura: {label}cursor={int(st.get('cursor', 0))}/"
+                f"{int(st.get('total_chunks', 0))}, pending={bool(st.get('has_pending', False))}, "
+                f"done={bool(st.get('done', False))}, barge_in={int(st.get('barge_in_count', 0))}."
+            ),
+            "no_auto_tts": True,
+        }
+
+    if any(k in normalized for k in ("repetir", "repeti")):
+        out = _READER_STORE.next_chunk(session_id)
+        if not out.get("ok"):
+            return {"reply": "No hay sesión de lectura activa. Abrí un libro con 'leer libro <n>'.", "no_auto_tts": True}
+        chunk = out.get("chunk")
+        if not isinstance(chunk, dict):
+            return {"reply": "No hay bloque pendiente para repetir.", "no_auto_tts": True}
+        chunk_text = str(chunk.get("text", "")).strip()
+        if ("tts" in allowed_tools) and _voice_enabled() and chunk_text:
+            _speak_reply_async(chunk_text)
+            return {"reply": "Repetí el bloque actual.", "no_auto_tts": True}
+        return {"reply": chunk_text or "No hay texto para repetir.", "no_auto_tts": True}
+
+    if any(k in normalized for k in ("segui", "siguiente")) or bool(re.search(r"\bnext\b", normalized)):
+        out = _READER_STORE.next_chunk(session_id)
+        if not out.get("ok"):
+            return {"reply": "No hay sesión de lectura activa. Usá 'biblioteca' y 'leer libro <n>'.", "no_auto_tts": True}
+        chunk = out.get("chunk")
+        if not isinstance(chunk, dict):
+            return {"reply": "Fin de lectura. No hay más bloques.", "no_auto_tts": True}
+        chunk_text = str(chunk.get("text", "")).strip()
+        chunk_id = str(chunk.get("chunk_id", "")).strip()
+        chunk_index = int(chunk.get("chunk_index", 0) or 0)
+        if ("tts" in allowed_tools) and _voice_enabled() and chunk_text:
+            stream_id = int(_speak_reply_async(chunk_text) or 0)
+            if stream_id > 0:
+                _reader_autocommit_register(
+                    stream_id=stream_id,
+                    session_id=session_id,
+                    chunk_id=chunk_id,
+                    chunk_index=chunk_index,
+                )
+            return {"reply": f"Leyendo bloque {chunk_index + 1}.", "no_auto_tts": True}
+        _READER_STORE.commit(
+            session_id,
+            chunk_id=chunk_id,
+            chunk_index=chunk_index,
+            reason="dc_text_autocommit",
+        )
+        return {"reply": chunk_text or f"Bloque {chunk_index + 1}.", "no_auto_tts": True}
 
     yt_transport = _extract_youtube_transport_request(message)
     if yt_transport:
@@ -5217,7 +5358,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_header("Connection", "close")
                     self.end_headers()
                     reply = str(local_action.get("reply", ""))
-                    if not _is_voice_control_command(message):
+                    if (not _is_voice_control_command(message)) and (not bool(local_action.get("no_auto_tts"))):
                         _maybe_speak_reply(reply, allowed_tools)
                     out = json.dumps({"token": reply}, ensure_ascii=False).encode("utf-8")
                     try:
@@ -5229,7 +5370,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.close_connection = True
                     return
 
-                if not _is_voice_control_command(message):
+                if (not _is_voice_control_command(message)) and (not bool(local_action.get("no_auto_tts"))):
                     _maybe_speak_reply(str(local_action.get("reply", "")), allowed_tools)
                 self._json(200, local_action)
                 return
