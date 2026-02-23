@@ -125,3 +125,8 @@ Por defecto, `exec`/`bash` deben mantenerse denegados en la política local de O
 Controles operativos:
 - `./scripts/mode_safe.sh` aplica perfil seguro con `exec` fuera de `allow` y explícitamente en `deny`.
 - `./scripts/policy_engine.sh check` falla si `mode_safe` vuelve a permitir `exec` o deja de denegarlo.
+
+## Reverse proxy y trusted proxies (gateway)
+- El gateway está configurado como **local-only** (`gateway.bind: loopback`) y autenticado por token.
+- Por eso, `gateway.trustedProxies` puede quedar vacío sin riesgo práctico en el uso actual.
+- Si se expone la UI/HTTP por **reverse proxy** (Caddy/Nginx/Traefik), se debe configurar `gateway.trustedProxies` con las IPs del/los proxy para evitar spoofing de headers.
