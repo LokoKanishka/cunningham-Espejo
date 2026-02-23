@@ -12,18 +12,21 @@ Glosario:
 - `GET /api/voice` es de solo lectura.
 - El estado STT se gobierna con `POST /api/voice` y `GET /api/stt/poll`.
 - Router con fallback local solo a modelos realmente instalados.
+- Reader Mode v0 disponible en `/api/reader/session/*` con cursor persistente y replay de pendiente tras reinicio.
 
 ## Botón rojo (obligatorio)
 Ejecutar:
 
 ```bash
 ./scripts/test_smoke.sh
+./scripts/verify_reader_mode.sh
 ```
 
 Incluye:
 - `py_compile`
 - `unittest` focalizado
 - `pytest` focalizado
+- Flujo Reader Mode v0 (`session/start`, `session/next`, `session/commit`, `session/barge_in`) con prueba de reinicio.
 
 Además, para cambios de voz/sesión/guardrails/workspace/router, ejecutar prueba humana en DC:
 1. VOZ ON, hablar 5 frases.
@@ -103,6 +106,7 @@ Variables útiles (opcionales):
 ## Documentación clave
 - `DOCS/PLAN.md` — roadmap operativo vigente (DC + Espejo-de-Lucy).
 - `DOCS/VOICE_RUNBOOK.md` — runbook mínimo de operación/diagnóstico de voz.
+- `DOCS/READER_MODE.md` — contrato Reader Mode v0 y verificador reproducible.
 - `docs/SECURITY_CHECKLIST.md` — checklist de seguridad.
 - `docs/INTEGRATIONS.md` — integraciones/pinning.
 - `DOCS/UX_SPANISH_VOICE.md` — guía de UX de voz.
@@ -110,6 +114,7 @@ Variables útiles (opcionales):
 
 ## Scripts importantes
 - `scripts/test_smoke.sh` — validación mínima obligatoria.
+- `scripts/verify_reader_mode.sh` — botón rojo de Reader Mode v0 (cursor + persistencia + reinicio + barge-in).
 - `scripts/model_router.sh` — selección y fallback de modelo.
 - `scripts/verify_all.sh` — verificación general legacy.
 - `scripts/host_audit_full.sh` — snapshot de host.

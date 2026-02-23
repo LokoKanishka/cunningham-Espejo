@@ -11,11 +11,13 @@ echo "[smoke] 2/3 unittest"
 python3 -m unittest \
   tests.test_voice_stt_manager \
   tests.test_openclaw_youtube_and_tools \
-  tests.test_model_router_script
+  tests.test_model_router_script \
+  tests.test_reader_mode
 
 echo "[smoke] 3/3 pytest focalizado"
 pytest -q \
   tests/test_openclaw_youtube_and_tools.py \
-  tests/test_model_router_script.py
+  tests/test_model_router_script.py \
+  tests/test_reader_mode.py
 
 echo "SMOKE_OK"

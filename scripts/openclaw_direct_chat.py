@@ -84,6 +84,12 @@ BROWSER_WINDOWS_PATH = Path.home() / ".openclaw" / "direct_chat_opened_browser_w
 BROWSER_WINDOWS_LOCK_PATH = Path.home() / ".openclaw" / ".direct_chat_opened_browser_windows.lock"
 TRUSTED_DC_ANCHOR_PATH = Path.home() / ".openclaw" / "direct_chat_trusted_anchor.json"
 VOICE_STATE_PATH = Path.home() / ".openclaw" / "direct_chat_voice.json"
+READER_STATE_PATH = Path(
+    os.environ.get("DIRECT_CHAT_READER_STATE_PATH", str(Path.home() / ".openclaw" / "reading_sessions.json"))
+)
+READER_LOCK_PATH = Path(
+    os.environ.get("DIRECT_CHAT_READER_LOCK_PATH", str(Path.home() / ".openclaw" / ".reading_sessions.lock"))
+)
 
 _VOICE_LOCK = threading.Lock()
 _VOICE_LAST_STATUS = {"ok": None, "detail": "not_started", "ts": 0.0}
@@ -3088,6 +3094,415 @@ def _save_history(session_id: str, history: list, model: str | None = None, back
     p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+class ReaderSessionStore:
+    def __init__(self, state_path: Path | None = None, lock_path: Path | None = None, max_sessions: int = 200) -> None:
+        self.state_path = Path(state_path or READER_STATE_PATH)
+        self.lock_path = Path(lock_path or READER_LOCK_PATH)
+        self.max_sessions = max(16, int(max_sessions))
+
+    @staticmethod
+    def _default_state() -> dict:
+        return {
+            "version": 1,
+            "updated_ts": float(time.time()),
+            "sessions": {},
+        }
+
+    def _load_state_unlocked(self) -> dict:
+        if not self.state_path.exists():
+            return self._default_state()
+        try:
+            raw = json.loads(self.state_path.read_text(encoding="utf-8") or "{}")
+        except Exception:
+            return self._default_state()
+        if not isinstance(raw, dict):
+            return self._default_state()
+        sessions = raw.get("sessions")
+        if not isinstance(sessions, dict):
+            sessions = {}
+        return {
+            "version": int(raw.get("version", 1) or 1),
+            "updated_ts": float(raw.get("updated_ts", 0.0) or 0.0),
+            "sessions": sessions,
+        }
+
+    def _save_state_unlocked(self, state: dict) -> None:
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(state, ensure_ascii=False, indent=2)
+        tmp = self.state_path.with_suffix(".json.tmp")
+        tmp.write_text(payload, encoding="utf-8")
+        tmp.replace(self.state_path)
+
+    def _with_state(self, write: bool, func):
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.lock_path.open("a+", encoding="utf-8") as lockf:
+            mode = fcntl.LOCK_EX if write else fcntl.LOCK_SH
+            fcntl.flock(lockf.fileno(), mode)
+            state = self._load_state_unlocked()
+            out = func(state)
+            if write:
+                state["updated_ts"] = float(time.time())
+                self._save_state_unlocked(state)
+            return out
+
+    @staticmethod
+    def _split_text_to_chunks(text: str, max_chars: int = 260) -> list[str]:
+        cleaned = str(text or "").strip()
+        if not cleaned:
+            return []
+        paragraphs = [re.sub(r"\s+", " ", p).strip() for p in re.split(r"\n{2,}", cleaned) if str(p or "").strip()]
+        if not paragraphs:
+            paragraphs = [re.sub(r"\s+", " ", cleaned).strip()]
+        out: list[str] = []
+        for para in paragraphs:
+            if len(para) <= max_chars:
+                out.append(para)
+                continue
+            sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", para) if s.strip()]
+            if not sentences:
+                sentences = [para]
+            acc = ""
+            for sent in sentences:
+                if len(sent) > max_chars:
+                    if acc:
+                        out.append(acc)
+                        acc = ""
+                    for i in range(0, len(sent), max_chars):
+                        piece = sent[i : i + max_chars].strip()
+                        if piece:
+                            out.append(piece)
+                    continue
+                candidate = f"{acc} {sent}".strip() if acc else sent
+                if len(candidate) <= max_chars:
+                    acc = candidate
+                else:
+                    if acc:
+                        out.append(acc)
+                    acc = sent
+            if acc:
+                out.append(acc)
+        return [x for x in out if x]
+
+    def _normalize_chunks(self, chunks, text: str = "") -> list[dict]:
+        src = chunks
+        if not isinstance(src, list):
+            src = []
+        out: list[dict] = []
+        for idx, item in enumerate(src):
+            if isinstance(item, str):
+                chunk_text = item.strip()
+                chunk_id = ""
+            elif isinstance(item, dict):
+                chunk_text = str(item.get("text", "")).strip()
+                chunk_id = str(item.get("id", "")).strip()
+            else:
+                continue
+            if not chunk_text:
+                continue
+            if not chunk_id:
+                chunk_id = f"chunk_{idx + 1:03d}"
+            out.append({"id": chunk_id[:80], "text": chunk_text[:8000]})
+
+        if not out and str(text or "").strip():
+            split = self._split_text_to_chunks(text)
+            for idx, piece in enumerate(split):
+                out.append({"id": f"chunk_{idx + 1:03d}", "text": piece[:8000]})
+
+        if not out:
+            raise ValueError("reader_chunks_empty")
+        return out
+
+    @staticmethod
+    def _pending_view(pending: dict | None) -> dict | None:
+        if not isinstance(pending, dict):
+            return None
+        return {
+            "chunk_index": int(pending.get("chunk_index", 0) or 0),
+            "chunk_id": str(pending.get("chunk_id", "")),
+            "text": str(pending.get("text", "")),
+            "deliveries": int(pending.get("deliveries", 0) or 0),
+            "last_delivery_ts": float(pending.get("last_delivery_ts", 0.0) or 0.0),
+            "last_barge_in_ts": float(pending.get("last_barge_in_ts", 0.0) or 0.0),
+        }
+
+    def _session_view(self, session_id: str, session: dict, include_chunks: bool = False) -> dict:
+        chunks = session.get("chunks")
+        if not isinstance(chunks, list):
+            chunks = []
+        cursor = int(session.get("cursor", 0) or 0)
+        total = len(chunks)
+        pending = self._pending_view(session.get("pending"))
+        payload = {
+            "ok": True,
+            "exists": True,
+            "session_id": str(session_id),
+            "cursor": max(0, cursor),
+            "total_chunks": total,
+            "done": bool(cursor >= total and pending is None),
+            "has_pending": pending is not None,
+            "pending": pending,
+            "barge_in_count": int(session.get("barge_in_count", 0) or 0),
+            "last_barge_in_detail": str(session.get("last_barge_in_detail", "")),
+            "last_barge_in_ts": float(session.get("last_barge_in_ts", 0.0) or 0.0),
+            "last_event": str(session.get("last_event", "")),
+            "updated_ts": float(session.get("updated_ts", 0.0) or 0.0),
+            "created_ts": float(session.get("created_ts", 0.0) or 0.0),
+            "last_commit_ts": float(session.get("last_commit_ts", 0.0) or 0.0),
+        }
+        if include_chunks:
+            payload["chunks"] = [
+                {"id": str(item.get("id", "")), "text": str(item.get("text", ""))}
+                for item in chunks
+                if isinstance(item, dict)
+            ]
+        return payload
+
+    @staticmethod
+    def _session_missing(session_id: str) -> dict:
+        return {
+            "ok": False,
+            "exists": False,
+            "session_id": str(session_id),
+            "error": "reader_session_not_found",
+        }
+
+    @staticmethod
+    def _prune_sessions(state: dict, max_sessions: int) -> None:
+        sessions = state.get("sessions")
+        if not isinstance(sessions, dict):
+            state["sessions"] = {}
+            return
+        if len(sessions) <= max_sessions:
+            return
+        sortable: list[tuple[float, str]] = []
+        for sid, sess in sessions.items():
+            if not isinstance(sid, str) or not isinstance(sess, dict):
+                continue
+            ts = float(sess.get("updated_ts", 0.0) or 0.0)
+            sortable.append((ts, sid))
+        sortable.sort(key=lambda x: x[0])
+        remove_count = max(0, len(sortable) - max_sessions)
+        for _, sid in sortable[:remove_count]:
+            sessions.pop(sid, None)
+
+    def summary(self, include_sessions: bool = False) -> dict:
+        def _read(state: dict) -> dict:
+            sessions = state.get("sessions", {})
+            count = len(sessions) if isinstance(sessions, dict) else 0
+            out = {
+                "ok": True,
+                "mode": "reader_v0",
+                "state_file": str(self.state_path),
+                "session_count": int(count),
+                "updated_ts": float(state.get("updated_ts", 0.0) or 0.0),
+            }
+            if include_sessions and isinstance(sessions, dict):
+                out["sessions"] = sorted([str(k) for k in sessions.keys()])[:120]
+            return out
+
+        return self._with_state(False, _read)
+
+    def start_session(
+        self,
+        session_id: str,
+        chunks,
+        text: str = "",
+        reset: bool = True,
+        metadata: dict | None = None,
+    ) -> dict:
+        sid = _safe_session_id(session_id)
+        normalized_chunks = self._normalize_chunks(chunks, text=text)
+        meta: dict = {}
+        if isinstance(metadata, dict):
+            for k, v in metadata.items():
+                if not isinstance(k, str):
+                    continue
+                if isinstance(v, (str, int, float, bool)):
+                    meta[k[:64]] = v
+
+        def _write(state: dict) -> dict:
+            sessions = state.get("sessions")
+            if not isinstance(sessions, dict):
+                sessions = {}
+                state["sessions"] = sessions
+            now = float(time.time())
+            exists = isinstance(sessions.get(sid), dict)
+            if exists and not reset:
+                out = self._session_view(sid, sessions[sid], include_chunks=False)
+                out["started"] = False
+                out["detail"] = "reader_session_exists"
+                return out
+            sessions[sid] = {
+                "chunks": normalized_chunks,
+                "cursor": 0,
+                "pending": None,
+                "barge_in_count": 0,
+                "last_barge_in_detail": "",
+                "last_barge_in_ts": 0.0,
+                "last_event": "session_started",
+                "last_commit_ts": 0.0,
+                "created_ts": now,
+                "updated_ts": now,
+                "metadata": meta,
+            }
+            self._prune_sessions(state, self.max_sessions)
+            out = self._session_view(sid, sessions[sid], include_chunks=False)
+            out["started"] = True
+            out["reset"] = bool(reset)
+            return out
+
+        return self._with_state(True, _write)
+
+    def get_session(self, session_id: str, include_chunks: bool = False) -> dict:
+        sid = _safe_session_id(session_id)
+
+        def _read(state: dict) -> dict:
+            sessions = state.get("sessions", {})
+            if not isinstance(sessions, dict) or sid not in sessions or not isinstance(sessions.get(sid), dict):
+                return self._session_missing(sid)
+            return self._session_view(sid, sessions[sid], include_chunks=include_chunks)
+
+        return self._with_state(False, _read)
+
+    def next_chunk(self, session_id: str) -> dict:
+        sid = _safe_session_id(session_id)
+
+        def _write(state: dict) -> dict:
+            sessions = state.get("sessions", {})
+            if not isinstance(sessions, dict) or sid not in sessions or not isinstance(sessions.get(sid), dict):
+                return self._session_missing(sid)
+            sess = sessions[sid]
+            chunks = sess.get("chunks")
+            if not isinstance(chunks, list):
+                chunks = []
+                sess["chunks"] = chunks
+            cursor = max(0, int(sess.get("cursor", 0) or 0))
+            now = float(time.time())
+            pending = sess.get("pending")
+            if isinstance(pending, dict):
+                deliveries = int(pending.get("deliveries", 0) or 0) + 1
+                pending["deliveries"] = deliveries
+                pending["last_delivery_ts"] = now
+                sess["updated_ts"] = now
+                sess["last_event"] = "next_replay"
+                out = self._session_view(sid, sess, include_chunks=False)
+                out["replayed"] = True
+                out["chunk"] = self._pending_view(pending)
+                return out
+            if cursor >= len(chunks):
+                sess["updated_ts"] = now
+                sess["last_event"] = "next_eof"
+                out = self._session_view(sid, sess, include_chunks=False)
+                out["replayed"] = False
+                out["chunk"] = None
+                return out
+            raw = chunks[cursor] if isinstance(chunks[cursor], dict) else {}
+            chunk_id = str(raw.get("id", f"chunk_{cursor + 1:03d}")).strip() or f"chunk_{cursor + 1:03d}"
+            chunk_text = str(raw.get("text", "")).strip()
+            pending = {
+                "chunk_index": cursor,
+                "chunk_id": chunk_id[:80],
+                "text": chunk_text[:8000],
+                "deliveries": 1,
+                "last_delivery_ts": now,
+                "last_barge_in_ts": 0.0,
+            }
+            sess["pending"] = pending
+            sess["updated_ts"] = now
+            sess["last_event"] = "next"
+            out = self._session_view(sid, sess, include_chunks=False)
+            out["replayed"] = False
+            out["chunk"] = self._pending_view(pending)
+            return out
+
+        return self._with_state(True, _write)
+
+    def commit(self, session_id: str, chunk_id: str = "", chunk_index: int | None = None, reason: str = "") -> dict:
+        sid = _safe_session_id(session_id)
+        expected_id = str(chunk_id or "").strip()
+        expected_index = None if chunk_index is None else int(chunk_index)
+
+        def _write(state: dict) -> dict:
+            sessions = state.get("sessions", {})
+            if not isinstance(sessions, dict) or sid not in sessions or not isinstance(sessions.get(sid), dict):
+                return self._session_missing(sid)
+            sess = sessions[sid]
+            pending = sess.get("pending")
+            if not isinstance(pending, dict):
+                out = self._session_view(sid, sess, include_chunks=False)
+                out["committed"] = False
+                out["detail"] = "reader_no_pending_chunk"
+                return out
+            got_id = str(pending.get("chunk_id", ""))
+            got_index = int(pending.get("chunk_index", 0) or 0)
+            if expected_id and expected_id != got_id:
+                out = self._session_view(sid, sess, include_chunks=False)
+                out["ok"] = False
+                out["error"] = "reader_commit_chunk_mismatch"
+                out["expected_chunk_id"] = expected_id
+                out["pending_chunk_id"] = got_id
+                return out
+            if expected_index is not None and expected_index != got_index:
+                out = self._session_view(sid, sess, include_chunks=False)
+                out["ok"] = False
+                out["error"] = "reader_commit_index_mismatch"
+                out["expected_chunk_index"] = expected_index
+                out["pending_chunk_index"] = got_index
+                return out
+            now = float(time.time())
+            cursor = max(0, int(sess.get("cursor", 0) or 0))
+            sess["cursor"] = max(cursor, got_index + 1)
+            sess["pending"] = None
+            sess["last_commit_ts"] = now
+            sess["updated_ts"] = now
+            sess["last_event"] = "commit"
+            if reason:
+                sess["last_commit_reason"] = str(reason)[:120]
+            out = self._session_view(sid, sess, include_chunks=False)
+            out["committed"] = True
+            out["committed_chunk_id"] = got_id
+            out["committed_chunk_index"] = got_index
+            return out
+
+        return self._with_state(True, _write)
+
+    def mark_barge_in(self, session_id: str, detail: str = "", keyword: str = "") -> dict:
+        sid = _safe_session_id(session_id)
+        detail_clean = str(detail or "barge_in_triggered").strip() or "barge_in_triggered"
+        keyword_clean = str(keyword or "").strip()
+
+        def _write(state: dict) -> dict:
+            sessions = state.get("sessions", {})
+            if not isinstance(sessions, dict) or sid not in sessions or not isinstance(sessions.get(sid), dict):
+                return self._session_missing(sid)
+            sess = sessions[sid]
+            pending = sess.get("pending")
+            now = float(time.time())
+            if not isinstance(pending, dict):
+                out = self._session_view(sid, sess, include_chunks=False)
+                out["interrupted"] = False
+                out["detail"] = "reader_no_pending_chunk"
+                return out
+            sess["barge_in_count"] = int(sess.get("barge_in_count", 0) or 0) + 1
+            sess["last_barge_in_detail"] = detail_clean[:240]
+            sess["last_barge_in_ts"] = now
+            if keyword_clean:
+                sess["last_barge_in_keyword"] = keyword_clean[:80]
+            pending["last_barge_in_ts"] = now
+            pending["deliveries"] = int(pending.get("deliveries", 0) or 0)
+            sess["updated_ts"] = now
+            sess["last_event"] = "barge_in"
+            out = self._session_view(sid, sess, include_chunks=False)
+            out["interrupted"] = True
+            out["chunk"] = self._pending_view(pending)
+            return out
+
+        return self._with_state(True, _write)
+
+
+_READER_STORE = ReaderSessionStore()
+
+
 def _guardrail_check(session_id: str, tool_name: str, params: dict | None = None) -> tuple[bool, str]:
     if str(os.environ.get("GUARDRAIL_ENABLED", "1")).strip().lower() not in ("1", "true", "yes"):
         return True, "guardrail_disabled"
@@ -4055,6 +4470,29 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
+        if path == "/api/reader":
+            query = parse_qs(parsed.query)
+            include = str(query.get("include_sessions", ["0"])[0]).strip().lower() in ("1", "true", "yes")
+            self._json(200, _READER_STORE.summary(include_sessions=include))
+            return
+
+        if path == "/api/reader/session":
+            query = parse_qs(parsed.query)
+            sid = _safe_session_id(str(query.get("session_id", query.get("session", ["default"]))[0]))
+            include_chunks = str(query.get("include_chunks", ["0"])[0]).strip().lower() in ("1", "true", "yes")
+            out = _READER_STORE.get_session(sid, include_chunks=include_chunks)
+            status = 200 if out.get("ok") else 404
+            self._json(status, out)
+            return
+
+        if path == "/api/reader/session/next":
+            query = parse_qs(parsed.query)
+            sid = _safe_session_id(str(query.get("session_id", query.get("session", ["default"]))[0]))
+            out = _READER_STORE.next_chunk(sid)
+            status = 200 if out.get("ok") else 404
+            self._json(status, out)
+            return
+
         if path == "/api/history":
             query = parse_qs(parsed.query)
             sid = _safe_session_id((query.get("session", ["default"])[0]))
@@ -4229,6 +4667,61 @@ class Handler(BaseHTTPRequestHandler):
         return self._call_gateway(payload)
 
     def do_POST(self):
+        if self.path == "/api/reader/session/start":
+            try:
+                payload = self._parse_payload()
+                sid = _safe_session_id(str(payload.get("session_id", "default")))
+                chunks = payload.get("chunks", [])
+                text = str(payload.get("text", ""))
+                reset = bool(payload.get("reset", True))
+                metadata = payload.get("metadata")
+                out = _READER_STORE.start_session(sid, chunks=chunks, text=text, reset=reset, metadata=metadata)
+                self._json(200, out)
+            except ValueError as e:
+                self._json(400, {"ok": False, "error": str(e)})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": str(e)})
+            return
+
+        if self.path == "/api/reader/session/commit":
+            try:
+                payload = self._parse_payload()
+                sid = _safe_session_id(str(payload.get("session_id", "default")))
+                chunk_id = str(payload.get("chunk_id", "")).strip()
+                chunk_index = payload.get("chunk_index")
+                if chunk_index in ("", None):
+                    chunk_index = None
+                else:
+                    chunk_index = int(chunk_index)
+                reason = str(payload.get("reason", "")).strip()
+                out = _READER_STORE.commit(sid, chunk_id=chunk_id, chunk_index=chunk_index, reason=reason)
+                if out.get("ok"):
+                    self._json(200, out)
+                    return
+                err = str(out.get("error", "")).strip()
+                if err == "reader_session_not_found":
+                    self._json(404, out)
+                elif "mismatch" in err:
+                    self._json(409, out)
+                else:
+                    self._json(400, out)
+            except Exception as e:
+                self._json(500, {"ok": False, "error": str(e)})
+            return
+
+        if self.path in ("/api/reader/session/barge_in", "/api/reader/session/barge-in"):
+            try:
+                payload = self._parse_payload()
+                sid = _safe_session_id(str(payload.get("session_id", "default")))
+                detail = str(payload.get("detail", "barge_in_triggered"))
+                keyword = str(payload.get("keyword", ""))
+                out = _READER_STORE.mark_barge_in(sid, detail=detail, keyword=keyword)
+                status = 200 if out.get("ok") else 404
+                self._json(status, out)
+            except Exception as e:
+                self._json(500, {"ok": False, "error": str(e)})
+            return
+
         if self.path == "/api/voice":
             try:
                 payload = self._parse_payload()
