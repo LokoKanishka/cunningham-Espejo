@@ -16,6 +16,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-sessions", type=int, default=0, help="Maximum number of files to process; 0 = unlimited")
     p.add_argument("--max-lines", type=int, default=0, help="Maximum lines to write; 0 = unlimited")
     p.add_argument("--since-days", type=int, default=0, help="Only include files modified in last N days; 0 = disabled")
+    p.add_argument("--max-completion-chars", type=int, default=0, help="Max chars for completion; 0 = unlimited")
     return p.parse_args()
 
 
@@ -27,18 +28,18 @@ def parse_meta(filename: str) -> tuple[str, str, str]:
     return stem, "", ""
 
 
-def load_history(path: Path) -> list[dict]:
+def load_history(path: Path) -> tuple[list[dict], bool]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        return []
+        return [], True
     if not isinstance(data, list):
-        return []
+        return [], True
     out: list[dict] = []
     for item in data:
         if isinstance(item, dict):
             out.append(item)
-    return out
+    return out, False
 
 
 def iter_pairs(messages: list[dict], min_chars: int, counters: dict[str, int]):
@@ -61,6 +62,7 @@ def iter_pairs(messages: list[dict], min_chars: int, counters: dict[str, int]):
 
         if role == "user":
             if pending_user is not None:
+                counters["user_overwritten"] += 1
                 counters["orphan_user_dropped"] += 1
             pending_user = content
             continue
@@ -94,6 +96,7 @@ def main() -> int:
     max_sessions = max(0, int(args.max_sessions))
     max_lines = max(0, int(args.max_lines))
     since_days = max(0, int(args.since_days))
+    max_completion_chars = max(0, int(args.max_completion_chars))
 
     files = sorted([p for p in input_dir.glob("*.json") if p.is_file()])
     sessions_total = len(files)
@@ -113,18 +116,28 @@ def main() -> int:
         "empty_dropped": 0,
         "assistant_without_user_dropped": 0,
         "orphan_user_dropped": 0,
+        "user_overwritten": 0,
         "short_prompt_dropped": 0,
         "short_completion_dropped": 0,
+        "completion_truncated": 0,
     }
+    files_invalid_json = 0
     rows = 0
     rows_by_session: dict[str, int] = {}
+    pairs_per_backend_model: dict[str, dict[str, int]] = {}
 
     with output_file.open("w", encoding="utf-8") as f:
         stop = False
         for path in files:
             session_id, backend, model = parse_meta(path.name)
-            history = load_history(path)
+            history, invalid_json = load_history(path)
+            if invalid_json:
+                files_invalid_json += 1
+                continue
             for prompt, completion in iter_pairs(history, min_chars=min_chars, counters=counters):
+                if max_completion_chars > 0 and len(completion) > max_completion_chars:
+                    completion = completion[:max_completion_chars]
+                    counters["completion_truncated"] += 1
                 base = {
                     "session_id": session_id,
                     "backend": backend,
@@ -144,6 +157,8 @@ def main() -> int:
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
                 rows += 1
                 rows_by_session[session_id] = rows_by_session.get(session_id, 0) + 1
+                backend_map = pairs_per_backend_model.setdefault(backend, {})
+                backend_map[model] = backend_map.get(model, 0) + 1
 
                 if max_lines > 0 and rows >= max_lines:
                     stop = True
@@ -160,6 +175,7 @@ def main() -> int:
         "sessions_total": sessions_total,
         "sessions_scanned": len(files),
         "sessions_with_rows": len(rows_by_session),
+        "files_invalid_json": files_invalid_json,
         "in": str(input_dir),
         "out": str(output_file),
         "filters": {
@@ -167,8 +183,10 @@ def main() -> int:
             "max_sessions": max_sessions,
             "max_lines": max_lines,
             "since_days": since_days,
+            "max_completion_chars": max_completion_chars,
         },
         "dropped": counters,
+        "pairs_per_backend_model": pairs_per_backend_model,
         "top_sessions": [{"session_id": sid, "rows": cnt} for sid, cnt in top_sessions],
     }
     print(json.dumps(summary, ensure_ascii=False))

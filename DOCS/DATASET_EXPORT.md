@@ -42,22 +42,28 @@ python3 scripts/export_history_jsonl.py \
   --min-chars 1 \
   --max-sessions 0 \
   --max-lines 0 \
-  --since-days 0
+  --since-days 0 \
+  --max-completion-chars 0
 ```
 
 - `--max-sessions 0`: sin límite.
 - `--max-lines 0`: sin límite de líneas exportadas.
 - `--since-days 0`: sin filtro temporal.
+- `--max-completion-chars 0`: sin límite de largo para `completion`.
 
 ## Resumen de calidad
 
 El script imprime JSON con métricas:
 
 - `rows`, `sessions_scanned`, `sessions_with_rows`
+- `files_invalid_json`
 - `dropped.empty_dropped`
 - `dropped.orphan_user_dropped`
+- `dropped.user_overwritten`
 - `dropped.assistant_without_user_dropped`
 - `dropped.short_prompt_dropped`, `dropped.short_completion_dropped`
+- `dropped.completion_truncated`
+- `pairs_per_backend_model` (breakdown por backend/model)
 - `top_sessions` (top 10 por cantidad de líneas exportadas)
 
 ## Verificación
