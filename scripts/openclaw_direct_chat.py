@@ -142,6 +142,7 @@ def _bargein_config() -> dict:
     rms_threshold = rms_state if rms_state > 0 else rms_env
     return {
         "enabled": _env_flag("DIRECT_CHAT_BARGEIN_ENABLED", True),
+        "vad_interrupt_enabled": _env_flag("DIRECT_CHAT_BARGEIN_VAD_INTERRUPT_ENABLED", False),
         "sample_rate": max(8000, _int_env("DIRECT_CHAT_BARGEIN_SAMPLE_RATE", 16000)),
         "frame_ms": max(10, min(30, _int_env("DIRECT_CHAT_BARGEIN_FRAME_MS", 30))),
         "vad_mode": max(0, min(3, _int_env("DIRECT_CHAT_BARGEIN_VAD_MODE", 1))),
@@ -374,7 +375,15 @@ class _BargeInMonitor:
 
     @staticmethod
     def _enabled() -> bool:
-        return _env_flag("DIRECT_CHAT_BARGEIN_ENABLED", True)
+        cfg = _bargein_config()
+        if not bool(cfg.get("enabled", True)):
+            return False
+        if not bool(cfg.get("vad_interrupt_enabled", False)):
+            return False
+        state = _load_voice_state()
+        if bool(state.get("stt_command_only", True)):
+            return False
+        return True
 
     @staticmethod
     def _keywords() -> list[str]:

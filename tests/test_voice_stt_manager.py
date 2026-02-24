@@ -78,6 +78,8 @@ class TestVoiceSttManager(unittest.TestCase):
             mgr._enabled = True
             mgr._owner_session_id = "sess_a"
             mgr._worker = _DummyWorker(running=True)
+        mgr._command_only_enabled = lambda: True  # type: ignore
+        mgr._debug_enabled = lambda: False  # type: ignore
         mgr._queue.put({"text": "comentario normal", "ts": 1.0})
         mgr._queue.put({"text": "detenete", "ts": 2.0})
         mgr._queue.put({"text": "continuar", "ts": 3.0})
