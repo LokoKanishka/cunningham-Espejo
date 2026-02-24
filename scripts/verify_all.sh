@@ -43,4 +43,9 @@ if [ "${VERIFY_DC_UI_MODELS:-0}" = "1" ]; then
   node ./scripts/verify_dc_ui_models.js
 fi
 
+if [ "${VERIFY_READER_UI_HUMAN:-0}" = "1" ]; then
+  echo "== verify_reader_ui_human ==" >&2
+  node ./scripts/verify_reader_ui_human.js
+fi
+
 echo "ALL_OK" >&2

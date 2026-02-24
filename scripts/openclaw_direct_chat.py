@@ -3244,10 +3244,11 @@ class ReaderSessionStore:
             return out
 
     @staticmethod
-    def _split_text_to_chunks(text: str, max_chars: int = 260) -> list[str]:
+    def _split_text_to_chunks(text: str, max_chars: int = 720) -> list[str]:
         cleaned = str(text or "").strip()
         if not cleaned:
             return []
+        max_chars = max(320, int(max_chars))
         paragraphs = [re.sub(r"\s+", " ", p).strip() for p in re.split(r"\n{2,}", cleaned) if str(p or "").strip()]
         if not paragraphs:
             paragraphs = [re.sub(r"\s+", " ", cleaned).strip()]
@@ -3302,7 +3303,10 @@ class ReaderSessionStore:
             out.append({"id": chunk_id[:80], "text": chunk_text[:8000]})
 
         if not out and str(text or "").strip():
-            split = self._split_text_to_chunks(text)
+            split = self._split_text_to_chunks(
+                text,
+                max_chars=max(320, _int_env("DIRECT_CHAT_READER_CHUNK_MAX_CHARS", 720)),
+            )
             for idx, piece in enumerate(split):
                 out.append({"id": f"chunk_{idx + 1:03d}", "text": piece[:8000]})
 
@@ -3346,6 +3350,9 @@ class ReaderSessionStore:
             "updated_ts": float(session.get("updated_ts", 0.0) or 0.0),
             "created_ts": float(session.get("created_ts", 0.0) or 0.0),
             "last_commit_ts": float(session.get("last_commit_ts", 0.0) or 0.0),
+            "continuous_active": bool(session.get("continuous_active", False)),
+            "continuous_reason": str(session.get("continuous_reason", "")),
+            "continuous_updated_ts": float(session.get("continuous_updated_ts", 0.0) or 0.0),
         }
         meta = session.get("metadata")
         if isinstance(meta, dict):
@@ -3437,6 +3444,9 @@ class ReaderSessionStore:
                 "chunks": normalized_chunks,
                 "cursor": 0,
                 "pending": None,
+                "continuous_active": False,
+                "continuous_reason": "session_started",
+                "continuous_updated_ts": now,
                 "barge_in_count": 0,
                 "last_barge_in_detail": "",
                 "last_barge_in_ts": 0.0,
@@ -3557,6 +3567,12 @@ class ReaderSessionStore:
             sess["last_commit_ts"] = now
             sess["updated_ts"] = now
             sess["last_event"] = "commit"
+            chunks = sess.get("chunks")
+            total = len(chunks) if isinstance(chunks, list) else 0
+            if int(sess.get("cursor", 0) or 0) >= total:
+                sess["continuous_active"] = False
+                sess["continuous_reason"] = "eof"
+                sess["continuous_updated_ts"] = now
             if reason:
                 sess["last_commit_reason"] = str(reason)[:120]
             out = self._session_view(sid, sess, include_chunks=False)
@@ -3593,12 +3609,50 @@ class ReaderSessionStore:
             pending["deliveries"] = int(pending.get("deliveries", 0) or 0)
             sess["updated_ts"] = now
             sess["last_event"] = "barge_in"
+            sess["continuous_active"] = False
+            sess["continuous_reason"] = "barge_in"
+            sess["continuous_updated_ts"] = now
             out = self._session_view(sid, sess, include_chunks=False)
             out["interrupted"] = True
             out["chunk"] = self._pending_view(pending)
             return out
 
         return self._with_state(True, _write)
+
+    def set_continuous(self, session_id: str, active: bool, reason: str = "") -> dict:
+        sid = _safe_session_id(session_id)
+        reason_clean = str(reason or "").strip()[:120]
+
+        def _write(state: dict) -> dict:
+            sessions = state.get("sessions", {})
+            if not isinstance(sessions, dict) or sid not in sessions or not isinstance(sessions.get(sid), dict):
+                return self._session_missing(sid)
+            sess = sessions[sid]
+            now = float(time.time())
+            sess["continuous_active"] = bool(active)
+            sess["continuous_reason"] = reason_clean or ("continuous_on" if active else "continuous_off")
+            sess["continuous_updated_ts"] = now
+            sess["updated_ts"] = now
+            sess["last_event"] = "continuous_on" if active else "continuous_off"
+            out = self._session_view(sid, sess, include_chunks=False)
+            out["continuous_changed"] = True
+            return out
+
+        return self._with_state(True, _write)
+
+    def is_continuous(self, session_id: str) -> bool:
+        sid = _safe_session_id(session_id)
+
+        def _read(state: dict) -> bool:
+            sessions = state.get("sessions", {})
+            if not isinstance(sessions, dict):
+                return False
+            sess = sessions.get(sid)
+            if not isinstance(sess, dict):
+                return False
+            return bool(sess.get("continuous_active", False))
+
+        return bool(self._with_state(False, _read))
 
 
 _READER_STORE = ReaderSessionStore()
@@ -3930,6 +3984,71 @@ def _extract_allowed_tools(payload: dict) -> set[str]:
     return out
 
 
+def _is_reader_control_command(message: str) -> bool:
+    normalized = _normalize_text(message)
+    if not normalized:
+        return False
+    if any(
+        k in normalized
+        for k in (
+            "ayuda lectura",
+            "help lectura",
+            "biblioteca",
+            "estado lectura",
+            "donde voy",
+            "status lectura",
+            "repetir",
+            "repeti",
+            "segui",
+            "seguir",
+            "siguiente",
+            "next",
+            "pausa lectura",
+            "pausar lectura",
+            "detener lectura",
+            "parar lectura",
+            "stop lectura",
+        )
+    ):
+        return True
+    return bool(re.search(r"(?:leer|abrir)\s+(?:el\s+)?(?:libro\s+)?(\d+)\b", normalized, flags=re.IGNORECASE))
+
+
+def _reader_chunk_reply(chunk: dict, total_chunks: int, title: str = "", prefix: str = "") -> str:
+    chunk_index = int(chunk.get("chunk_index", 0) or 0)
+    index = max(1, chunk_index + 1)
+    total = max(int(total_chunks or 0), index)
+    text = str(chunk.get("text", "")).strip()
+    header = f"Bloque {index}/{total}"
+    if title:
+        header = f"{title} - {header}"
+    parts: list[str] = []
+    if prefix:
+        parts.append(str(prefix).strip())
+    parts.append(header)
+    parts.append("")
+    parts.append(text or "[bloque sin texto]")
+    return "\n".join(parts)
+
+
+def _reader_meta(session_id: str, state: dict | None, chunk: dict | None = None, auto_continue: bool = False) -> dict:
+    st = state if isinstance(state, dict) else {}
+    out = {
+        "session_id": _safe_session_id(session_id),
+        "cursor": int(st.get("cursor", 0) or 0),
+        "total_chunks": int(st.get("total_chunks", 0) or 0),
+        "done": bool(st.get("done", False)),
+        "has_pending": bool(st.get("has_pending", False)),
+        "continuous_active": bool(st.get("continuous_active", False)),
+        "continuous_reason": str(st.get("continuous_reason", "")),
+        "auto_continue": bool(auto_continue),
+    }
+    if isinstance(chunk, dict):
+        out["chunk_index"] = int(chunk.get("chunk_index", 0) or 0)
+        out["chunk_id"] = str(chunk.get("chunk_id", ""))
+    return out
+
+
 def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id: str) -> dict | None:
     text = message.lower()
     normalized = _normalize_text(message)
@@ -3964,7 +4083,7 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
             _speak_reply_async("Prueba de voz activada. Sistema listo.")
             return {"reply": "Ejecuté prueba de voz."}
 
-    # Reader UX v0: local commands in DC chat, no model round-trip needed.
+    # Reader UX v0.3: local commands in DC chat, no model round-trip needed.
     if any(k in normalized for k in ("ayuda lectura", "help lectura")):
         return {
             "reply": (
@@ -3974,7 +4093,8 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
                 "- leer libro <n>\n"
                 "- segui\n"
                 "- repetir\n"
-                "- estado lectura"
+                "- estado lectura\n"
+                "- pausar lectura"
             ),
             "no_auto_tts": True,
         }
@@ -4043,7 +4163,54 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         )
         if not started.get("ok"):
             return {"reply": f"No pude iniciar lectura ({started.get('error', 'reader_start_failed')}).", "no_auto_tts": True}
-        return {"reply": f"Listo: abrí '{title}'. Decí 'seguí' para leer.", "no_auto_tts": True}
+        _READER_STORE.set_continuous(session_id, True, reason="reader_start_auto")
+        first = _READER_STORE.next_chunk(session_id)
+        chunk = first.get("chunk") if isinstance(first, dict) else None
+        if not first.get("ok") or not isinstance(chunk, dict):
+            _READER_STORE.set_continuous(session_id, False, reason="reader_start_empty")
+            return {
+                "reply": f"Listo: abrí '{title}', pero no encontré contenido para leer.",
+                "no_auto_tts": True,
+                "reader": _reader_meta(session_id, _READER_STORE.get_session(session_id), auto_continue=False),
+            }
+        chunk_text = str(chunk.get("text", "")).strip()
+        chunk_id = str(chunk.get("chunk_id", "")).strip()
+        chunk_index = int(chunk.get("chunk_index", 0) or 0)
+        if ("tts" in allowed_tools) and _voice_enabled() and chunk_text:
+            _speak_reply_async(chunk_text)
+        _READER_STORE.commit(
+            session_id,
+            chunk_id=chunk_id,
+            chunk_index=chunk_index,
+            reason="reader_start_autocommit",
+        )
+        st_after = _READER_STORE.get_session(session_id, include_chunks=False)
+        has_more = (not bool(st_after.get("done", False))) and int(st_after.get("cursor", 0) or 0) < int(
+            st_after.get("total_chunks", 0) or 0
+        )
+        auto_continue = bool(st_after.get("continuous_active", False)) and has_more
+        return {
+            "reply": _reader_chunk_reply(
+                chunk,
+                total_chunks=int(st_after.get("total_chunks", 0) or 0),
+                title=title,
+                prefix=f"Lectura iniciada de '{title}'.",
+            ),
+            "no_auto_tts": True,
+            "reader": _reader_meta(session_id, st_after, chunk=chunk, auto_continue=auto_continue),
+        }
+
+    if any(k in normalized for k in ("pausa lectura", "pausar lectura", "detener lectura", "parar lectura", "stop lectura")):
+        st = _READER_STORE.get_session(session_id, include_chunks=False)
+        if not st.get("ok"):
+            return {"reply": "No hay sesión de lectura activa en este chat.", "no_auto_tts": True}
+        _READER_STORE.set_continuous(session_id, False, reason="reader_user_paused")
+        st_after = _READER_STORE.get_session(session_id, include_chunks=False)
+        return {
+            "reply": "Lectura en pausa. Para retomar, decí: seguí",
+            "no_auto_tts": True,
+            "reader": _reader_meta(session_id, st_after, auto_continue=False),
+        }
 
     if any(k in normalized for k in ("estado lectura", "donde voy", "status lectura")):
         st = _READER_STORE.get_session(session_id, include_chunks=False)
@@ -4052,55 +4219,103 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         meta = st.get("metadata", {}) if isinstance(st.get("metadata"), dict) else {}
         title = str(meta.get("book_title", "")).strip()
         label = f"'{title}' | " if title else ""
+        continuous = "on" if bool(st.get("continuous_active", False)) else "off"
+        reason = str(st.get("continuous_reason", "")).strip() or "-"
         return {
             "reply": (
                 f"Estado lectura: {label}cursor={int(st.get('cursor', 0))}/"
                 f"{int(st.get('total_chunks', 0))}, pending={bool(st.get('has_pending', False))}, "
-                f"done={bool(st.get('done', False))}, barge_in={int(st.get('barge_in_count', 0))}."
+                f"done={bool(st.get('done', False))}, continua={continuous}({reason}), "
+                f"barge_in={int(st.get('barge_in_count', 0))}."
             ),
             "no_auto_tts": True,
+            "reader": _reader_meta(session_id, st, auto_continue=False),
         }
 
     if any(k in normalized for k in ("repetir", "repeti")):
-        out = _READER_STORE.next_chunk(session_id)
-        if not out.get("ok"):
+        st = _READER_STORE.get_session(session_id, include_chunks=True)
+        if not st.get("ok"):
             return {"reply": "No hay sesión de lectura activa. Abrí un libro con 'leer libro <n>'.", "no_auto_tts": True}
-        chunk = out.get("chunk")
+        meta = st.get("metadata", {}) if isinstance(st.get("metadata"), dict) else {}
+        title = str(meta.get("book_title", "")).strip()
+        chunk = st.get("pending") if isinstance(st.get("pending"), dict) else None
         if not isinstance(chunk, dict):
-            return {"reply": "No hay bloque pendiente para repetir.", "no_auto_tts": True}
+            cursor = int(st.get("cursor", 0) or 0)
+            chunks = st.get("chunks") if isinstance(st.get("chunks"), list) else []
+            idx = min(max(0, cursor - 1), len(chunks) - 1) if chunks else -1
+            if idx < 0:
+                return {"reply": "No hay bloque pendiente para repetir.", "no_auto_tts": True}
+            raw = chunks[idx] if isinstance(chunks[idx], dict) else {}
+            chunk = {
+                "chunk_index": idx,
+                "chunk_id": str(raw.get("id", f"chunk_{idx + 1:03d}")),
+                "text": str(raw.get("text", "")),
+            }
         chunk_text = str(chunk.get("text", "")).strip()
         if ("tts" in allowed_tools) and _voice_enabled() and chunk_text:
             _speak_reply_async(chunk_text)
-            return {"reply": "Repetí el bloque actual.", "no_auto_tts": True}
-        return {"reply": chunk_text or "No hay texto para repetir.", "no_auto_tts": True}
+        return {
+            "reply": _reader_chunk_reply(
+                chunk,
+                total_chunks=int(st.get("total_chunks", 0) or 0),
+                title=title,
+                prefix="Repito el bloque actual.",
+            ),
+            "no_auto_tts": True,
+            "reader": _reader_meta(
+                session_id,
+                st,
+                chunk=chunk,
+                auto_continue=bool(st.get("continuous_active", False)) and (not bool(st.get("done", False))),
+            ),
+        }
 
     if any(k in normalized for k in ("segui", "siguiente")) or bool(re.search(r"\bnext\b", normalized)):
+        st_before = _READER_STORE.get_session(session_id, include_chunks=False)
+        if st_before.get("ok") and (not bool(st_before.get("continuous_active", False))):
+            _READER_STORE.set_continuous(session_id, True, reason="reader_resumed_by_user")
         out = _READER_STORE.next_chunk(session_id)
         if not out.get("ok"):
             return {"reply": "No hay sesión de lectura activa. Usá 'biblioteca' y 'leer libro <n>'.", "no_auto_tts": True}
         chunk = out.get("chunk")
         if not isinstance(chunk, dict):
-            return {"reply": "Fin de lectura. No hay más bloques.", "no_auto_tts": True}
+            _READER_STORE.set_continuous(session_id, False, reason="reader_eof")
+            st_end = _READER_STORE.get_session(session_id, include_chunks=False)
+            return {
+                "reply": "Fin de lectura. No hay más bloques.",
+                "no_auto_tts": True,
+                "reader": _reader_meta(session_id, st_end, auto_continue=False),
+            }
         chunk_text = str(chunk.get("text", "")).strip()
         chunk_id = str(chunk.get("chunk_id", "")).strip()
         chunk_index = int(chunk.get("chunk_index", 0) or 0)
         if ("tts" in allowed_tools) and _voice_enabled() and chunk_text:
-            stream_id = int(_speak_reply_async(chunk_text) or 0)
-            if stream_id > 0:
-                _reader_autocommit_register(
-                    stream_id=stream_id,
-                    session_id=session_id,
-                    chunk_id=chunk_id,
-                    chunk_index=chunk_index,
-                )
-            return {"reply": f"Leyendo bloque {chunk_index + 1}.", "no_auto_tts": True}
+            _speak_reply_async(chunk_text)
         _READER_STORE.commit(
             session_id,
             chunk_id=chunk_id,
             chunk_index=chunk_index,
-            reason="dc_text_autocommit",
+            reason="dc_reader_autocommit",
         )
-        return {"reply": chunk_text or f"Bloque {chunk_index + 1}.", "no_auto_tts": True}
+        st_after = _READER_STORE.get_session(session_id, include_chunks=False)
+        meta_after = st_after.get("metadata", {}) if isinstance(st_after.get("metadata"), dict) else {}
+        title = str(meta_after.get("book_title", "")).strip()
+        has_more = (not bool(st_after.get("done", False))) and int(st_after.get("cursor", 0) or 0) < int(
+            st_after.get("total_chunks", 0) or 0
+        )
+        auto_continue = bool(st_after.get("continuous_active", False)) and has_more
+        reply = _reader_chunk_reply(
+            chunk,
+            total_chunks=int(st_after.get("total_chunks", 0) or 0),
+            title=title,
+        )
+        if not chunk_text:
+            reply = f"Error: bloque {chunk_index + 1} sin texto legible."
+        return {
+            "reply": reply,
+            "no_auto_tts": True,
+            "reader": _reader_meta(session_id, st_after, chunk=chunk, auto_continue=auto_continue),
+        }
 
     yt_transport = _extract_youtube_transport_request(message)
     if yt_transport:
@@ -5341,6 +5556,8 @@ class Handler(BaseHTTPRequestHandler):
             session_id = _safe_session_id(str(payload.get("session_id", "default")))
             allowed_tools = _extract_allowed_tools(payload)
             # allow_local_action_on_unknown_model
+            if message and _READER_STORE.is_continuous(session_id) and (not _is_reader_control_command(message)):
+                _READER_STORE.set_continuous(session_id, False, reason="reader_user_interrupt")
 
             model = str(payload.get("model", "openai-codex/gpt-5.1-codex-mini")).strip()
             requested_backend = str(payload.get("model_backend", "")).strip().lower()
@@ -5359,7 +5576,10 @@ class Handler(BaseHTTPRequestHandler):
                         reply = str(local_action.get("reply", ""))
                         if (not _is_voice_control_command(message)) and (not bool(local_action.get("no_auto_tts"))):
                             _maybe_speak_reply(reply, allowed_tools)
-                        out = json.dumps({"token": reply}, ensure_ascii=False).encode("utf-8")
+                        event = {"token": reply}
+                        if isinstance(local_action.get("reader"), dict):
+                            event["reader"] = local_action.get("reader")
+                        out = json.dumps(event, ensure_ascii=False).encode("utf-8")
                         try:
                             self.wfile.write(b"data: " + out + b"\n\n")
                             self.wfile.write(b"data: [DONE]\n\n")
@@ -5399,7 +5619,10 @@ class Handler(BaseHTTPRequestHandler):
                     reply = str(local_action.get("reply", ""))
                     if (not _is_voice_control_command(message)) and (not bool(local_action.get("no_auto_tts"))):
                         _maybe_speak_reply(reply, allowed_tools)
-                    out = json.dumps({"token": reply}, ensure_ascii=False).encode("utf-8")
+                    event = {"token": reply}
+                    if isinstance(local_action.get("reader"), dict):
+                        event["reader"] = local_action.get("reader")
+                    out = json.dumps(event, ensure_ascii=False).encode("utf-8")
                     try:
                         self.wfile.write(b"data: " + out + b"\n\n")
                         self.wfile.write(b"data: [DONE]\n\n")

@@ -93,6 +93,26 @@ class TestReaderSessionStore(unittest.TestCase):
         self.assertFalse(out.get("ok"))
         self.assertEqual(str(out.get("error", "")), "reader_commit_chunk_mismatch")
 
+    def test_continuous_state_turns_off_on_eof(self) -> None:
+        started = self.store.start_session("sess_d", chunks=["uno"], reset=True)
+        self.assertTrue(started.get("ok"))
+        toggled = self.store.set_continuous("sess_d", True, reason="test")
+        self.assertTrue(toggled.get("ok"))
+        self.assertTrue(toggled.get("continuous_active"))
+
+        nxt = self.store.next_chunk("sess_d")
+        chunk = nxt.get("chunk", {})
+        committed = self.store.commit(
+            "sess_d",
+            chunk_id=str(chunk.get("chunk_id", "")),
+            chunk_index=int(chunk.get("chunk_index", 0)),
+            reason="unit_test",
+        )
+        self.assertTrue(committed.get("ok"))
+        self.assertTrue(committed.get("done"))
+        self.assertFalse(committed.get("continuous_active"))
+        self.assertEqual(str(committed.get("continuous_reason", "")), "eof")
+
 
 class TestReaderHttpEndpoints(unittest.TestCase):
     def setUp(self) -> None:
@@ -220,6 +240,34 @@ class TestReaderHttpEndpoints(unittest.TestCase):
 
         self.assertEqual(int(status.get("cursor", -1)), 1)
         self.assertIsNone(status.get("pending"))
+
+    def test_non_reader_message_interrupts_continuous(self) -> None:
+        code, started = self._request(
+            "POST",
+            "/api/reader/session/start",
+            {"session_id": "interrupt_sess", "chunks": ["uno", "dos"], "reset": True},
+        )
+        self.assertEqual(code, 200)
+        self.assertTrue(started.get("ok"))
+        direct_chat._READER_STORE.set_continuous("interrupt_sess", True, reason="test_interrupt")  # type: ignore
+
+        code, out = self._request(
+            "POST",
+            "/api/chat",
+            {
+                "session_id": "interrupt_sess",
+                "message": "voz off",
+                "allowed_tools": ["tts"],
+                "history": [],
+            },
+        )
+        self.assertEqual(code, 200)
+        self.assertIn("desactiv", str(out.get("reply", "")).lower())
+
+        code, st = self._request("GET", "/api/reader/session?session_id=interrupt_sess")
+        self.assertEqual(code, 200)
+        self.assertFalse(bool(st.get("continuous_active", True)))
+        self.assertEqual(str(st.get("continuous_reason", "")), "reader_user_interrupt")
 
 
 if __name__ == "__main__":

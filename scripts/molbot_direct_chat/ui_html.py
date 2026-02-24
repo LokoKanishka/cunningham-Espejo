@@ -232,6 +232,9 @@ HTML = r"""<!doctype html>
       let voiceEnabled = true;
       let speakingTimer = null;
       let activeStreamController = null;
+      let readerAutoTimer = null;
+      let readerAutoActive = false;
+      let readerAutoInFlight = false;
       let sttPollTimer = null;
       let sttSending = false;
       let sttLastText = "";
@@ -538,6 +541,155 @@ HTML = r"""<!doctype html>
       return { kind: "unknown" };
     }
 
+    function normalizeTextSimple(text) {
+      return String(text || "")
+        .toLowerCase()
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .replace(/\s+/g, " ")
+        .trim();
+    }
+
+    function isReaderControlMessage(text) {
+      const t = normalizeTextSimple(text);
+      if (!t) return false;
+      if (
+        t.includes("ayuda lectura") ||
+        t.includes("help lectura") ||
+        t.includes("biblioteca") ||
+        t.includes("estado lectura") ||
+        t.includes("donde voy") ||
+        t.includes("status lectura") ||
+        t.includes("repetir") ||
+        t.includes("segui") ||
+        t.includes("seguir") ||
+        t.includes("siguiente") ||
+        t.includes("next") ||
+        t.includes("pausa lectura") ||
+        t.includes("pausar lectura") ||
+        t.includes("detener lectura") ||
+        t.includes("parar lectura") ||
+        t.includes("stop lectura")
+      ) {
+        return true;
+      }
+      return /(?:leer|abrir)\s+(?:el\s+)?(?:libro\s+)?\d+\b/.test(t);
+    }
+
+    function clearAttachments() {
+      pendingAttachments = [];
+      attachEl.value = "";
+      attachInfoEl.textContent = "";
+    }
+
+    function bumpSpeakingVisual() {
+      if (!voiceEnabled) return;
+      markSpeaking(true);
+      if (speakingTimer) clearTimeout(speakingTimer);
+      speakingTimer = setTimeout(() => markSpeaking(false), 6000);
+    }
+
+    function stopReaderAuto() {
+      readerAutoActive = false;
+      if (readerAutoTimer) {
+        clearTimeout(readerAutoTimer);
+        readerAutoTimer = null;
+      }
+    }
+
+    function scheduleReaderAuto() {
+      if (!readerAutoActive || readerAutoInFlight) return;
+      if (readerAutoTimer) return;
+      readerAutoTimer = setTimeout(() => {
+        readerAutoTimer = null;
+        runReaderAutoStep();
+      }, 220);
+    }
+
+    function applyReaderMeta(meta) {
+      const auto = !!meta?.auto_continue;
+      readerAutoActive = auto;
+      if (auto) {
+        scheduleReaderAuto();
+      } else {
+        stopReaderAuto();
+      }
+    }
+
+    async function postChatJson(payload, controller) {
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: controller?.signal,
+      });
+      if (!res.ok) {
+        let errCode = "";
+        let errText = `HTTP ${res.status}`;
+        try {
+          const j = await res.json();
+          errCode = String(j?.error || "").trim();
+          errText = errCode ? `${errCode}` : errText;
+        } catch {}
+        if (errCode === "UNKNOWN_MODEL" || errCode === "MISSING_MODEL") {
+          await recoverModelSelection(errCode);
+          return { recovered: true };
+        }
+        throw new Error(errText);
+      }
+      const j = await res.json();
+      return { data: j };
+    }
+
+    async function runReaderAutoStep() {
+      if (!readerAutoActive || readerAutoInFlight) return;
+      if (sendEl.disabled) {
+        scheduleReaderAuto();
+        return;
+      }
+      readerAutoInFlight = true;
+      abortCurrentStream();
+      const controller = new AbortController();
+      activeStreamController = controller;
+      try {
+        const sel = selectedModel();
+        const payload = {
+          message: "seguí",
+          model: sel.model || "openai-codex/gpt-5.1-codex-mini",
+          model_backend: sel.model_backend || "cloud",
+          history,
+          mode: "operativo",
+          session_id: sessionId,
+          allowed_tools: allowedTools(),
+          attachments: [],
+        };
+        const out = await postChatJson(payload, controller);
+        if (out?.recovered) {
+          stopReaderAuto();
+          return;
+        }
+        const reply = String(out?.data?.reply || "").trim();
+        if (reply) {
+          await push("assistant", reply);
+          bumpSpeakingVisual();
+        }
+        applyReaderMeta(out?.data?.reader || {});
+        await saveServerHistory();
+      } catch (err) {
+        if (err?.name !== "AbortError") {
+          await push("assistant", "Error: " + (err?.message || String(err)));
+        }
+        stopReaderAuto();
+      } finally {
+        if (activeStreamController === controller) {
+          activeStreamController = null;
+        }
+        readerAutoInFlight = false;
+        if (readerAutoActive) scheduleReaderAuto();
+        await syncVoiceState();
+      }
+    }
+
     async function saveServerHistory() {
       const sel = selectedModel();
       try {
@@ -588,6 +740,7 @@ HTML = r"""<!doctype html>
 
       const slash = parseSlash(text);
       if (slash?.kind === "new") {
+        stopReaderAuto();
         sessionId = crypto.randomUUID();
         localStorage.setItem(SESSION_KEY, sessionId);
         history = [];
@@ -604,6 +757,11 @@ HTML = r"""<!doctype html>
         await push("assistant", "Comando desconocido. Usá /new /escritorio /lib /rescan /read N /next /repeat /status /help reader");
         inputEl.value = "";
         return;
+      }
+
+      const readerControl = isReaderControlMessage(text);
+      if (!readerControl) {
+        stopReaderAuto();
       }
 
       if (pendingAttachments.length) {
@@ -631,7 +789,18 @@ HTML = r"""<!doctype html>
       };
 
       try {
-        if (true) {
+        if (readerControl) {
+          const out = await postChatJson(payload, controller);
+          if (!out?.recovered) {
+            const reply = String(out?.data?.reply || "").trim();
+            if (reply) {
+              await push("assistant", reply);
+              bumpSpeakingVisual();
+            }
+            applyReaderMeta(out?.data?.reader || {});
+            await saveServerHistory();
+          }
+        } else {
           const res = await fetch("/api/chat/stream", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -658,6 +827,7 @@ HTML = r"""<!doctype html>
           const reader = res.body.getReader();
           const decoder = new TextDecoder();
           let buf = "";
+          let streamReaderMeta = null;
 
           while (true) {
             const { done, value } = await reader.read();
@@ -674,14 +844,16 @@ HTML = r"""<!doctype html>
                 const j = JSON.parse(data);
                 if (j.token) appendAssistantChunk(j.token);
                 if (j.error) appendAssistantChunk(`\nError: ${j.error}`);
+                if (j.reader && typeof j.reader === "object") streamReaderMeta = j.reader;
               } catch {}
             }
           }
-          if (voiceEnabled) {
-            markSpeaking(true);
-            if (speakingTimer) clearTimeout(speakingTimer);
-            speakingTimer = setTimeout(() => markSpeaking(false), 6000);
+          if (streamReaderMeta) {
+            applyReaderMeta(streamReaderMeta);
+          } else {
+            stopReaderAuto();
           }
+          bumpSpeakingVisual();
           await saveServerHistory();
         }
       } catch (err) {
@@ -691,10 +863,9 @@ HTML = r"""<!doctype html>
         if (activeStreamController === controller) {
           activeStreamController = null;
         }
-        pendingAttachments = [];
-        attachEl.value = "";
-        attachInfoEl.textContent = "";
+        clearAttachments();
         sendEl.disabled = false;
+        if (readerAutoActive) scheduleReaderAuto();
         inputEl.focus();
         await syncVoiceState();
       }
@@ -722,6 +893,7 @@ HTML = r"""<!doctype html>
 
     newSessionEl.addEventListener("click", () => sendMessage("/new"));
     modelEl.addEventListener("change", async () => {
+      stopReaderAuto();
       if (!modelExists(modelEl.value)) {
         localStorage.removeItem(MODEL_KEY);
         await refreshModels(true);
@@ -732,6 +904,7 @@ HTML = r"""<!doctype html>
       inputEl.focus();
     });
     clearChatEl.addEventListener("click", async () => {
+      stopReaderAuto();
       history = [];
       draw();
       await saveServerHistory();

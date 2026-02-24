@@ -10,7 +10,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "== verify reader ux dc v0 ==" >&2
+echo "== verify reader ux dc v0.3 ==" >&2
 echo "tmp_dir=${TMP_DIR}" >&2
 
 python3 - "${TMP_DIR}" <<'PY'
@@ -30,15 +30,27 @@ sys.path.insert(0, str(repo_root / "scripts"))
 import openclaw_direct_chat as direct_chat  # noqa: E402
 
 os.environ["DIRECT_CHAT_TTS_DRY_RUN"] = "1"
-# Avoid STT/audio side effects in verifier; this test targets reader UX commands.
+os.environ["DIRECT_CHAT_READER_CHUNK_MAX_CHARS"] = "420"
+# Keep verifier deterministic and local-only.
 direct_chat._sync_stt_with_voice = lambda enabled, session_id="": None  # type: ignore
+direct_chat.Handler._call_model_backend = (  # type: ignore
+    lambda self, backend, payload: {
+        "id": "verify-local-model",
+        "choices": [{"message": {"role": "assistant", "content": "MODELO_OK"}}],
+    }
+)
 
 library_dir = tmp_dir / "Lucy_Library"
 library_dir.mkdir(parents=True, exist_ok=True)
-(library_dir / "lectura_dc.txt").write_text(
-    "Bloque uno para flujo UX.\n\nBloque dos para autocommit por TTS.",
-    encoding="utf-8",
+text = "\n\n".join(
+    [
+        "PARTE UNO. " + "Frase de lectura fluida. " * 28,
+        "PARTE DOS. " + "Contenido largo para segundo bloque. " * 26,
+        "PARTE TRES. " + "Contenido largo para tercer bloque. " * 27,
+        "PARTE CUATRO. " + "Contenido largo para cuarto bloque. " * 25,
+    ]
 )
+(library_dir / "lectura_dc.txt").write_text(text, encoding="utf-8")
 
 state_path = tmp_dir / "reading_sessions.json"
 lock_path = tmp_dir / ".reading_sessions.lock"
@@ -54,28 +66,10 @@ direct_chat._READER_LIBRARY = direct_chat.ReaderLibraryIndex(
     cache_dir=cache_dir,
 )
 
+
 def ensure(cond: bool, msg: str) -> None:
     if not cond:
         raise AssertionError(msg)
-
-
-def parse_sse_text(raw: str) -> str:
-    out = []
-    for part in raw.split("\n\n"):
-        lines = [ln for ln in part.split("\n") if ln.startswith("data: ")]
-        if not lines:
-            continue
-        data = lines[0][6:]
-        if data == "[DONE]":
-            continue
-        try:
-            payload = json.loads(data)
-        except Exception:
-            continue
-        tok = str(payload.get("token", ""))
-        if tok:
-            out.append(tok)
-    return "".join(out).strip()
 
 
 httpd = direct_chat.ThreadingHTTPServer(("127.0.0.1", 0), direct_chat.Handler)
@@ -88,22 +82,24 @@ base = f"http://127.0.0.1:{httpd.server_address[1]}"
 session_id = "verify_ux_dc"
 
 
-def chat_stream(message: str) -> str:
+def post_chat(message: str, allowed_tools=None) -> dict:
     payload = {
         "message": message,
         "session_id": session_id,
-        "allowed_tools": ["tts"],
+        "allowed_tools": allowed_tools or [],
         "history": [],
+        "mode": "operativo",
+        "attachments": [],
     }
     req = Request(
-        base + "/api/chat/stream",
+        base + "/api/chat",
         method="POST",
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers={"Content-Type": "application/json"},
     )
-    with urlopen(req, timeout=8) as resp:
-        body = resp.read().decode("utf-8", errors="replace")
-        return parse_sse_text(body)
+    with urlopen(req, timeout=10) as resp:
+        body = json.loads(resp.read().decode("utf-8") or "{}")
+        return body if isinstance(body, dict) else {}
 
 
 def get_status() -> dict:
@@ -114,38 +110,50 @@ def get_status() -> dict:
 
 
 try:
-    r = chat_stream("voz on")
-    ensure("active" in r.lower() or "activ" in r.lower() or "listo" in r.lower(), f"voz_on_failed reply={r}")
-    print("PASS voz_on")
-
-    r = chat_stream("biblioteca rescan")
-    ensure("biblioteca" in r.lower() or "libros" in r.lower(), f"rescan_failed reply={r}")
+    r = post_chat("biblioteca rescan")
+    ensure("biblioteca" in str(r.get("reply", "")).lower(), f"rescan_failed reply={r}")
     print("PASS biblioteca_rescan")
 
-    r = chat_stream("biblioteca")
-    ensure("1)" in r or "biblioteca" in r.lower(), f"biblioteca_failed reply={r}")
+    r = post_chat("biblioteca")
+    ensure("1)" in str(r.get("reply", "")) or "biblioteca" in str(r.get("reply", "")).lower(), f"biblioteca_failed reply={r}")
     print("PASS biblioteca_list")
 
-    r = chat_stream("leer libro 1")
-    ensure("abrí" in r.lower() or "abri" in r.lower() or "listo" in r.lower(), f"leer_libro_failed reply={r}")
-    print("PASS leer_libro_1")
+    # Continuous start + visible content in the same reply.
+    blocks = []
+    r = post_chat("leer libro 1")
+    reply = str(r.get("reply", ""))
+    ensure("bloque" in reply.lower(), f"leer_libro_no_block reply={reply}")
+    ensure("PARTE" in reply, f"leer_libro_no_text reply={reply[:220]}")
+    ensure(bool(r.get("reader", {}).get("auto_continue", False)), f"leer_libro_not_continuous payload={r}")
+    blocks.append(reply)
+    print("PASS leer_libro_continuous_start")
 
-    r = chat_stream("seguí")
-    ensure("leyendo" in r.lower() or "bloque" in r.lower(), f"segui_failed reply={r}")
+    # Simulate UI auto-loop deterministically via reader auto_continue metadata.
+    loop_guard = 0
+    while bool(r.get("reader", {}).get("auto_continue", False)) and len(blocks) < 3:
+        loop_guard += 1
+        ensure(loop_guard <= 10, "continuous_loop_guard_exceeded")
+        r = post_chat("seguí")
+        reply = str(r.get("reply", ""))
+        ensure("bloque" in reply.lower(), f"auto_next_no_block reply={reply}")
+        ensure(len(reply.strip()) >= 80, f"auto_next_reply_too_short reply={reply}")
+        blocks.append(reply)
 
-    status = {}
-    for _ in range(80):
-        status = get_status()
-        if int(status.get("cursor", 0)) >= 1 and status.get("pending") is None:
-            break
-        time.sleep(0.05)
-    ensure(int(status.get("cursor", 0)) >= 1, f"cursor_not_advanced status={status}")
-    ensure(status.get("pending") is None, f"pending_not_cleared status={status}")
-    print("PASS segui_autocommit")
+    ensure(len(blocks) >= 3, f"continuous_less_than_3_blocks blocks={len(blocks)}")
+    print("PASS continuous_multi_block")
 
-    r = chat_stream("estado lectura")
-    ensure("estado lectura" in r.lower() or "cursor=" in r.lower(), f"estado_failed reply={r}")
-    print("PASS estado_lectura")
+    # Interruption: any non-reader message should stop continuous mode.
+    post_chat("hola")
+    status = get_status()
+    ensure(status.get("ok"), f"status_failed payload={status}")
+    ensure(not bool(status.get("continuous_active", True)), f"interrupt_not_applied status={status}")
+    print("PASS interruption_stops_continuous")
+
+    # Estado should show progress and continuous mode state.
+    r = post_chat("estado lectura")
+    estado = str(r.get("reply", ""))
+    ensure("cursor=" in estado and "continua=" in estado.lower(), f"estado_missing_fields reply={estado}")
+    print("PASS estado_reflects_progress")
 
     print("READER_UX_DC_OK")
 finally:
