@@ -465,6 +465,7 @@ HTML = r"""<!doctype html>
     }
 
     async function push(role, content) {
+      if (shouldHideNoiseLine(content)) return;
       history.push({ role, content });
       history = history.slice(-200);
       draw();
@@ -476,7 +477,13 @@ HTML = r"""<!doctype html>
       draw();
     }
 
+    function shouldHideNoiseLine(text) {
+      const t = String(text || "");
+      return /amara\.org|suscrib|suscr[ií]b|subt[ií]tulos\s+por\s+la\s+comunidad/i.test(t);
+    }
+
     function appendAssistantChunk(chunk) {
+      if (shouldHideNoiseLine(chunk)) return;
       if (!history.length || history[history.length - 1].role !== "assistant") {
         startAssistantMessage();
       }

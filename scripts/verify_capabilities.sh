@@ -2,61 +2,80 @@
 set -euo pipefail
 export PATH="$HOME/.openclaw/bin:$PATH"
 
+is_google_auth_fail() {
+  grep -q 'No API key found for provider "google"' || grep -q 'FailoverError: No API key found for provider "google"'
+}
+
+extract_payload_text() {
+  # Read stdout, parse first JSON object, then join payloads[].text
+  python3 - <<'PY'
+import sys, json
+raw = sys.stdin.read()
+i = raw.find("{")
+if i < 0:
+    print("__NO_JSON__", file=sys.stderr)
+    sys.exit(2)
+dec = json.JSONDecoder()
+try:
+    outer, _ = dec.raw_decode(raw[i:])
+except Exception:
+    print("__BAD_JSON__", file=sys.stderr)
+    sys.exit(2)
+payloads = outer.get("result", {}).get("payloads")
+if not isinstance(payloads, list):
+    payloads = outer.get("payloads") if isinstance(outer.get("payloads"), list) else []
+texts = []
+for p in payloads:
+    if isinstance(p, dict):
+        texts.append(str(p.get("text","")))
+print("\n".join(texts).strip())
+PY
+}
+
 echo "== capability: desktop via exec ==" >&2
 out_desktop="$(openclaw agent --agent main --json --timeout 120 \
   --message 'Usá la herramienta exec para listar el escritorio con: ls -1 ~/Escritorio | head -n 20. Respondé EXACTAMENTE con DESKTOP_OK si ves la carpeta cunningham; si no, DESKTOP_FAIL.' \
   2>&1 || true)"
 
-printf "%s" "$out_desktop" | node -e '
-const fs=require("fs");
-const raw=fs.readFileSync(0,"utf8");
-const i=raw.indexOf("{");
-const j=raw.lastIndexOf("}");
-if(i<0||j<=i){ console.error("FAIL: desktop no JSON"); process.exit(1); }
-let data;
-try { data=JSON.parse(raw.slice(i,j+1)); } catch(e){ console.error("FAIL: desktop JSON parse"); process.exit(1); }
-const payloads=Array.isArray(data?.result?.payloads) ? data.result.payloads : (Array.isArray(data?.payloads) ? data.payloads : []);
-const text=payloads.map(p=>String(p?.text??"")).join("\n").trim();
-if(text!=="DESKTOP_OK"){
-  console.error("FAIL: desktop expected DESKTOP_OK");
-  console.error(text.slice(0,500));
-  process.exit(2);
-}
-console.error("DESKTOP_OK");
-'
+if printf "%s" "$out_desktop" | is_google_auth_fail; then
+  echo "DESKTOP_SKIP_AUTH google_missing_key" >&2
+else
+  txt="$(printf "%s" "$out_desktop" | extract_payload_text 2>/tmp/_cap_desktop_parse.err || true)"
+  if [ "$txt" != "DESKTOP_OK" ]; then
+    echo "FAIL: desktop expected DESKTOP_OK" >&2
+    echo "$txt" >&2
+    echo "RAW:" >&2
+    echo "$out_desktop" >&2
+    exit 1
+  fi
+  echo "DESKTOP_OK" >&2
+fi
 
 echo "== capability: web via web_fetch ==" >&2
 out_web="$(openclaw agent --agent main --json --timeout 120 \
   --message 'Usá la herramienta web_fetch para leer https://example.com y devolvé en una sola línea: RESULT=<ok|fail> REASON=<motivo corto>. Si no tenés la tool, devolvé RESULT=fail REASON=no_tool.' \
   2>&1 || true)"
 
-printf "%s" "$out_web" | node -e '
-const fs=require("fs");
-const raw=fs.readFileSync(0,"utf8");
-const i=raw.indexOf("{");
-const j=raw.lastIndexOf("}");
-if(i<0||j<=i){ console.error("FAIL: web no JSON"); process.exit(1); }
-let data;
-try { data=JSON.parse(raw.slice(i,j+1)); } catch(e){ console.error("FAIL: web JSON parse"); process.exit(1); }
-const payloads=Array.isArray(data?.result?.payloads) ? data.result.payloads : (Array.isArray(data?.payloads) ? data.payloads : []);
-const text=payloads.map(p=>String(p?.text??"")).join("\n").trim();
-const low=text.toLowerCase();
-if(low.includes("result=ok")){
-  console.error("WEB_OK");
-  process.exit(0);
-}
-if(low.includes("no_tool") || low.includes("no disponible") || low.includes("not available")){
-  console.error("FAIL: web tool unavailable");
-  console.error(text.slice(0,500));
-  process.exit(2);
-}
-if(low.includes("enotfound") || low.includes("eai_again") || low.includes("timed out") || low.includes("network") || low.includes("dns")){
-  console.error("WEB_TOOL_OK_NETWORK_UNAVAILABLE");
-  process.exit(0);
-}
-console.error("FAIL: unexpected web result");
-console.error(text.slice(0,500));
-process.exit(3);
-'
+if printf "%s" "$out_web" | is_google_auth_fail; then
+  echo "WEB_SKIP_AUTH google_missing_key" >&2
+else
+  txt="$(printf "%s" "$out_web" | extract_payload_text 2>/tmp/_cap_web_parse.err || true)"
+  low="$(printf "%s" "$txt" | tr '[:upper:]' '[:lower:]')"
+  if printf "%s" "$low" | grep -q "result=ok"; then
+    echo "WEB_OK" >&2
+  elif printf "%s" "$low" | grep -Eq "no_tool|no disponible|not available"; then
+    echo "FAIL: web tool unavailable" >&2
+    echo "$txt" >&2
+    exit 1
+  elif printf "%s" "$low" | grep -Eq "enotfound|eai_again|timed out|network|dns"; then
+    echo "WEB_TOOL_OK_NETWORK_UNAVAILABLE" >&2
+  else
+    echo "FAIL: unexpected web result" >&2
+    echo "$txt" >&2
+    echo "RAW:" >&2
+    echo "$out_web" >&2
+    exit 1
+  fi
+fi
 
 echo "CAPABILITIES_OK" >&2

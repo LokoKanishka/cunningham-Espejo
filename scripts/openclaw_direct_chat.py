@@ -5326,21 +5326,48 @@ class Handler(BaseHTTPRequestHandler):
         try:
             payload = self._parse_payload()
             message = str(payload.get("message", "")).strip()
+            session_id = _safe_session_id(str(payload.get("session_id", "default")))
+            allowed_tools = _extract_allowed_tools(payload)
+            # allow_local_action_on_unknown_model
+
             model = str(payload.get("model", "openai-codex/gpt-5.1-codex-mini")).strip()
             requested_backend = str(payload.get("model_backend", "")).strip().lower()
             try:
                 model_resolution = _resolve_model_request(model=model, model_backend=requested_backend)
             except _ModelSelectionError as e:
+                # If the selected model is unknown/missing, still allow local actions.
+                local_action = _maybe_handle_local_action(message, allowed_tools, session_id=session_id)
+                if local_action is not None:
+                    if self.path == "/api/chat/stream":
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/event-stream")
+                        self.send_header("Cache-Control", "no-cache")
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                        reply = str(local_action.get("reply", ""))
+                        if (not _is_voice_control_command(message)) and (not bool(local_action.get("no_auto_tts"))):
+                            _maybe_speak_reply(reply, allowed_tools)
+                        out = json.dumps({"token": reply}, ensure_ascii=False).encode("utf-8")
+                        try:
+                            self.wfile.write(b"data: " + out + b"\n\n")
+                            self.wfile.write(b"data: [DONE]\n\n")
+                            self.wfile.flush()
+                        except BrokenPipeError:
+                            return
+                        self.close_connection = True
+                        return
+                    if (not _is_voice_control_command(message)) and (not bool(local_action.get("no_auto_tts"))):
+                        _maybe_speak_reply(str(local_action.get("reply", "")), allowed_tools)
+                    self._json(200, local_action)
+                    return
                 self._json(400, e.as_payload())
                 return
             model = str(model_resolution.get("requested_model", "")).strip() or model
             routed_model = str(model_resolution.get("resolved_model", "")).strip() or model
             resolved_backend = str(model_resolution.get("resolved_backend", "")).strip() or "cloud"
             history = payload.get("history", [])
-            session_id = _safe_session_id(str(payload.get("session_id", "default")))
             mode = str(payload.get("mode", "operativo"))
             attachments = payload.get("attachments", [])
-            allowed_tools = _extract_allowed_tools(payload)
             # Local-only tools that should not be advertised to the upstream model.
             allowed_tools_for_prompt = set(allowed_tools)
             allowed_tools_for_prompt.discard("web_search")

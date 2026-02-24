@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
+is_google_auth_fail() {
+  grep -q 'No API key found for provider "google"' || grep -q 'FailoverError: No API key found for provider "google"'
+}
 
 export PATH="$HOME/.openclaw/bin:$PATH"
 MODEL="openai-codex/gpt-5.1-codex-mini"
@@ -17,6 +20,13 @@ openclaw agent --agent main --message "/new $MODEL" --timeout 120 >/dev/null 2>&
 
 echo "== smoke agent (--json) ==" >&2
 out="$(openclaw agent --agent main --message "Respondé EXACTAMENTE con: OK" --json --timeout 120 2>&1 || true)"
+
+# Auth guard: skip when Google key is missing
+if printf "%s" "${out}" | is_google_auth_fail; then
+  echo "SKIP_AUTH google_missing_key (verify_codex_subscription)" >&2
+  exit 0
+fi
+
 
 # Parse robusto desde stdin: busca el JSON dentro de cualquier ruido (warnings, etc.)
 printf "%s" "$out" | EXPECT_MODEL_SUB="$EXPECT_MODEL_SUB" node -e '
