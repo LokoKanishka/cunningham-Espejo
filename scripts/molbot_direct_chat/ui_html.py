@@ -361,8 +361,40 @@ HTML = r"""<!doctype html>
       }
     }
 
-    let sttLastSendAtMs = 0;
-    const STT_MIN_SEND_INTERVAL_MS = 1500;
+	    let sttLastSendAtMs = 0;
+	    const STT_MIN_SEND_INTERVAL_MS = 1500;
+	    let sttLastBargeAtMs = 0;
+	    const STT_BARGE_COOLDOWN_MS = 1200;
+
+	    function isBargeInText(text) {
+	      const t = norm(text).toLowerCase();
+	      if (!t) return false;
+	      if (
+	        t === "detenete" ||
+	        t === "detente" ||
+	        t === "pausa" ||
+	        t === "pausa lectura" ||
+	        t === "pausar lectura" ||
+	        t === "detener lectura" ||
+	        t === "parar lectura" ||
+	        t === "basta" ||
+	        t === "stop" ||
+	        t === "stop lectura"
+	      ) return true;
+	      return /^(detenete|detente|pausa|pausa lectura|pausar lectura|detener lectura|parar lectura|basta|stop)\b/i.test(t);
+	    }
+
+	    async function applyVoiceBargeIn(text) {
+	      const now = Date.now();
+	      if ((now - sttLastBargeAtMs) < STT_BARGE_COOLDOWN_MS) return;
+	      sttLastBargeAtMs = now;
+	      stopReaderAuto();
+	      abortCurrentStream();
+	      await pauseReaderContinuousSilently();
+	      await push("user", text);
+	      await push("assistant", "Pausado por voz.");
+	      await saveServerHistory();
+	    }
 
     function shouldAcceptSttText(text) {
       const t = (text || "").trim();
@@ -374,22 +406,33 @@ HTML = r"""<!doctype html>
       return true;
     }
 
-    async function pollSttOnce() {
-      if (!voiceEnabled) return;
-      if (sendEl.disabled || sttSending) return;
-      try {
-        const q = new URLSearchParams({ session_id: sessionId, limit: "2" });
-        const r = await fetch(`/api/stt/poll?${q.toString()}`);
-        if (!r.ok) return;
-        const j = await r.json();
+	    async function pollSttOnce() {
+	      if (!voiceEnabled) return;
+	      if (sttSending) return;
+	      try {
+	        const q = new URLSearchParams({ session_id: sessionId, limit: "2" });
+	        const r = await fetch(`/api/stt/poll?${q.toString()}`);
+	        if (!r.ok) return;
+	        const j = await r.json();
         const items = Array.isArray(j?.items) ? j.items : [];
-        for (const item of items) {
-          const text = String(item?.text || "").trim();
-          if (!shouldAcceptSttText(text)) continue;
-          const nowSend = Date.now();
-          if ((nowSend - sttLastSendAtMs) < STT_MIN_SEND_INTERVAL_MS) break;
-          sttLastSendAtMs = nowSend;
-          sttSending = true;
+	        for (const item of items) {
+	          const text = String(item?.text || "").trim();
+	          if (!shouldAcceptSttText(text)) continue;
+	          const barge = isBargeInText(text);
+	          if (barge) {
+	            sttSending = true;
+	            try {
+	              await applyVoiceBargeIn(text);
+	            } finally {
+	              sttSending = false;
+	            }
+	            break;
+	          }
+	          if (sendEl.disabled) continue;
+	          const nowSend = Date.now();
+	          if ((nowSend - sttLastSendAtMs) < STT_MIN_SEND_INTERVAL_MS) break;
+	          sttLastSendAtMs = nowSend;
+	          sttSending = true;
           try {
             await sendMessage(text);
           } finally {

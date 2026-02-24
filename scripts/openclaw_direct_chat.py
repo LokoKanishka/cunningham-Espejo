@@ -571,6 +571,32 @@ def _int_env(name: str, default: int) -> int:
         return int(default)
 
 
+def _is_barge_in_phrase(text: str) -> bool:
+    n = _normalize_text(text)
+    if not n:
+        return False
+    if n in (
+        "detenete",
+        "detente",
+        "pausa",
+        "pausa lectura",
+        "pausar lectura",
+        "detener lectura",
+        "parar lectura",
+        "basta",
+        "stop",
+        "stop lectura",
+    ):
+        return True
+    return bool(
+        re.search(
+            r"^(detenete|detente|pausa|pausa lectura|pausar lectura|detener lectura|parar lectura|basta|stop)\b",
+            n,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
 class STTManager:
     _RETRY_DELAYS_SEC = (2.0, 5.0, 10.0)
 
@@ -622,7 +648,9 @@ class STTManager:
             enabled = bool(self._enabled)
         if not enabled:
             return False
-        return not _tts_is_playing()
+        if _tts_is_playing():
+            return _env_flag("DIRECT_CHAT_STT_ALLOW_DURING_TTS", True)
+        return True
 
     def _build_worker_locked(self):
         from molbot_direct_chat import stt_local
@@ -739,6 +767,7 @@ class STTManager:
                 return []
 
         out: list[dict] = []
+        tts_playing = _tts_is_playing()
         for _ in range(limit):
             try:
                 item = self._queue.get_nowait()
@@ -747,6 +776,8 @@ class STTManager:
             if isinstance(item, dict):
                 text = str(item.get("text", "")).strip()
                 if not text:
+                    continue
+                if tts_playing and (not _is_barge_in_phrase(text)):
                     continue
                 out.append({"text": text, "ts": float(item.get("ts", time.time()))})
         return out

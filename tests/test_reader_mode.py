@@ -398,6 +398,5 @@ class TestReaderHttpEndpoints(unittest.TestCase):
         self.assertIn("tts_health_timeout_sec", out)
         self.assertIn("tts_available", out)
 
-
 if __name__ == "__main__":
     unittest.main()
