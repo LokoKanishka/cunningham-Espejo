@@ -170,13 +170,31 @@ def _bargein_mark(detail: str, keyword: str = "") -> None:
             _BARGEIN_STATS["count"] = int(_BARGEIN_STATS.get("count", 0) or 0) + 1
 
 
-def _request_tts_stop(reason: str = "barge_in", keyword: str = "", detail: str = "") -> None:
+def _request_tts_stop(
+    reason: str = "barge_in",
+    keyword: str = "",
+    detail: str = "",
+    session_id: str = "",
+    offset_hint: int | None = None,
+    playback_ms: float | None = None,
+) -> None:
     _bargein_mark(detail or "triggered", keyword=keyword)
     _tts_touch()
+    stream_id = 0
     with _TTS_STREAM_LOCK:
+        stream_id = int(_TTS_PLAYING_STREAM_ID or 0)
         _TTS_STOP_EVENT.set()
+    _reader_mark_barge_in_from_stream(
+        stream_id=stream_id,
+        reason=str(reason),
+        keyword=keyword,
+        detail=detail or "triggered",
+        session_id=session_id,
+        offset_hint=offset_hint,
+        playback_ms=playback_ms,
+    )
     _stop_playback_process()
-    _set_voice_status(_TTS_PLAYING_STREAM_ID, False, str(reason))
+    _set_voice_status(stream_id, False, str(reason))
 
 
 def _reader_autocommit_register(
@@ -184,6 +202,8 @@ def _reader_autocommit_register(
     session_id: str,
     chunk_id: str,
     chunk_index: int,
+    text_len: int = 0,
+    start_offset_chars: int = 0,
 ) -> None:
     sid = _safe_session_id(session_id)
     cid = str(chunk_id or "").strip()
@@ -195,7 +215,49 @@ def _reader_autocommit_register(
             "chunk_id": cid,
             "chunk_index": int(chunk_index),
             "created_mono": time.monotonic(),
+            "text_len": max(0, int(text_len)),
+            "start_offset_chars": max(0, int(start_offset_chars)),
         }
+
+
+def _reader_autocommit_peek(stream_id: int) -> dict | None:
+    if stream_id <= 0:
+        return None
+    with _READER_AUTOCOMMIT_LOCK:
+        pending = _READER_AUTOCOMMIT_BY_STREAM.get(int(stream_id))
+        return dict(pending) if isinstance(pending, dict) else None
+
+
+def _reader_mark_barge_in_from_stream(
+    stream_id: int,
+    reason: str,
+    detail: str,
+    keyword: str = "",
+    session_id: str = "",
+    offset_hint: int | None = None,
+    playback_ms: float | None = None,
+) -> None:
+    sid = _safe_session_id(session_id) if session_id else ""
+    pending = _reader_autocommit_peek(stream_id)
+    if (not sid) and isinstance(pending, dict):
+        sid = _safe_session_id(str(pending.get("session_id", "")))
+    if not sid:
+        return
+    pm = playback_ms
+    if pm is None and isinstance(pending, dict):
+        created_mono = float(pending.get("created_mono", 0.0) or 0.0)
+        if created_mono > 0.0:
+            pm = max(0.0, (time.monotonic() - created_mono) * 1000.0)
+    try:
+        _READER_STORE.mark_barge_in(
+            sid,
+            detail=str(detail or reason),
+            keyword=keyword,
+            offset_hint=offset_hint,
+            playback_ms=pm,
+        )
+    except Exception:
+        return
 
 
 def _reader_autocommit_finalize(stream_id: int, ok: bool | None) -> None:
@@ -3318,14 +3380,121 @@ class ReaderSessionStore:
     def _pending_view(pending: dict | None) -> dict | None:
         if not isinstance(pending, dict):
             return None
+        raw_text = str(pending.get("text", ""))
+        offset_chars = int(pending.get("offset_chars", 0) or 0)
+        if offset_chars < 0:
+            offset_chars = 0
+        if offset_chars > len(raw_text):
+            offset_chars = len(raw_text)
+        text_view = raw_text[offset_chars:] if raw_text else ""
         return {
             "chunk_index": int(pending.get("chunk_index", 0) or 0),
             "chunk_id": str(pending.get("chunk_id", "")),
-            "text": str(pending.get("text", "")),
+            "text": text_view,
+            "offset_chars": offset_chars,
+            "offset_quality": str(pending.get("offset_quality", "start") or "start"),
+            "last_snippet": str(pending.get("last_snippet", "")),
             "deliveries": int(pending.get("deliveries", 0) or 0),
             "last_delivery_ts": float(pending.get("last_delivery_ts", 0.0) or 0.0),
             "last_barge_in_ts": float(pending.get("last_barge_in_ts", 0.0) or 0.0),
         }
+
+    @staticmethod
+    def _bookmark_view(bookmark: dict | None) -> dict | None:
+        if not isinstance(bookmark, dict):
+            return None
+        return {
+            "chunk_index": int(bookmark.get("chunk_index", 0) or 0),
+            "chunk_id": str(bookmark.get("chunk_id", "")),
+            "offset_chars": int(bookmark.get("offset_chars", 0) or 0),
+            "quality": str(bookmark.get("quality", "unknown") or "unknown"),
+            "last_snippet": str(bookmark.get("last_snippet", "")),
+            "updated_ts": float(bookmark.get("updated_ts", 0.0) or 0.0),
+        }
+
+    @staticmethod
+    def _snippet_around(text: str, offset_chars: int, before: int = 40, after: int = 80) -> str:
+        src = str(text or "")
+        if not src:
+            return ""
+        off = max(0, min(int(offset_chars), len(src)))
+        start = max(0, off - max(0, int(before)))
+        end = min(len(src), off + max(1, int(after)))
+        return src[start:end].strip()
+
+    @classmethod
+    def _bookmark_from_pending(cls, pending: dict | None, now: float, quality_fallback: str = "unknown") -> dict | None:
+        if not isinstance(pending, dict):
+            return None
+        text = str(pending.get("text", ""))
+        offset = int(pending.get("offset_chars", 0) or 0)
+        if offset < 0:
+            offset = 0
+        if offset > len(text):
+            offset = len(text)
+        quality = str(pending.get("offset_quality", quality_fallback) or quality_fallback)
+        snippet = str(pending.get("last_snippet", "")).strip() or cls._snippet_around(text, offset)
+        return {
+            "chunk_index": int(pending.get("chunk_index", 0) or 0),
+            "chunk_id": str(pending.get("chunk_id", "")),
+            "offset_chars": offset,
+            "quality": quality[:24],
+            "last_snippet": snippet[:220],
+            "updated_ts": float(now),
+        }
+
+    @classmethod
+    def _set_pending_offset(cls, pending: dict, offset_chars: int, now: float, quality: str) -> None:
+        text = str(pending.get("text", ""))
+        off = max(0, min(int(offset_chars), len(text)))
+        pending["offset_chars"] = off
+        pending["offset_quality"] = str(quality or "unknown")[:24]
+        pending["offset_updated_ts"] = float(now)
+        pending["last_snippet"] = cls._snippet_around(text, off)[:220]
+
+    @staticmethod
+    def _rewind_sentence_offset(text: str, offset_chars: int) -> int:
+        src = str(text or "")
+        if not src:
+            return 0
+        off = max(0, min(int(offset_chars), len(src)))
+        if off <= 0:
+            return 0
+        starts = [0]
+        for m in re.finditer(r"[.!?]\s+", src):
+            starts.append(m.end())
+        starts = sorted(set(starts))
+        prev = 0
+        curr = 0
+        for st in starts:
+            if st <= off:
+                prev = curr
+                curr = st
+            else:
+                break
+        return max(0, min(prev, len(src)))
+
+    @staticmethod
+    def _rewind_paragraph_offset(text: str, offset_chars: int) -> int:
+        src = str(text or "")
+        if not src:
+            return 0
+        off = max(0, min(int(offset_chars), len(src)))
+        if off <= 0:
+            return 0
+        starts = [0]
+        for m in re.finditer(r"\n\s*\n", src):
+            starts.append(m.end())
+        starts = sorted(set(starts))
+        prev = 0
+        curr = 0
+        for st in starts:
+            if st <= off:
+                prev = curr
+                curr = st
+            else:
+                break
+        return max(0, min(prev, len(src)))
 
     def _session_view(self, session_id: str, session: dict, include_chunks: bool = False) -> dict:
         chunks = session.get("chunks")
@@ -3334,6 +3503,10 @@ class ReaderSessionStore:
         cursor = int(session.get("cursor", 0) or 0)
         total = len(chunks)
         pending = self._pending_view(session.get("pending"))
+        bookmark_raw = session.get("bookmark")
+        if not isinstance(bookmark_raw, dict):
+            bookmark_raw = self._bookmark_from_pending(session.get("pending"), now=float(time.time()), quality_fallback="pending")
+        bookmark = self._bookmark_view(bookmark_raw)
         payload = {
             "ok": True,
             "exists": True,
@@ -3343,10 +3516,12 @@ class ReaderSessionStore:
             "done": bool(cursor >= total and pending is None),
             "has_pending": pending is not None,
             "pending": pending,
+            "bookmark": bookmark,
             "barge_in_count": int(session.get("barge_in_count", 0) or 0),
             "last_barge_in_detail": str(session.get("last_barge_in_detail", "")),
             "last_barge_in_ts": float(session.get("last_barge_in_ts", 0.0) or 0.0),
             "last_event": str(session.get("last_event", "")),
+            "reader_state": str(session.get("reader_state", "paused") or "paused"),
             "updated_ts": float(session.get("updated_ts", 0.0) or 0.0),
             "created_ts": float(session.get("created_ts", 0.0) or 0.0),
             "last_commit_ts": float(session.get("last_commit_ts", 0.0) or 0.0),
@@ -3448,6 +3623,7 @@ class ReaderSessionStore:
                 "chunks": normalized_chunks,
                 "cursor": 0,
                 "pending": None,
+                "bookmark": None,
                 "continuous_active": False,
                 "continuous_enabled": False,
                 "continuous_reason": "session_started",
@@ -3459,6 +3635,7 @@ class ReaderSessionStore:
                 "last_barge_in_detail": "",
                 "last_barge_in_ts": 0.0,
                 "last_event": "session_started",
+                "reader_state": "paused",
                 "last_commit_ts": 0.0,
                 "created_ts": now,
                 "updated_ts": now,
@@ -3516,6 +3693,14 @@ class ReaderSessionStore:
                 deliveries = int(pending.get("deliveries", 0) or 0) + 1
                 pending["deliveries"] = deliveries
                 pending["last_delivery_ts"] = now
+                if "offset_chars" not in pending:
+                    pending["offset_chars"] = 0
+                if "offset_quality" not in pending:
+                    pending["offset_quality"] = "start"
+                if "last_snippet" not in pending:
+                    pending["last_snippet"] = self._snippet_around(str(pending.get("text", "")), int(pending.get("offset_chars", 0) or 0))
+                sess["bookmark"] = self._bookmark_from_pending(pending, now=now, quality_fallback="pending")
+                sess["reader_state"] = "reading"
                 _touch_delivery_window()
                 sess["updated_ts"] = now
                 sess["last_event"] = "next_replay"
@@ -3537,11 +3722,16 @@ class ReaderSessionStore:
                 "chunk_index": cursor,
                 "chunk_id": chunk_id[:80],
                 "text": chunk_text[:8000],
+                "offset_chars": 0,
+                "offset_quality": "start",
+                "last_snippet": self._snippet_around(chunk_text[:8000], 0),
                 "deliveries": 1,
                 "last_delivery_ts": now,
                 "last_barge_in_ts": 0.0,
             }
             sess["pending"] = pending
+            sess["bookmark"] = self._bookmark_from_pending(pending, now=now, quality_fallback="start")
+            sess["reader_state"] = "reading"
             _touch_delivery_window()
             sess["updated_ts"] = now
             sess["last_event"] = "next"
@@ -3588,6 +3778,7 @@ class ReaderSessionStore:
             cursor = max(0, int(sess.get("cursor", 0) or 0))
             sess["cursor"] = max(cursor, got_index + 1)
             sess["pending"] = None
+            sess["bookmark"] = None
             sess["last_commit_ts"] = now
             sess["updated_ts"] = now
             sess["last_event"] = "commit"
@@ -3598,6 +3789,11 @@ class ReaderSessionStore:
                 sess["continuous_enabled"] = False
                 sess["continuous_reason"] = "eof"
                 sess["continuous_updated_ts"] = now
+                sess["reader_state"] = "paused"
+            elif bool(sess.get("continuous_enabled", False)):
+                sess["reader_state"] = "reading"
+            else:
+                sess["reader_state"] = "paused"
             if reason:
                 sess["last_commit_reason"] = str(reason)[:120]
             out = self._session_view(sid, sess, include_chunks=False)
@@ -3608,7 +3804,14 @@ class ReaderSessionStore:
 
         return self._with_state(True, _write)
 
-    def mark_barge_in(self, session_id: str, detail: str = "", keyword: str = "") -> dict:
+    def mark_barge_in(
+        self,
+        session_id: str,
+        detail: str = "",
+        keyword: str = "",
+        offset_hint: int | None = None,
+        playback_ms: float | None = None,
+    ) -> dict:
         sid = _safe_session_id(session_id)
         detail_clean = str(detail or "barge_in_triggered").strip() or "barge_in_triggered"
         keyword_clean = str(keyword or "").strip()
@@ -3632,12 +3835,39 @@ class ReaderSessionStore:
                 sess["last_barge_in_keyword"] = keyword_clean[:80]
             pending["last_barge_in_ts"] = now
             pending["deliveries"] = int(pending.get("deliveries", 0) or 0)
+            pending_text = str(pending.get("text", ""))
+            text_len = len(pending_text)
+            offset = int(pending.get("offset_chars", 0) or 0)
+            quality = "approx"
+            if offset_hint is not None:
+                try:
+                    offset = int(offset_hint)
+                    quality = "hint"
+                except Exception:
+                    offset = int(pending.get("offset_chars", 0) or 0)
+            elif playback_ms is not None:
+                cps = max(4.0, float(os.environ.get("DIRECT_CHAT_READER_APPROX_CHARS_PER_SEC", "16")))
+                offset = int((max(0.0, float(playback_ms)) / 1000.0) * cps)
+                quality = "playback_ms"
+            else:
+                last_delivery_ts = float(pending.get("last_delivery_ts", 0.0) or 0.0)
+                if last_delivery_ts > 0.0:
+                    cps = max(4.0, float(os.environ.get("DIRECT_CHAT_READER_APPROX_CHARS_PER_SEC", "16")))
+                    elapsed = max(0.0, now - last_delivery_ts)
+                    offset = int(elapsed * cps)
+            if text_len > 0:
+                offset = max(0, min(offset, text_len))
+            else:
+                offset = 0
+            self._set_pending_offset(pending, offset_chars=offset, now=now, quality=quality)
+            sess["bookmark"] = self._bookmark_from_pending(pending, now=now, quality_fallback=quality)
             sess["updated_ts"] = now
             sess["last_event"] = "barge_in"
             sess["continuous_active"] = False
             sess["continuous_enabled"] = False
             sess["continuous_reason"] = "barge_in"
             sess["continuous_updated_ts"] = now
+            sess["reader_state"] = "commenting"
             out = self._session_view(sid, sess, include_chunks=False)
             out["interrupted"] = True
             out["chunk"] = self._pending_view(pending)
@@ -3661,8 +3891,170 @@ class ReaderSessionStore:
             sess["continuous_updated_ts"] = now
             sess["updated_ts"] = now
             sess["last_event"] = "continuous_on" if active else "continuous_off"
+            if active:
+                sess["reader_state"] = "reading"
+            elif str(sess.get("reader_state", "")) == "reading":
+                sess["reader_state"] = "paused"
             out = self._session_view(sid, sess, include_chunks=False)
             out["continuous_changed"] = True
+            return out
+
+        return self._with_state(True, _write)
+
+    def set_reader_state(self, session_id: str, state: str, reason: str = "") -> dict:
+        sid = _safe_session_id(session_id)
+        wanted = str(state or "").strip().lower()
+        if wanted not in ("reading", "paused", "commenting"):
+            wanted = "paused"
+        reason_clean = str(reason or "").strip()[:120]
+
+        def _write(state_obj: dict) -> dict:
+            sessions = state_obj.get("sessions", {})
+            if not isinstance(sessions, dict) or sid not in sessions or not isinstance(sessions.get(sid), dict):
+                return self._session_missing(sid)
+            sess = sessions[sid]
+            now = float(time.time())
+            sess["reader_state"] = wanted
+            if reason_clean:
+                sess["reader_state_reason"] = reason_clean
+            sess["updated_ts"] = now
+            sess["last_event"] = f"reader_state_{wanted}"
+            out = self._session_view(sid, sess, include_chunks=False)
+            out["reader_state_changed"] = True
+            return out
+
+        return self._with_state(True, _write)
+
+    def seek_phrase(self, session_id: str, phrase: str) -> dict:
+        sid = _safe_session_id(session_id)
+        needle = str(phrase or "").strip()
+
+        def _write(state_obj: dict) -> dict:
+            sessions = state_obj.get("sessions", {})
+            if not isinstance(sessions, dict) or sid not in sessions or not isinstance(sessions.get(sid), dict):
+                return self._session_missing(sid)
+            sess = sessions[sid]
+            now = float(time.time())
+            chunks = sess.get("chunks")
+            if not isinstance(chunks, list):
+                chunks = []
+                sess["chunks"] = chunks
+            pending = sess.get("pending") if isinstance(sess.get("pending"), dict) else None
+            cursor = max(0, int(sess.get("cursor", 0) or 0))
+            if pending is None:
+                base_idx = min(max(0, cursor - 1), len(chunks) - 1) if chunks else -1
+                if base_idx < 0:
+                    out = self._session_view(sid, sess, include_chunks=False)
+                    out["ok"] = False
+                    out["error"] = "reader_no_chunk_for_seek"
+                    return out
+                raw = chunks[base_idx] if isinstance(chunks[base_idx], dict) else {}
+                pending = {
+                    "chunk_index": base_idx,
+                    "chunk_id": str(raw.get("id", f"chunk_{base_idx + 1:03d}"))[:80],
+                    "text": str(raw.get("text", ""))[:8000],
+                    "offset_chars": 0,
+                    "offset_quality": "start",
+                    "last_snippet": "",
+                    "deliveries": 0,
+                    "last_delivery_ts": 0.0,
+                    "last_barge_in_ts": 0.0,
+                }
+                sess["pending"] = pending
+            ptext = str(pending.get("text", ""))
+            idx = ptext.lower().find(needle.lower()) if needle else -1
+            if idx < 0:
+                next_idx = int(pending.get("chunk_index", 0) or 0) + 1
+                if 0 <= next_idx < len(chunks):
+                    raw_n = chunks[next_idx] if isinstance(chunks[next_idx], dict) else {}
+                    text_n = str(raw_n.get("text", ""))
+                    idx_n = text_n.lower().find(needle.lower()) if needle else -1
+                    if idx_n >= 0:
+                        pending = {
+                            "chunk_index": next_idx,
+                            "chunk_id": str(raw_n.get("id", f"chunk_{next_idx + 1:03d}"))[:80],
+                            "text": text_n[:8000],
+                            "offset_chars": 0,
+                            "offset_quality": "start",
+                            "last_snippet": "",
+                            "deliveries": 0,
+                            "last_delivery_ts": 0.0,
+                            "last_barge_in_ts": 0.0,
+                        }
+                        sess["pending"] = pending
+                        ptext = str(pending.get("text", ""))
+                        idx = idx_n
+            if idx < 0:
+                out = self._session_view(sid, sess, include_chunks=False)
+                out["ok"] = False
+                out["error"] = "reader_phrase_not_found"
+                out["phrase"] = needle
+                return out
+            self._set_pending_offset(pending, offset_chars=idx, now=now, quality="phrase")
+            sess["bookmark"] = self._bookmark_from_pending(pending, now=now, quality_fallback="phrase")
+            sess["reader_state"] = "reading"
+            sess["updated_ts"] = now
+            sess["last_event"] = "reader_seek_phrase"
+            out = self._session_view(sid, sess, include_chunks=False)
+            out["seeked"] = True
+            out["chunk"] = self._pending_view(pending)
+            return out
+
+        return self._with_state(True, _write)
+
+    def rewind(self, session_id: str, unit: str = "sentence") -> dict:
+        sid = _safe_session_id(session_id)
+        mode = "paragraph" if str(unit or "").strip().lower().startswith("para") else "sentence"
+
+        def _write(state_obj: dict) -> dict:
+            sessions = state_obj.get("sessions", {})
+            if not isinstance(sessions, dict) or sid not in sessions or not isinstance(sessions.get(sid), dict):
+                return self._session_missing(sid)
+            sess = sessions[sid]
+            now = float(time.time())
+            chunks = sess.get("chunks")
+            if not isinstance(chunks, list):
+                chunks = []
+                sess["chunks"] = chunks
+            pending = sess.get("pending") if isinstance(sess.get("pending"), dict) else None
+            cursor = max(0, int(sess.get("cursor", 0) or 0))
+            if pending is None:
+                idx = min(max(0, cursor - 1), len(chunks) - 1) if chunks else -1
+                if idx < 0:
+                    out = self._session_view(sid, sess, include_chunks=False)
+                    out["ok"] = False
+                    out["error"] = "reader_no_chunk_for_rewind"
+                    return out
+                raw = chunks[idx] if isinstance(chunks[idx], dict) else {}
+                pending = {
+                    "chunk_index": idx,
+                    "chunk_id": str(raw.get("id", f"chunk_{idx + 1:03d}"))[:80],
+                    "text": str(raw.get("text", ""))[:8000],
+                    "offset_chars": 0,
+                    "offset_quality": "start",
+                    "last_snippet": "",
+                    "deliveries": 0,
+                    "last_delivery_ts": 0.0,
+                    "last_barge_in_ts": 0.0,
+                }
+                sess["pending"] = pending
+            ptext = str(pending.get("text", ""))
+            cur = int(pending.get("offset_chars", 0) or 0)
+            if mode == "paragraph":
+                target = self._rewind_paragraph_offset(ptext, cur)
+                quality = "rewind_paragraph"
+            else:
+                target = self._rewind_sentence_offset(ptext, cur)
+                quality = "rewind_sentence"
+            self._set_pending_offset(pending, offset_chars=target, now=now, quality=quality)
+            sess["bookmark"] = self._bookmark_from_pending(pending, now=now, quality_fallback=quality)
+            sess["reader_state"] = "reading"
+            sess["updated_ts"] = now
+            sess["last_event"] = "reader_rewind"
+            out = self._session_view(sid, sess, include_chunks=False)
+            out["rewound"] = True
+            out["rewind_unit"] = mode
+            out["chunk"] = self._pending_view(pending)
             return out
 
         return self._with_state(True, _write)
@@ -4067,10 +4459,18 @@ def _is_reader_control_command(message: str) -> bool:
             "repeti",
             "segui",
             "seguir",
+            "seguir leyendo",
             "siguiente",
             "next",
+            "continuar",
+            "continuar desde",
+            "volver una frase",
+            "volver un parrafo",
+            "volver un párrafo",
             "continuo on",
             "continuo off",
+            "detenete",
+            "detente",
             "pausa lectura",
             "pausar lectura",
             "detener lectura",
@@ -4119,6 +4519,7 @@ def _reader_meta(
         "continuous_active": bool(st.get("continuous_active", False)),
         "continuous_enabled": bool(st.get("continuous_enabled", st.get("continuous_active", False))),
         "continuous_reason": str(st.get("continuous_reason", "")),
+        "reader_state": str(st.get("reader_state", "paused") or "paused"),
         "auto_continue": bool(auto_continue),
         "pacing_min_delay_ms": int(pacing_cfg.get("min_delay_ms", 1500) or 1500),
         "pacing_burst_window_ms": int(pacing_cfg.get("burst_window_ms", 10000) or 10000),
@@ -4131,7 +4532,53 @@ def _reader_meta(
     if isinstance(chunk, dict):
         out["chunk_index"] = int(chunk.get("chunk_index", 0) or 0)
         out["chunk_id"] = str(chunk.get("chunk_id", ""))
+        out["offset_chars"] = int(chunk.get("offset_chars", 0) or 0)
+    if isinstance(st.get("bookmark"), dict):
+        out["bookmark"] = {
+            "chunk_index": int(st["bookmark"].get("chunk_index", 0) or 0),
+            "chunk_id": str(st["bookmark"].get("chunk_id", "")),
+            "offset_chars": int(st["bookmark"].get("offset_chars", 0) or 0),
+            "quality": str(st["bookmark"].get("quality", "unknown") or "unknown"),
+            "last_snippet": str(st["bookmark"].get("last_snippet", "")),
+        }
     return out
+
+
+def _reader_emit_chunk(
+    session_id: str,
+    chunk: dict,
+    allowed_tools: set[str],
+    commit_reason: str,
+) -> tuple[bool, int, bool]:
+    chunk_text = str(chunk.get("text", "")).strip()
+    chunk_id = str(chunk.get("chunk_id", "")).strip()
+    chunk_index = int(chunk.get("chunk_index", 0) or 0)
+    start_offset = int(chunk.get("offset_chars", 0) or 0)
+    tts_gate_required = ("tts" in allowed_tools) and _voice_enabled() and bool(chunk_text)
+    tts_stream_id = 0
+    committed = False
+    if tts_gate_required:
+        tts_stream_id = int(_speak_reply_async(chunk_text) or 0)
+        if tts_stream_id > 0:
+            _reader_autocommit_register(
+                stream_id=tts_stream_id,
+                session_id=session_id,
+                chunk_id=chunk_id,
+                chunk_index=chunk_index,
+                text_len=len(chunk_text),
+                start_offset_chars=start_offset,
+            )
+        else:
+            tts_gate_required = False
+    if not tts_gate_required:
+        _READER_STORE.commit(
+            session_id,
+            chunk_id=chunk_id,
+            chunk_index=chunk_index,
+            reason=commit_reason,
+        )
+        committed = True
+    return tts_gate_required, tts_stream_id, committed
 
 
 def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id: str) -> dict | None:
@@ -4177,10 +4624,13 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
                 "- biblioteca rescan\n"
                 "- leer libro <n>\n"
                 "- segui\n"
+                "- continuar\n"
+                "- continuar desde \"<frase>\"\n"
+                "- volver una frase | volver un párrafo\n"
                 "- continuo on|off\n"
                 "- repetir\n"
                 "- estado lectura\n"
-                "- pausa lectura"
+                "- pausa lectura | detenete"
             ),
             "no_auto_tts": True,
         }
@@ -4286,18 +4736,11 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
                 "no_auto_tts": True,
                 "reader": _reader_meta(session_id, _READER_STORE.get_session(session_id), auto_continue=False),
             }
-        chunk_text = str(chunk.get("text", "")).strip()
-        chunk_id = str(chunk.get("chunk_id", "")).strip()
-        chunk_index = int(chunk.get("chunk_index", 0) or 0)
-        tts_gate_required = ("tts" in allowed_tools) and _voice_enabled() and bool(chunk_text)
-        tts_stream_id = 0
-        if tts_gate_required:
-            tts_stream_id = _speak_reply_async(chunk_text)
-        _READER_STORE.commit(
-            session_id,
-            chunk_id=chunk_id,
-            chunk_index=chunk_index,
-            reason="reader_start_autocommit",
+        tts_gate_required, tts_stream_id, _committed = _reader_emit_chunk(
+            session_id=session_id,
+            chunk=chunk,
+            allowed_tools=allowed_tools,
+            commit_reason="reader_start_autocommit",
         )
         st_after = _READER_STORE.get_session(session_id, include_chunks=False)
         has_more = (not bool(st_after.get("done", False))) and int(st_after.get("cursor", 0) or 0) < int(
@@ -4326,16 +4769,162 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
             ),
         }
 
-    if any(k in normalized for k in ("pausa lectura", "pausar lectura", "detener lectura", "parar lectura", "stop lectura")):
+    if any(
+        k in normalized
+        for k in (
+            "detenete",
+            "detente",
+            "pausa lectura",
+            "pausar lectura",
+            "detener lectura",
+            "parar lectura",
+            "stop lectura",
+        )
+    ):
         st = _READER_STORE.get_session(session_id, include_chunks=False)
         if not st.get("ok"):
             return {"reply": "No hay sesión de lectura activa en este chat.", "no_auto_tts": True}
+        _request_tts_stop(
+            reason="reader_user_barge_in",
+            keyword="detenete",
+            detail="triggered:user_pause",
+            session_id=session_id,
+        )
         _READER_STORE.set_continuous(session_id, False, reason="reader_user_paused")
+        _READER_STORE.set_reader_state(session_id, "paused", reason="reader_user_paused")
         st_after = _READER_STORE.get_session(session_id, include_chunks=False)
         return {
             "reply": "Lectura en pausa. Para retomar, decí: seguí",
             "no_auto_tts": True,
             "reader": _reader_meta(session_id, st_after, auto_continue=False),
+        }
+
+    m_continue_from = re.search(r'continuar\s+desde\s+["“](.+?)["”]', message, flags=re.IGNORECASE)
+    if not m_continue_from:
+        m_continue_from = re.search(r"continuar\s+desde\s+(.+)$", message, flags=re.IGNORECASE)
+    if m_continue_from:
+        phrase = str(m_continue_from.group(1) or "").strip()
+        if not phrase:
+            return {"reply": "Indicá una frase para continuar. Ejemplo: continuar desde \"matriz\".", "no_auto_tts": True}
+        sought = _READER_STORE.seek_phrase(session_id, phrase=phrase)
+        if not sought.get("ok"):
+            return {
+                "reply": f"No encontré esa frase en el punto actual ({sought.get('error', 'reader_phrase_not_found')}).",
+                "no_auto_tts": True,
+                "reader": _reader_meta(session_id, _READER_STORE.get_session(session_id, include_chunks=False), auto_continue=False),
+            }
+        _READER_STORE.set_reader_state(session_id, "reading", reason="reader_continue_from_phrase")
+        out = _READER_STORE.next_chunk(session_id)
+        chunk = out.get("chunk") if isinstance(out, dict) else None
+        if not isinstance(chunk, dict):
+            st_now = _READER_STORE.get_session(session_id, include_chunks=False)
+            return {"reply": "No pude retomar desde esa frase.", "no_auto_tts": True, "reader": _reader_meta(session_id, st_now)}
+        tts_gate_required, tts_stream_id, _committed = _reader_emit_chunk(
+            session_id=session_id,
+            chunk=chunk,
+            allowed_tools=allowed_tools,
+            commit_reason="reader_continue_from_phrase_autocommit",
+        )
+        st_after = _READER_STORE.get_session(session_id, include_chunks=False)
+        meta_after = st_after.get("metadata", {}) if isinstance(st_after.get("metadata"), dict) else {}
+        has_more = (not bool(st_after.get("done", False))) and int(st_after.get("cursor", 0) or 0) < int(
+            st_after.get("total_chunks", 0) or 0
+        )
+        auto_continue = bool(st_after.get("continuous_enabled", False)) and has_more
+        return {
+            "reply": _reader_chunk_reply(
+                chunk,
+                total_chunks=int(st_after.get("total_chunks", 0) or 0),
+                title=str(meta_after.get("book_title", "")),
+                prefix=f"Retomo desde: \"{phrase}\".",
+            ),
+            "no_auto_tts": True,
+            "reader": _reader_meta(
+                session_id,
+                st_after,
+                chunk=chunk,
+                auto_continue=auto_continue,
+                tts_stream_id=tts_stream_id,
+                tts_gate_required=tts_gate_required,
+            ),
+        }
+
+    if any(k in normalized for k in ("volver una frase",)):
+        rew = _READER_STORE.rewind(session_id, unit="sentence")
+        if not rew.get("ok"):
+            return {"reply": "No pude retroceder una frase en esta sesión.", "no_auto_tts": True}
+        out = _READER_STORE.next_chunk(session_id)
+        chunk = out.get("chunk") if isinstance(out, dict) else None
+        if not isinstance(chunk, dict):
+            st_now = _READER_STORE.get_session(session_id, include_chunks=False)
+            return {"reply": "No pude retomar tras volver una frase.", "no_auto_tts": True, "reader": _reader_meta(session_id, st_now)}
+        tts_gate_required, tts_stream_id, _committed = _reader_emit_chunk(
+            session_id=session_id,
+            chunk=chunk,
+            allowed_tools=allowed_tools,
+            commit_reason="reader_rewind_sentence_autocommit",
+        )
+        st_after = _READER_STORE.get_session(session_id, include_chunks=False)
+        meta_after = st_after.get("metadata", {}) if isinstance(st_after.get("metadata"), dict) else {}
+        has_more = (not bool(st_after.get("done", False))) and int(st_after.get("cursor", 0) or 0) < int(
+            st_after.get("total_chunks", 0) or 0
+        )
+        auto_continue = bool(st_after.get("continuous_enabled", False)) and has_more
+        return {
+            "reply": _reader_chunk_reply(
+                chunk,
+                total_chunks=int(st_after.get("total_chunks", 0) or 0),
+                title=str(meta_after.get("book_title", "")),
+                prefix="Retrocedí una frase y retomo desde ahí.",
+            ),
+            "no_auto_tts": True,
+            "reader": _reader_meta(
+                session_id,
+                st_after,
+                chunk=chunk,
+                auto_continue=auto_continue,
+                tts_stream_id=tts_stream_id,
+                tts_gate_required=tts_gate_required,
+            ),
+        }
+
+    if any(k in normalized for k in ("volver un parrafo", "volver un párrafo")):
+        rew = _READER_STORE.rewind(session_id, unit="paragraph")
+        if not rew.get("ok"):
+            return {"reply": "No pude retroceder un párrafo en esta sesión.", "no_auto_tts": True}
+        out = _READER_STORE.next_chunk(session_id)
+        chunk = out.get("chunk") if isinstance(out, dict) else None
+        if not isinstance(chunk, dict):
+            st_now = _READER_STORE.get_session(session_id, include_chunks=False)
+            return {"reply": "No pude retomar tras volver un párrafo.", "no_auto_tts": True, "reader": _reader_meta(session_id, st_now)}
+        tts_gate_required, tts_stream_id, _committed = _reader_emit_chunk(
+            session_id=session_id,
+            chunk=chunk,
+            allowed_tools=allowed_tools,
+            commit_reason="reader_rewind_paragraph_autocommit",
+        )
+        st_after = _READER_STORE.get_session(session_id, include_chunks=False)
+        meta_after = st_after.get("metadata", {}) if isinstance(st_after.get("metadata"), dict) else {}
+        has_more = (not bool(st_after.get("done", False))) and int(st_after.get("cursor", 0) or 0) < int(
+            st_after.get("total_chunks", 0) or 0
+        )
+        auto_continue = bool(st_after.get("continuous_enabled", False)) and has_more
+        return {
+            "reply": _reader_chunk_reply(
+                chunk,
+                total_chunks=int(st_after.get("total_chunks", 0) or 0),
+                title=str(meta_after.get("book_title", "")),
+                prefix="Retrocedí un párrafo y retomo desde ahí.",
+            ),
+            "no_auto_tts": True,
+            "reader": _reader_meta(
+                session_id,
+                st_after,
+                chunk=chunk,
+                auto_continue=auto_continue,
+                tts_stream_id=tts_stream_id,
+                tts_gate_required=tts_gate_required,
+            ),
         }
 
     if any(k in normalized for k in ("estado lectura", "donde voy", "status lectura")):
@@ -4347,12 +4936,18 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         label = f"'{title}' | " if title else ""
         continuous = "on" if bool(st.get("continuous_enabled", st.get("continuous_active", False))) else "off"
         reason = str(st.get("continuous_reason", "")).strip() or "-"
+        bookmark = st.get("bookmark") if isinstance(st.get("bookmark"), dict) else {}
+        b_chunk = int(bookmark.get("chunk_index", -1) or -1)
+        b_off = int(bookmark.get("offset_chars", 0) or 0)
+        b_quality = str(bookmark.get("quality", "-") or "-")
+        r_state = str(st.get("reader_state", "paused") or "paused")
         return {
             "reply": (
                 f"Estado lectura: {label}cursor={int(st.get('cursor', 0))}/"
                 f"{int(st.get('total_chunks', 0))}, pending={bool(st.get('has_pending', False))}, "
                 f"done={bool(st.get('done', False))}, continua={continuous}({reason}), "
-                f"barge_in={int(st.get('barge_in_count', 0))}."
+                f"barge_in={int(st.get('barge_in_count', 0))}, state={r_state}, "
+                f"bookmark=chunk:{b_chunk},offset:{b_off},quality:{b_quality}."
             ),
             "no_auto_tts": True,
             "reader": _reader_meta(session_id, st, auto_continue=False),
@@ -4381,30 +4976,38 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         tts_gate_required = ("tts" in allowed_tools) and _voice_enabled() and bool(chunk_text)
         tts_stream_id = 0
         if tts_gate_required:
-            tts_stream_id = _speak_reply_async(chunk_text)
+            tts_stream_id = int(_speak_reply_async(chunk_text) or 0)
+            tts_gate_required = tts_stream_id > 0
+        st_after = _READER_STORE.get_session(session_id, include_chunks=False)
+        has_more = (not bool(st_after.get("done", False))) and int(st_after.get("cursor", 0) or 0) < int(
+            st_after.get("total_chunks", 0) or 0
+        )
         return {
             "reply": _reader_chunk_reply(
                 chunk,
-                total_chunks=int(st.get("total_chunks", 0) or 0),
+                total_chunks=int(st_after.get("total_chunks", 0) or 0),
                 title=title,
                 prefix="Repito el bloque actual.",
             ),
             "no_auto_tts": True,
             "reader": _reader_meta(
                 session_id,
-                st,
+                st_after,
                 chunk=chunk,
-                auto_continue=bool(st.get("continuous_enabled", st.get("continuous_active", False)))
-                and (not bool(st.get("done", False))),
+                auto_continue=bool(st_after.get("continuous_enabled", st_after.get("continuous_active", False)))
+                and has_more,
                 tts_stream_id=tts_stream_id,
                 tts_gate_required=tts_gate_required,
             ),
         }
 
-    if any(k in normalized for k in ("segui", "siguiente")) or bool(re.search(r"\bnext\b", normalized)):
+    if any(k in normalized for k in ("segui", "siguiente", "continuar", "seguir leyendo")) or bool(
+        re.search(r"\bnext\b", normalized)
+    ):
         st_before = _READER_STORE.get_session(session_id, include_chunks=False)
         if not st_before.get("ok"):
             return {"reply": "No hay sesión de lectura activa. Usá 'biblioteca' y 'leer libro <n>'.", "no_auto_tts": True}
+        _READER_STORE.set_reader_state(session_id, "reading", reason="reader_continue")
         was_continuous = bool(st_before.get("continuous_enabled", st_before.get("continuous_active", False)))
         if was_continuous:
             wait_ms = _reader_pacing_wait_ms(st_before)
@@ -4426,18 +5029,11 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
                 "no_auto_tts": True,
                 "reader": _reader_meta(session_id, st_end, auto_continue=False),
             }
-        chunk_text = str(chunk.get("text", "")).strip()
-        chunk_id = str(chunk.get("chunk_id", "")).strip()
-        chunk_index = int(chunk.get("chunk_index", 0) or 0)
-        tts_gate_required = ("tts" in allowed_tools) and _voice_enabled() and bool(chunk_text)
-        tts_stream_id = 0
-        if tts_gate_required:
-            tts_stream_id = _speak_reply_async(chunk_text)
-        _READER_STORE.commit(
-            session_id,
-            chunk_id=chunk_id,
-            chunk_index=chunk_index,
-            reason="dc_reader_autocommit",
+        tts_gate_required, tts_stream_id, _committed = _reader_emit_chunk(
+            session_id=session_id,
+            chunk=chunk,
+            allowed_tools=allowed_tools,
+            commit_reason="dc_reader_autocommit",
         )
         st_after = _READER_STORE.get_session(session_id, include_chunks=False)
         meta_after = st_after.get("metadata", {}) if isinstance(st_after.get("metadata"), dict) else {}
@@ -4451,8 +5047,8 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
             total_chunks=int(st_after.get("total_chunks", 0) or 0),
             title=title,
         )
-        if not chunk_text:
-            reply = f"Error: bloque {chunk_index + 1} sin texto legible."
+        if not str(chunk.get("text", "")).strip():
+            reply = f"Error: bloque {int(chunk.get('chunk_index', 0) or 0) + 1} sin texto legible."
         return {
             "reply": reply,
             "no_auto_tts": True,
@@ -5376,6 +5972,8 @@ class Handler(BaseHTTPRequestHandler):
                             session_id=sid,
                             chunk_id=str(chunk.get("chunk_id", "")),
                             chunk_index=int(chunk.get("chunk_index", 0) or 0),
+                            text_len=len(text),
+                            start_offset_chars=int(chunk.get("offset_chars", 0) or 0),
                         )
                         out["autocommit_registered"] = True
                 else:
@@ -5637,7 +6235,27 @@ class Handler(BaseHTTPRequestHandler):
                 sid = _safe_session_id(str(payload.get("session_id", "default")))
                 detail = str(payload.get("detail", "barge_in_triggered"))
                 keyword = str(payload.get("keyword", ""))
-                out = _READER_STORE.mark_barge_in(sid, detail=detail, keyword=keyword)
+                raw_offset = payload.get("offset_hint")
+                offset_hint = None
+                if raw_offset not in ("", None):
+                    try:
+                        offset_hint = int(raw_offset)
+                    except Exception:
+                        offset_hint = None
+                raw_playback = payload.get("playback_ms")
+                playback_ms = None
+                if raw_playback not in ("", None):
+                    try:
+                        playback_ms = float(raw_playback)
+                    except Exception:
+                        playback_ms = None
+                out = _READER_STORE.mark_barge_in(
+                    sid,
+                    detail=detail,
+                    keyword=keyword,
+                    offset_hint=offset_hint,
+                    playback_ms=playback_ms,
+                )
                 status = 200 if out.get("ok") else 404
                 self._json(status, out)
             except Exception as e:
@@ -5706,8 +6324,19 @@ class Handler(BaseHTTPRequestHandler):
             session_id = _safe_session_id(str(payload.get("session_id", "default")))
             allowed_tools = _extract_allowed_tools(payload)
             # allow_local_action_on_unknown_model
-            if message and _READER_STORE.is_continuous(session_id) and (not _is_reader_control_command(message)):
-                _READER_STORE.set_continuous(session_id, False, reason="reader_user_interrupt")
+            if message and (not _is_reader_control_command(message)):
+                st_reader = _READER_STORE.get_session(session_id, include_chunks=False)
+                reader_state = str(st_reader.get("reader_state", "")).strip().lower() if st_reader.get("ok") else ""
+                if _READER_STORE.is_continuous(session_id) or reader_state == "reading":
+                    _READER_STORE.set_continuous(session_id, False, reason="reader_user_interrupt")
+                    _READER_STORE.set_reader_state(session_id, "commenting", reason="reader_user_interrupt")
+                    if _tts_is_playing():
+                        _request_tts_stop(
+                            reason="reader_user_interrupt",
+                            keyword="typed_interrupt",
+                            detail="triggered:typed_interrupt",
+                            session_id=session_id,
+                        )
 
             model = str(payload.get("model", "openai-codex/gpt-5.1-codex-mini")).strip()
             requested_backend = str(payload.get("model_backend", "")).strip().lower()

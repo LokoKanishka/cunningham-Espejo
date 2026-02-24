@@ -11,6 +11,16 @@ function norm(s) {
   return String(s || "").replace(/\s+/g, " ").trim();
 }
 
+function looksLikeReadingReply(text) {
+  const t = norm(text);
+  if (!t) return false;
+  if (/bloque\s+\d+\//i.test(t)) return true;
+  if (/fin de lectura/i.test(t)) return true;
+  // Resume-from-offset can return plain body text without "Bloque N/M" label.
+  if (t.length >= 120 && !/no encontr[eé]/i.test(t)) return true;
+  return false;
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -177,7 +187,7 @@ async function main() {
 
     const beforeManual = stAfterWait;
     const resumed1 = await sendAndWaitAssistant(page, "seguí", 80000);
-    if (!/bloque\s+\d+\//i.test(resumed1) && !/fin de lectura/i.test(resumed1)) {
+    if (!looksLikeReadingReply(resumed1)) {
       throw new Error(`manual_1_missing_block reply=${resumed1.slice(0, 220)}`);
     }
     const afterManual1 = await readerStatus(context.request, sessionId);
@@ -189,7 +199,7 @@ async function main() {
     }
 
     const resumed2 = await sendAndWaitAssistant(page, "seguí", 80000);
-    if (!/bloque\s+\d+\//i.test(resumed2) && !/fin de lectura/i.test(resumed2)) {
+    if (!looksLikeReadingReply(resumed2)) {
       throw new Error(`manual_2_missing_block reply=${resumed2.slice(0, 220)}`);
     }
     const afterManual2 = await readerStatus(context.request, sessionId);
@@ -216,6 +226,26 @@ async function main() {
       const now = await getAssistantCount(page);
       return now >= (afterEnableCount + 1);
     }, { timeoutMs: 45000, minDelayMs: 140, maxDelayMs: 1800 });
+
+    await sendAndWaitAssistant(page, "detenete", 80000);
+    await waitUntil("reader_stopped_by_barge", async () => {
+      const st = await readerStatus(context.request, sessionId);
+      return st.continuous_enabled === false && (st.reader_state === "commenting" || st.reader_state === "paused");
+    }, { timeoutMs: 25000, minDelayMs: 100, maxDelayMs: 1000 });
+
+    await sendAndWaitAssistant(page, "comentario breve sobre el texto", 80000);
+
+    const continued = await sendAndWaitAssistant(page, "continuar", 80000);
+    if (!looksLikeReadingReply(continued)) {
+      throw new Error(`continuar_missing_block reply=${continued.slice(0, 220)}`);
+    }
+
+    const phraseMatch = continued.match(/[A-Za-zÁÉÍÓÚáéíóúñÑ]{6,}/);
+    const phrase = phraseMatch ? phraseMatch[0] : "texto";
+    const continuedFrom = await sendAndWaitAssistant(page, `continuar desde "${phrase}"`, 80000);
+    if (!looksLikeReadingReply(continuedFrom) && !/no encontr[eé]/i.test(continuedFrom)) {
+      throw new Error(`continuar_desde_unexpected reply=${continuedFrom.slice(0, 240)}`);
+    }
 
     await sendViaUI(page, "pausa lectura");
     await waitUntil("reader_paused", async () => {

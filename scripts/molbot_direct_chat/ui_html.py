@@ -576,10 +576,18 @@ HTML = r"""<!doctype html>
         t.includes("repetir") ||
         t.includes("segui") ||
         t.includes("seguir") ||
+        t.includes("seguir leyendo") ||
         t.includes("siguiente") ||
         t.includes("next") ||
+        t.includes("continuar") ||
+        t.includes("continuar desde") ||
+        t.includes("volver una frase") ||
+        t.includes("volver un parrafo") ||
+        t.includes("volver un párrafo") ||
         t.includes("continuo on") ||
         t.includes("continuo off") ||
+        t.includes("detenete") ||
+        t.includes("detente") ||
         t.includes("pausa lectura") ||
         t.includes("pausar lectura") ||
         t.includes("detener lectura") ||

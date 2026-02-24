@@ -113,6 +113,33 @@ class TestReaderSessionStore(unittest.TestCase):
         self.assertFalse(committed.get("continuous_active"))
         self.assertEqual(str(committed.get("continuous_reason", "")), "eof")
 
+    def test_barge_in_sets_bookmark_offset(self) -> None:
+        txt = "Primera frase para lectura. Segunda frase para corte. Tercera frase para continuar."
+        self.store.start_session("sess_e", chunks=[txt], reset=True)
+        self.store.next_chunk("sess_e")
+        interrupted = self.store.mark_barge_in("sess_e", detail="speech_cut", playback_ms=700.0)
+        self.assertTrue(interrupted.get("ok"))
+        self.assertTrue(interrupted.get("interrupted"))
+        bookmark = interrupted.get("bookmark", {})
+        self.assertIsInstance(bookmark, dict)
+        self.assertGreaterEqual(int(bookmark.get("offset_chars", -1)), 0)
+        self.assertEqual(str(interrupted.get("reader_state", "")), "commenting")
+
+    def test_seek_phrase_and_rewind_sentence(self) -> None:
+        txt = "Inicio del texto. Punto de control matriz para retomar. Cierre de ejemplo."
+        self.store.start_session("sess_f", chunks=[txt], reset=True)
+        self.store.next_chunk("sess_f")
+        self.store.mark_barge_in("sess_f", detail="speech_cut", playback_ms=400.0)
+        sought = self.store.seek_phrase("sess_f", "matriz")
+        self.assertTrue(sought.get("ok"))
+        self.assertTrue(sought.get("seeked"))
+        chunk = sought.get("chunk", {})
+        self.assertTrue(str(chunk.get("text", "")).lower().startswith("matriz"))
+        rew = self.store.rewind("sess_f", unit="sentence")
+        self.assertTrue(rew.get("ok"))
+        self.assertTrue(rew.get("rewound"))
+        self.assertEqual(str(rew.get("rewind_unit", "")), "sentence")
+
 
 class TestReaderHttpEndpoints(unittest.TestCase):
     def setUp(self) -> None:
@@ -211,6 +238,26 @@ class TestReaderHttpEndpoints(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertTrue(committed.get("committed"))
         self.assertEqual(int(committed.get("cursor", -1)), 1)
+
+    def test_http_barge_in_accepts_playback_offset(self) -> None:
+        code, started = self._request(
+            "POST",
+            "/api/reader/session/start",
+            {"session_id": "http_barge_offset", "chunks": ["uno dos tres cuatro"], "reset": True},
+        )
+        self.assertEqual(code, 200)
+        self.assertTrue(started.get("ok"))
+        self._request("GET", "/api/reader/session/next?session_id=http_barge_offset")
+        code, barge = self._request(
+            "POST",
+            "/api/reader/session/barge_in",
+            {"session_id": "http_barge_offset", "detail": "speech_detected", "playback_ms": 500},
+        )
+        self.assertEqual(code, 200)
+        self.assertTrue(barge.get("interrupted"))
+        bookmark = barge.get("bookmark", {})
+        self.assertIsInstance(bookmark, dict)
+        self.assertGreaterEqual(int(bookmark.get("offset_chars", -1)), 0)
 
     def test_next_with_speak_and_autocommit_advances_cursor_after_tts_end(self) -> None:
         code, started = self._request(

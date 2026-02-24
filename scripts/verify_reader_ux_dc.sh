@@ -10,7 +10,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "== verify reader ux dc v0.5 ==" >&2
+echo "== verify reader ux dc v0.6 ==" >&2
 echo "tmp_dir=${TMP_DIR}" >&2
 
 python3 - "${TMP_DIR}" <<'PY'
@@ -112,6 +112,25 @@ def get_status() -> dict:
         return body if isinstance(body, dict) else {}
 
 
+def reader_get(path: str) -> dict:
+    req = Request(base + path, method="GET")
+    with urlopen(req, timeout=8) as resp:
+        body = json.loads(resp.read().decode("utf-8") or "{}")
+        return body if isinstance(body, dict) else {}
+
+
+def reader_post(path: str, payload: dict) -> dict:
+    req = Request(
+        base + path,
+        method="POST",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    with urlopen(req, timeout=8) as resp:
+        body = json.loads(resp.read().decode("utf-8") or "{}")
+        return body if isinstance(body, dict) else {}
+
+
 try:
     r = post_chat("biblioteca rescan")
     ensure("biblioteca" in str(r.get("reply", "")).lower(), f"rescan_failed reply={r}")
@@ -183,6 +202,42 @@ try:
     ensure(status.get("ok"), f"status_after_pause_failed payload={status}")
     ensure(not bool(status.get("continuous_enabled", True)), f"pause_not_applied status={status}")
     print("PASS pausa_lectura_stops_continuous")
+
+    # v0.6: barge-in bookmark + continue/seek/rewind commands.
+    reader_post(
+        "/api/reader/session/start",
+        {
+            "session_id": session_id,
+            "chunks": ["Inicio académico. Punto matriz para retomar. Cierre del ejemplo."],
+            "reset": True,
+        },
+    )
+    reader_get(f"/api/reader/session/next?session_id={session_id}")
+    barge = reader_post(
+        "/api/reader/session/barge_in",
+        {"session_id": session_id, "detail": "verify_mid_block_cut", "playback_ms": 650},
+    )
+    ensure(bool(barge.get("interrupted", False)), f"barge_in_not_interrupted payload={barge}")
+    bookmark = barge.get("bookmark", {}) if isinstance(barge.get("bookmark"), dict) else {}
+    ensure(int(bookmark.get("offset_chars", -1)) >= 0, f"bookmark_missing_offset payload={barge}")
+    ensure(str(barge.get("reader_state", "")) in ("commenting", "paused"), f"barge_in_state_bad payload={barge}")
+    print("PASS barge_in_bookmark")
+
+    post_chat("comentario académico breve")
+    resumed = post_chat("continuar")
+    resumed_reply = str(resumed.get("reply", ""))
+    ensure("bloque" in resumed_reply.lower(), f"continuar_no_block payload={resumed}")
+    print("PASS continuar_from_bookmark")
+
+    resumed_from = post_chat('continuar desde "matriz"')
+    resumed_from_reply = str(resumed_from.get("reply", "")).lower()
+    ensure(("matriz" in resumed_from_reply) or ("bloque" in resumed_from_reply), f"continuar_desde_bad payload={resumed_from}")
+    print("PASS continuar_desde_phrase")
+
+    rewind = post_chat("volver una frase")
+    rewind_reply = str(rewind.get("reply", ""))
+    ensure("bloque" in rewind_reply.lower(), f"volver_una_frase_bad payload={rewind}")
+    print("PASS volver_una_frase")
 
     # Estado should show progress and continuous mode state.
     r = post_chat("estado lectura")
