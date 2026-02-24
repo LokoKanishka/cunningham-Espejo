@@ -163,60 +163,19 @@ async function main() {
       throw new Error(`leer_libro_reply_too_short len=${firstRead.length}`);
     }
 
-    await sleep(3000);
-    const assistantsAfter3s = await getAssistantCount(page);
-    const chunksIn3s = assistantsAfter3s - beforeRead;
-    if (chunksIn3s > 2) {
-      throw new Error(`reader_flood_detected chunks_in_3s=${chunksIn3s} before=${beforeRead} after=${assistantsAfter3s}`);
-    }
-
     const sessionId = await getSessionId(page);
-    const initialStatus = await readerStatus(context.request, sessionId);
-    const total = Math.max(1, Number(initialStatus.total_chunks || 0));
-    const targetCursor = total >= 2 ? 2 : 1;
-
-    const progressedStatus = await waitUntil("reader_auto_progress", async () => {
-      const st = await readerStatus(context.request, sessionId);
-      if (st.done) return st;
-      if (Number(st.cursor || 0) >= targetCursor) return st;
-      return false;
-    }, { timeoutMs: 60000, minDelayMs: 140, maxDelayMs: 2000 });
-
-    if (!progressedStatus.done && Number(progressedStatus.cursor || 0) < targetCursor) {
-      throw new Error(`reader_no_progress cursor=${progressedStatus.cursor} target=${targetCursor} total=${total}`);
+    const stManualStart = await readerStatus(context.request, sessionId);
+    if (stManualStart.continuous_enabled === true) {
+      throw new Error(`manual_default_failed status=${JSON.stringify(stManualStart)}`);
     }
 
-    if (total >= 2) {
-      await waitUntil("assistant_auto_block_visible", async () => {
-        const now = await getAssistantCount(page);
-        return now >= (beforeRead + 2);
-      }, { timeoutMs: 45000 });
-      const autoText = await getLastAssistantText(page);
-      if (!/bloque\s+\d+\//i.test(autoText)) {
-        throw new Error(`auto_block_missing_header text=${autoText.slice(0, 220)}`);
-      }
-      if (autoText.length < 80) {
-        throw new Error(`auto_block_too_short len=${autoText.length}`);
-      }
+    await sleep(3200);
+    const stAfterWait = await readerStatus(context.request, sessionId);
+    if (Number(stAfterWait.cursor || 0) !== Number(stManualStart.cursor || 0)) {
+      throw new Error(`manual_cursor_moved_without_input before=${stManualStart.cursor} after=${stAfterWait.cursor}`);
     }
 
-    // Explicit pause should disable auto-continue immediately.
-    await sendViaUI(page, "pausa lectura");
-    await waitUntil("reader_paused", async () => {
-      const st = await readerStatus(context.request, sessionId);
-      return st.continuous_active === false;
-    }, { timeoutMs: 25000, minDelayMs: 100, maxDelayMs: 1000 });
-
-    await waitSendEnabled(page, 80000);
-    const estado = await sendAndWaitAssistant(page, "estado lectura", 80000);
-    if (!/cursor=\d+\//i.test(estado)) {
-      throw new Error(`estado_missing_cursor reply=${estado.slice(0, 220)}`);
-    }
-    if (!/continua=off/i.test(estado)) {
-      throw new Error(`interrupt_not_applied reply=${estado.slice(0, 240)}`);
-    }
-
-    const beforeManual = await readerStatus(context.request, sessionId);
+    const beforeManual = stAfterWait;
     const resumed1 = await sendAndWaitAssistant(page, "seguí", 80000);
     if (!/bloque\s+\d+\//i.test(resumed1) && !/fin de lectura/i.test(resumed1)) {
       throw new Error(`manual_1_missing_block reply=${resumed1.slice(0, 220)}`);
@@ -225,7 +184,7 @@ async function main() {
     if (Number(afterManual1.cursor || 0) > (Number(beforeManual.cursor || 0) + 1)) {
       throw new Error(`manual_1_advanced_more_than_one before=${beforeManual.cursor} after=${afterManual1.cursor}`);
     }
-    if (afterManual1.continuous_active === true) {
+    if (afterManual1.continuous_enabled === true) {
       throw new Error(`manual_1_reactivated_continuous status=${JSON.stringify(afterManual1)}`);
     }
 
@@ -237,8 +196,40 @@ async function main() {
     if (Number(afterManual2.cursor || 0) > (Number(afterManual1.cursor || 0) + 1)) {
       throw new Error(`manual_2_advanced_more_than_one prev=${afterManual1.cursor} after=${afterManual2.cursor}`);
     }
-    if (afterManual2.continuous_active === true) {
+    if (afterManual2.continuous_enabled === true) {
       throw new Error(`manual_2_reactivated_continuous status=${JSON.stringify(afterManual2)}`);
+    }
+
+    const contOnReply = await sendAndWaitAssistant(page, "continuo on", 80000);
+    if (!/continua|continuo/i.test(contOnReply)) {
+      throw new Error(`continuous_on_missing_ack reply=${contOnReply.slice(0, 220)}`);
+    }
+    const stContOn = await readerStatus(context.request, sessionId);
+    if (stContOn.continuous_enabled !== true) {
+      throw new Error(`continuous_on_not_applied status=${JSON.stringify(stContOn)}`);
+    }
+
+    // In opt-in continuous mode, reader can chain with pacing.
+    const afterEnableCount = await getAssistantCount(page);
+    await sendAndWaitAssistant(page, "seguí", 80000);
+    await waitUntil("continuous_progress_after_opt_in", async () => {
+      const now = await getAssistantCount(page);
+      return now >= (afterEnableCount + 1);
+    }, { timeoutMs: 45000, minDelayMs: 140, maxDelayMs: 1800 });
+
+    await sendViaUI(page, "pausa lectura");
+    await waitUntil("reader_paused", async () => {
+      const st = await readerStatus(context.request, sessionId);
+      return st.continuous_enabled === false;
+    }, { timeoutMs: 25000, minDelayMs: 100, maxDelayMs: 1000 });
+
+    await waitSendEnabled(page, 80000);
+    const estado = await sendAndWaitAssistant(page, "estado lectura", 80000);
+    if (!/cursor=\d+\//i.test(estado)) {
+      throw new Error(`estado_missing_cursor reply=${estado.slice(0, 220)}`);
+    }
+    if (!/continua=off/i.test(estado)) {
+      throw new Error(`pause_not_applied reply=${estado.slice(0, 240)}`);
     }
 
     console.log(`READER_UI_HUMAN_OK base=${BASE} model=${model}`);

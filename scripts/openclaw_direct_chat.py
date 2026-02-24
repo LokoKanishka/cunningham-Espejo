@@ -3351,6 +3351,7 @@ class ReaderSessionStore:
             "created_ts": float(session.get("created_ts", 0.0) or 0.0),
             "last_commit_ts": float(session.get("last_commit_ts", 0.0) or 0.0),
             "continuous_active": bool(session.get("continuous_active", False)),
+            "continuous_enabled": bool(session.get("continuous_enabled", session.get("continuous_active", False))),
             "continuous_reason": str(session.get("continuous_reason", "")),
             "continuous_updated_ts": float(session.get("continuous_updated_ts", 0.0) or 0.0),
             "last_chunk_emit_ts": float(session.get("last_chunk_emit_ts", 0.0) or 0.0),
@@ -3448,6 +3449,7 @@ class ReaderSessionStore:
                 "cursor": 0,
                 "pending": None,
                 "continuous_active": False,
+                "continuous_enabled": False,
                 "continuous_reason": "session_started",
                 "continuous_updated_ts": now,
                 "last_chunk_emit_ts": 0.0,
@@ -3593,6 +3595,7 @@ class ReaderSessionStore:
             total = len(chunks) if isinstance(chunks, list) else 0
             if int(sess.get("cursor", 0) or 0) >= total:
                 sess["continuous_active"] = False
+                sess["continuous_enabled"] = False
                 sess["continuous_reason"] = "eof"
                 sess["continuous_updated_ts"] = now
             if reason:
@@ -3632,6 +3635,7 @@ class ReaderSessionStore:
             sess["updated_ts"] = now
             sess["last_event"] = "barge_in"
             sess["continuous_active"] = False
+            sess["continuous_enabled"] = False
             sess["continuous_reason"] = "barge_in"
             sess["continuous_updated_ts"] = now
             out = self._session_view(sid, sess, include_chunks=False)
@@ -3652,6 +3656,7 @@ class ReaderSessionStore:
             sess = sessions[sid]
             now = float(time.time())
             sess["continuous_active"] = bool(active)
+            sess["continuous_enabled"] = bool(active)
             sess["continuous_reason"] = reason_clean or ("continuous_on" if active else "continuous_off")
             sess["continuous_updated_ts"] = now
             sess["updated_ts"] = now
@@ -3672,7 +3677,7 @@ class ReaderSessionStore:
             sess = sessions.get(sid)
             if not isinstance(sess, dict):
                 return False
-            return bool(sess.get("continuous_active", False))
+            return bool(sess.get("continuous_enabled", sess.get("continuous_active", False)))
 
         return bool(self._with_state(False, _read))
 
@@ -4064,6 +4069,8 @@ def _is_reader_control_command(message: str) -> bool:
             "seguir",
             "siguiente",
             "next",
+            "continuo on",
+            "continuo off",
             "pausa lectura",
             "pausar lectura",
             "detener lectura",
@@ -4110,6 +4117,7 @@ def _reader_meta(
         "done": bool(st.get("done", False)),
         "has_pending": bool(st.get("has_pending", False)),
         "continuous_active": bool(st.get("continuous_active", False)),
+        "continuous_enabled": bool(st.get("continuous_enabled", st.get("continuous_active", False))),
         "continuous_reason": str(st.get("continuous_reason", "")),
         "auto_continue": bool(auto_continue),
         "pacing_min_delay_ms": int(pacing_cfg.get("min_delay_ms", 1500) or 1500),
@@ -4169,6 +4177,7 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
                 "- biblioteca rescan\n"
                 "- leer libro <n>\n"
                 "- segui\n"
+                "- continuo on|off\n"
                 "- repetir\n"
                 "- estado lectura\n"
                 "- pausa lectura"
@@ -4211,6 +4220,28 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
             "no_auto_tts": True,
         }
 
+    m_cont = re.search(r"\bcontinuo\s+(on|off)\b", normalized, flags=re.IGNORECASE)
+    if m_cont:
+        st = _READER_STORE.get_session(session_id, include_chunks=False)
+        if not st.get("ok"):
+            return {"reply": "No hay sesión de lectura activa en este chat.", "no_auto_tts": True}
+        mode = str(m_cont.group(1) or "").strip().lower()
+        enable = mode == "on"
+        reason = "reader_continuous_opt_in" if enable else "reader_continuous_opt_out"
+        _READER_STORE.set_continuous(session_id, enable, reason=reason)
+        st_after = _READER_STORE.get_session(session_id, include_chunks=False)
+        if enable:
+            return {
+                "reply": "Lectura continua activada. Va a avanzar sola con pacing hasta que la pauses.",
+                "no_auto_tts": True,
+                "reader": _reader_meta(session_id, st_after, auto_continue=not bool(st_after.get("done", False))),
+            }
+        return {
+            "reply": "Lectura continua desactivada. Quedó en modo manual (usá 'seguí').",
+            "no_auto_tts": True,
+            "reader": _reader_meta(session_id, st_after, auto_continue=False),
+        }
+
     m_read = re.search(r"(?:leer|abrir)\s+(?:el\s+)?(?:libro\s+)?(\d+)\b", normalized, flags=re.IGNORECASE)
     if m_read:
         out = _READER_LIBRARY.list_books()
@@ -4231,6 +4262,7 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
             return {"reply": f"No pude abrir el libro ({loaded.get('error', 'reader_book_error')}).", "no_auto_tts": True}
         book_meta = loaded.get("book", {})
         title = str(book_meta.get("title", item.get("title", "libro"))).strip() if isinstance(book_meta, dict) else "libro"
+        explicit_continuous = bool(re.search(r"\bcontinuo\b", normalized, flags=re.IGNORECASE))
         started = _READER_STORE.start_session(
             session_id,
             chunks=[],
@@ -4240,7 +4272,11 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         )
         if not started.get("ok"):
             return {"reply": f"No pude iniciar lectura ({started.get('error', 'reader_start_failed')}).", "no_auto_tts": True}
-        _READER_STORE.set_continuous(session_id, True, reason="reader_start_auto")
+        _READER_STORE.set_continuous(
+            session_id,
+            explicit_continuous,
+            reason="reader_start_continuous_opt_in" if explicit_continuous else "reader_start_manual_default",
+        )
         first = _READER_STORE.next_chunk(session_id)
         chunk = first.get("chunk") if isinstance(first, dict) else None
         if not first.get("ok") or not isinstance(chunk, dict):
@@ -4267,13 +4303,17 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         has_more = (not bool(st_after.get("done", False))) and int(st_after.get("cursor", 0) or 0) < int(
             st_after.get("total_chunks", 0) or 0
         )
-        auto_continue = bool(st_after.get("continuous_active", False)) and has_more
+        auto_continue = bool(st_after.get("continuous_enabled", False)) and has_more
         return {
             "reply": _reader_chunk_reply(
                 chunk,
                 total_chunks=int(st_after.get("total_chunks", 0) or 0),
                 title=title,
-                prefix=f"Lectura iniciada de '{title}'.",
+                prefix=(
+                    f"Lectura iniciada de '{title}' (continuo ON)."
+                    if explicit_continuous
+                    else f"Lectura iniciada de '{title}' (modo manual)."
+                ),
             ),
             "no_auto_tts": True,
             "reader": _reader_meta(
@@ -4305,7 +4345,7 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         meta = st.get("metadata", {}) if isinstance(st.get("metadata"), dict) else {}
         title = str(meta.get("book_title", "")).strip()
         label = f"'{title}' | " if title else ""
-        continuous = "on" if bool(st.get("continuous_active", False)) else "off"
+        continuous = "on" if bool(st.get("continuous_enabled", st.get("continuous_active", False))) else "off"
         reason = str(st.get("continuous_reason", "")).strip() or "-"
         return {
             "reply": (
@@ -4354,7 +4394,8 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
                 session_id,
                 st,
                 chunk=chunk,
-                auto_continue=bool(st.get("continuous_active", False)) and (not bool(st.get("done", False))),
+                auto_continue=bool(st.get("continuous_enabled", st.get("continuous_active", False)))
+                and (not bool(st.get("done", False))),
                 tts_stream_id=tts_stream_id,
                 tts_gate_required=tts_gate_required,
             ),
@@ -4364,7 +4405,7 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         st_before = _READER_STORE.get_session(session_id, include_chunks=False)
         if not st_before.get("ok"):
             return {"reply": "No hay sesión de lectura activa. Usá 'biblioteca' y 'leer libro <n>'.", "no_auto_tts": True}
-        was_continuous = bool(st_before.get("continuous_active", False))
+        was_continuous = bool(st_before.get("continuous_enabled", st_before.get("continuous_active", False)))
         if was_continuous:
             wait_ms = _reader_pacing_wait_ms(st_before)
             if wait_ms > 0:
@@ -4404,7 +4445,7 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         has_more = (not bool(st_after.get("done", False))) and int(st_after.get("cursor", 0) or 0) < int(
             st_after.get("total_chunks", 0) or 0
         )
-        auto_continue = bool(st_after.get("continuous_active", False)) and has_more
+        auto_continue = bool(st_after.get("continuous_enabled", st_after.get("continuous_active", False))) and has_more
         reply = _reader_chunk_reply(
             chunk,
             total_chunks=int(st_after.get("total_chunks", 0) or 0),

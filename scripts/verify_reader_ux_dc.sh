@@ -10,7 +10,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "== verify reader ux dc v0.4 ==" >&2
+echo "== verify reader ux dc v0.5 ==" >&2
 echo "tmp_dir=${TMP_DIR}" >&2
 
 python3 - "${TMP_DIR}" <<'PY'
@@ -121,70 +121,68 @@ try:
     ensure("1)" in str(r.get("reply", "")) or "biblioteca" in str(r.get("reply", "")).lower(), f"biblioteca_failed reply={r}")
     print("PASS biblioteca_list")
 
-    # Continuous start + visible content in the same reply.
+    # Manual default start + visible content in the same reply.
     blocks = []
     r = post_chat("leer libro 1")
     reply = str(r.get("reply", ""))
     ensure("bloque" in reply.lower(), f"leer_libro_no_block reply={reply}")
     ensure("PARTE" in reply, f"leer_libro_no_text reply={reply[:220]}")
-    ensure(bool(r.get("reader", {}).get("auto_continue", False)), f"leer_libro_not_continuous payload={r}")
-    ensure(int(r.get("reader", {}).get("next_auto_after_ms", 0) or 0) >= 1200, f"leer_libro_no_pacing_meta payload={r}")
+    ensure(not bool(r.get("reader", {}).get("auto_continue", True)), f"leer_libro_should_be_manual payload={r}")
+    ensure(not bool(r.get("reader", {}).get("continuous_enabled", True)), f"leer_libro_continuous_enabled payload={r}")
     blocks.append(reply)
-    print("PASS leer_libro_continuous_start")
+    print("PASS leer_libro_manual_start")
 
-    # Anti-flood: in 3 seconds there should be at most 2 chunk replies total.
-    # (1 initial + max 1 additional), regardless of "seguí" spam rate.
-    started_mono = time.monotonic()
-    chunk_count_3s = 1
-    while (time.monotonic() - started_mono) < 3.0:
-        r = post_chat("seguí")
-        reply = str(r.get("reply", ""))
-        if "bloque" in reply.lower():
-            chunk_count_3s += 1
-            blocks.append(reply)
-        time.sleep(0.20)
-    ensure(chunk_count_3s <= 2, f"anti_flood_failed chunk_count_3s={chunk_count_3s}")
-    print("PASS anti_flood_3s")
+    # No auto-run in manual mode: cursor must remain unchanged without commands.
+    status_before_wait = get_status()
+    time.sleep(3.0)
+    status_after_wait = get_status()
+    ensure(
+        int(status_after_wait.get("cursor", -1)) == int(status_before_wait.get("cursor", -2)),
+        f"manual_autorun_detected before={status_before_wait} after={status_after_wait}",
+    )
+    print("PASS manual_no_auto_run")
 
-    # Keep reading with pacing-aware waits until we gather at least one extra valid chunk.
-    loop_guard = 0
-    while len(blocks) < 3:
-        loop_guard += 1
-        ensure(loop_guard <= 20, "continuous_loop_guard_exceeded")
-        wait_ms = int(r.get("reader", {}).get("next_auto_after_ms", 0) or 0)
-        time.sleep(max(0.15, min(2.0, wait_ms / 1000.0)))
-        r = post_chat("seguí")
-        reply = str(r.get("reply", ""))
-        if "bloque" in reply.lower():
-            ensure(len(reply.strip()) >= 80, f"auto_next_reply_too_short reply={reply}")
-            blocks.append(reply)
-    print("PASS continuous_paced_progress")
+    # Manual mode: two explicit "seguí" should advance one block each and stay manual.
+    cursor0 = int(status_after_wait.get("cursor", 0) or 0)
+    manual_1 = post_chat("seguí")
+    reply_1 = str(manual_1.get("reply", ""))
+    ensure("bloque" in reply_1.lower() or "fin de lectura" in reply_1.lower(), f"manual_seg1_bad_reply={manual_1}")
+    ensure(not bool(manual_1.get("reader", {}).get("auto_continue", True)), f"manual_seg1_auto_continue payload={manual_1}")
+    st1 = get_status()
+    ensure(int(st1.get("cursor", 0) or 0) == (cursor0 + 1), f"manual_seg1_bad_cursor status={st1} cursor0={cursor0}")
+    manual_2 = post_chat("seguí")
+    reply_2 = str(manual_2.get("reply", ""))
+    ensure("bloque" in reply_2.lower() or "fin de lectura" in reply_2.lower(), f"manual_seg2_bad_reply={manual_2}")
+    ensure(not bool(manual_2.get("reader", {}).get("auto_continue", True)), f"manual_seg2_auto_continue payload={manual_2}")
+    st2 = get_status()
+    ensure(int(st2.get("cursor", 0) or 0) == (cursor0 + 2), f"manual_seg2_bad_cursor status={st2} cursor0={cursor0}")
+    print("PASS manual_segui_two_steps")
+
+    # Continuous opt-in.
+    cont_on = post_chat("continuo on")
+    ensure("continua" in str(cont_on.get("reply", "")).lower(), f"continuo_on_bad_reply={cont_on}")
+    st_cont_on = get_status()
+    ensure(bool(st_cont_on.get("continuous_enabled", False)), f"continuo_on_not_enabled status={st_cont_on}")
+    step_cont = post_chat("seguí")
+    ensure(
+        bool(step_cont.get("reader", {}).get("continuous_enabled", False)),
+        f"continuous_step_missing_enabled payload={step_cont}",
+    )
+    print("PASS continuous_opt_in")
 
     # Interruption: any non-reader message should stop continuous mode.
     post_chat("hola")
     status = get_status()
     ensure(status.get("ok"), f"status_failed payload={status}")
-    ensure(not bool(status.get("continuous_active", True)), f"interrupt_not_applied status={status}")
+    ensure(not bool(status.get("continuous_enabled", True)), f"interrupt_not_applied status={status}")
     print("PASS interruption_stops_continuous")
 
     # Explicit pause command should also stop continuous mode immediately.
     post_chat("pausa lectura")
     status = get_status()
     ensure(status.get("ok"), f"status_after_pause_failed payload={status}")
-    ensure(not bool(status.get("continuous_active", True)), f"pause_not_applied status={status}")
+    ensure(not bool(status.get("continuous_enabled", True)), f"pause_not_applied status={status}")
     print("PASS pausa_lectura_stops_continuous")
-
-    # Manual mode after pause: two explicit "seguí" should advance one block each
-    # and must not reactivate continuous auto mode.
-    manual_1 = post_chat("seguí")
-    reply_1 = str(manual_1.get("reply", ""))
-    ensure("bloque" in reply_1.lower() or "fin de lectura" in reply_1.lower(), f"manual_seg1_bad_reply={manual_1}")
-    ensure(not bool(manual_1.get("reader", {}).get("auto_continue", False)), f"manual_seg1_reactivated_auto payload={manual_1}")
-    manual_2 = post_chat("seguí")
-    reply_2 = str(manual_2.get("reply", ""))
-    ensure("bloque" in reply_2.lower() or "fin de lectura" in reply_2.lower(), f"manual_seg2_bad_reply={manual_2}")
-    ensure(not bool(manual_2.get("reader", {}).get("auto_continue", False)), f"manual_seg2_reactivated_auto payload={manual_2}")
-    print("PASS manual_segui_two_steps")
 
     # Estado should show progress and continuous mode state.
     r = post_chat("estado lectura")

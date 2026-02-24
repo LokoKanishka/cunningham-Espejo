@@ -578,6 +578,8 @@ HTML = r"""<!doctype html>
         t.includes("seguir") ||
         t.includes("siguiente") ||
         t.includes("next") ||
+        t.includes("continuo on") ||
+        t.includes("continuo off") ||
         t.includes("pausa lectura") ||
         t.includes("pausar lectura") ||
         t.includes("detener lectura") ||
@@ -623,11 +625,12 @@ HTML = r"""<!doctype html>
 	      }, waitMs);
 	    }
 
-	    function applyReaderMeta(meta) {
-	      const auto = !!meta?.auto_continue;
-	      readerAutoMinDelayMs = clampInt(meta?.pacing_min_delay_ms, 1500, 250, 15000);
-	      const nextAfterMs = clampInt(meta?.next_auto_after_ms, readerAutoMinDelayMs, 0, 60000);
-	      const requiresTtsGate = !!meta?.tts_gate_required && voiceEnabled;
+    function applyReaderMeta(meta) {
+      const continuousEnabled = !!meta?.continuous_enabled;
+      const auto = !!meta?.auto_continue && continuousEnabled;
+      readerAutoMinDelayMs = clampInt(meta?.pacing_min_delay_ms, 1500, 250, 15000);
+      const nextAfterMs = clampInt(meta?.next_auto_after_ms, readerAutoMinDelayMs, 0, 60000);
+      const requiresTtsGate = !!meta?.tts_gate_required && voiceEnabled;
 	      const ttsStreamId = clampInt(meta?.tts_wait_stream_id, 0, 0, 10000000);
 	      const ttsTimeoutMs = clampInt(meta?.tts_wait_timeout_ms, 15000, 1500, 120000);
 	      readerAutoActive = auto;
