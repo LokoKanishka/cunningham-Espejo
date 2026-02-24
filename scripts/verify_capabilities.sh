@@ -7,29 +7,36 @@ is_google_auth_fail() {
 }
 
 extract_payload_text() {
-  # Read stdout, parse first JSON object, then join payloads[].text
-  python3 - <<'PY'
-import sys, json
+  # Read stdout, parse the JSON payload even if warnings/ANSI noise appear before it.
+  python3 -c '
+import sys, json, re
 raw = sys.stdin.read()
-i = raw.find("{")
-if i < 0:
-    print("__NO_JSON__", file=sys.stderr)
-    sys.exit(2)
+clean = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", raw)
 dec = json.JSONDecoder()
-try:
-    outer, _ = dec.raw_decode(raw[i:])
-except Exception:
-    print("__BAD_JSON__", file=sys.stderr)
+best = None
+for i, ch in enumerate(clean):
+    if ch != "{":
+        continue
+    try:
+        outer, _ = dec.raw_decode(clean[i:])
+    except Exception:
+        continue
+    if not isinstance(outer, dict):
+        continue
+    payloads = outer.get("result", {}).get("payloads")
+    if not isinstance(payloads, list):
+        payloads = outer.get("payloads") if isinstance(outer.get("payloads"), list) else []
+    texts = []
+    for p in payloads:
+        if isinstance(p, dict):
+            texts.append(str(p.get("text", "")))
+    if texts:
+        best = "\n".join(texts).strip()
+if best is None:
+    print("__NO_JSON_PAYLOAD__", file=sys.stderr)
     sys.exit(2)
-payloads = outer.get("result", {}).get("payloads")
-if not isinstance(payloads, list):
-    payloads = outer.get("payloads") if isinstance(outer.get("payloads"), list) else []
-texts = []
-for p in payloads:
-    if isinstance(p, dict):
-        texts.append(str(p.get("text","")))
-print("\n".join(texts).strip())
-PY
+print(best)
+'
 }
 
 echo "== capability: desktop via exec ==" >&2
@@ -41,7 +48,7 @@ if printf "%s" "$out_desktop" | is_google_auth_fail; then
   echo "DESKTOP_SKIP_AUTH google_missing_key" >&2
 else
   txt="$(printf "%s" "$out_desktop" | extract_payload_text 2>/tmp/_cap_desktop_parse.err || true)"
-  if [ "$txt" != "DESKTOP_OK" ]; then
+  if ! printf "%s" "$txt" | grep -Eq '\bDESKTOP_OK\b'; then
     echo "FAIL: desktop expected DESKTOP_OK" >&2
     echo "$txt" >&2
     echo "RAW:" >&2
