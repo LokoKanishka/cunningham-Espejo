@@ -26,6 +26,9 @@ echo "== verify_reader_ux_dc ==" >&2
 echo "== verify_slash_reader_ui ==" >&2
 ./scripts/verify_slash_reader_ui.sh
 
+echo "== verify_history_export ==" >&2
+./scripts/verify_history_export.sh
+
 echo "== verify_codex_subscription ==" >&2
 ./scripts/verify_codex_subscription.sh
 
