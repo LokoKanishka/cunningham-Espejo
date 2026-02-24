@@ -1,4 +1,4 @@
-# Dataset Export (JSONL) v0
+# Dataset Export (JSONL) v0.1
 
 Exporta conversaciones de Direct Chat desde `~/.openclaw/direct_chat_histories` a JSONL para entrenamiento.
 
@@ -32,7 +32,7 @@ Cada archivo de historial es un array JSON con items:
 {"session_id":"...","backend":"cloud","model":"...","source_file":"...","messages":[{"role":"user","content":"..."},{"role":"assistant","content":"..."}]}
 ```
 
-## Uso
+## CLI
 
 ```bash
 python3 scripts/export_history_jsonl.py \
@@ -40,13 +40,36 @@ python3 scripts/export_history_jsonl.py \
   --out ~/.openclaw/exports/dc_pairs.jsonl \
   --mode pairs \
   --min-chars 1 \
-  --max-sessions 0
+  --max-sessions 0 \
+  --max-lines 0 \
+  --since-days 0
 ```
 
-`--max-sessions 0` significa sin límite.
+- `--max-sessions 0`: sin límite.
+- `--max-lines 0`: sin límite de líneas exportadas.
+- `--since-days 0`: sin filtro temporal.
 
-## Verificación rápida
+## Resumen de calidad
+
+El script imprime JSON con métricas:
+
+- `rows`, `sessions_scanned`, `sessions_with_rows`
+- `dropped.empty_dropped`
+- `dropped.orphan_user_dropped`
+- `dropped.assistant_without_user_dropped`
+- `dropped.short_prompt_dropped`, `dropped.short_completion_dropped`
+- `top_sessions` (top 10 por cantidad de líneas exportadas)
+
+## Verificación
+
+Verificación sintética (CI/smoke):
 
 ```bash
 ./scripts/verify_history_export.sh
+```
+
+Verificación real no destructiva (solo resumen):
+
+```bash
+./scripts/verify_history_export_real.sh
 ```
