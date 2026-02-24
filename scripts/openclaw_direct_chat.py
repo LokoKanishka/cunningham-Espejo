@@ -4676,6 +4676,22 @@ def _discover_ollama_models() -> list[str]:
     return _unique_keep_order(found)
 
 
+def _configured_local_model_candidates() -> tuple[list[str], bool]:
+    # Preferred knob: strict allowlist for local selector entries.
+    strict = _split_csv(str(os.environ.get("DIRECT_CHAT_OLLAMA_MODELS", "")).strip())
+    if strict:
+        return strict, True
+    fallback = _split_csv(
+        str(
+            os.environ.get(
+                "DIRECT_CHAT_LOCAL_MODEL_CANDIDATES",
+                "dolphin-mixtral:latest,mistral-uncensored,qwen-32b-uncensored-q6",
+            )
+        ).strip()
+    )
+    return fallback, False
+
+
 def _looks_embedding_model(model_id: str) -> bool:
     lower = str(model_id or "").strip().lower()
     if not lower:
@@ -4726,14 +4742,7 @@ def _model_catalog(force_refresh: bool = False) -> dict:
 
     default_cloud, cloud_models = _discover_cloud_models()
     installed_local = _discover_ollama_models()
-    local_candidates = _split_csv(
-        str(
-            os.environ.get(
-                "DIRECT_CHAT_LOCAL_MODEL_CANDIDATES",
-                "dolphin-mixtral:latest,mistral-uncensored,qwen-32b-uncensored-q6",
-            )
-        ).strip()
-    )
+    local_candidates, local_strict_allowlist = _configured_local_model_candidates()
     alias_map = _model_alias_map()
     alias_targets = {v for v in alias_map.values() if v}
     filtered_installed_local: list[str] = []
@@ -4746,7 +4755,10 @@ def _model_catalog(force_refresh: bool = False) -> dict:
         if (not _is_chat_selector_model(mid)) and mid not in candidate_set:
             continue
         filtered_installed_local.append(mid)
-    local_all = _unique_keep_order(local_candidates + filtered_installed_local)
+    if local_strict_allowlist:
+        local_all = _unique_keep_order(local_candidates)
+    else:
+        local_all = _unique_keep_order(local_candidates + filtered_installed_local)
 
     models: list[dict] = []
     by_id: dict[str, dict] = {}
