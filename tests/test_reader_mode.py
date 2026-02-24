@@ -431,6 +431,17 @@ class TestReaderHttpEndpoints(unittest.TestCase):
         self.assertIn("tts_health_url", out)
         self.assertIn("tts_health_timeout_sec", out)
         self.assertIn("tts_available", out)
+        self.assertIn("stt_no_speech_detected", out)
+        self.assertIn("stt_vad_true_ratio", out)
+
+    def test_stt_level_endpoint_exposes_runtime_fields(self) -> None:
+        code, out = self._request("GET", "/api/stt/level?session_id=default")
+        self.assertEqual(code, 200)
+        self.assertTrue(bool(out.get("ok", False)))
+        self.assertIn("rms", out)
+        self.assertIn("threshold", out)
+        self.assertIn("vad_true_ratio", out)
+        self.assertIn("last_segment_ms", out)
 
     def test_stt_poll_owner_mismatch_returns_409(self) -> None:
         mgr = direct_chat._STT_MANAGER

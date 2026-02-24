@@ -144,8 +144,8 @@ def _bargein_config() -> dict:
         "enabled": _env_flag("DIRECT_CHAT_BARGEIN_ENABLED", True),
         "sample_rate": max(8000, _int_env("DIRECT_CHAT_BARGEIN_SAMPLE_RATE", 16000)),
         "frame_ms": max(10, min(30, _int_env("DIRECT_CHAT_BARGEIN_FRAME_MS", 30))),
-        "vad_mode": max(0, min(3, _int_env("DIRECT_CHAT_BARGEIN_VAD_MODE", 2))),
-        "min_voice_frames": max(2, _int_env("DIRECT_CHAT_BARGEIN_MIN_VOICE_FRAMES", 8)),
+        "vad_mode": max(0, min(3, _int_env("DIRECT_CHAT_BARGEIN_VAD_MODE", 1))),
+        "min_voice_frames": max(2, _int_env("DIRECT_CHAT_BARGEIN_MIN_VOICE_FRAMES", 4)),
         "rms_threshold": max(0.001, float(rms_threshold)),
         "cooldown_sec": max(0.2, float(os.environ.get("DIRECT_CHAT_BARGEIN_COOLDOWN_SEC", "1.5"))),
     }
@@ -684,10 +684,14 @@ class STTManager:
         self._vad_active = False
         self._in_speech = False
         self._vad_frames = 0
+        self._vad_true_frames = 0
+        self._last_segment_ms = 0
         self._device_label = ""
         self._drop_reason = ""
         self._items_total = 0
         self._items_dropped = 0
+        self._items_dropped_audio = 0
+        self._items_dropped_text = 0
         self._last_item_ts = 0.0
 
     @staticmethod
@@ -802,23 +806,63 @@ class STTManager:
                     self._vad_frames = max(self._vad_frames, int(event.get("vad_frames", self._vad_frames)))
                 except Exception:
                     pass
+            if "vad_true_frames" in event:
+                try:
+                    self._vad_true_frames = max(
+                        self._vad_true_frames, int(event.get("vad_true_frames", self._vad_true_frames))
+                    )
+                except Exception:
+                    pass
+            if "last_segment_ms" in event:
+                try:
+                    self._last_segment_ms = max(self._last_segment_ms, int(event.get("last_segment_ms", 0) or 0))
+                except Exception:
+                    pass
             if "device" in event:
                 self._device_label = str(event.get("device", "")).strip()
             if kind in ("stt_drop", "stt_error"):
                 self._items_dropped += 1
             if kind == "stt_drop":
-                self._drop_reason = str(event.get("reason", "drop_unknown"))[:120]
+                reason = str(event.get("reason", "drop_unknown"))[:120]
+                self._drop_reason = reason
+                if any(k in reason for k in ("text_", "command_", "tts_guard_", "empty_text")):
+                    self._items_dropped_text += 1
+                else:
+                    self._items_dropped_audio += 1
             elif kind == "stt_error":
                 detail = str(event.get("detail", "")).strip()
                 if detail:
                     self._last_error = detail[:240]
                     self._drop_reason = self._last_error
+                self._items_dropped_audio += 1
             elif kind == "stt_emit":
                 self._drop_reason = ""
 
     def _register_drop_locked(self, reason: str) -> None:
         self._items_dropped += 1
-        self._drop_reason = str(reason or "drop_unknown")[:120]
+        r = str(reason or "drop_unknown")[:120]
+        self._drop_reason = r
+        if any(k in r for k in ("text_", "command_", "tts_guard_", "empty_text")):
+            self._items_dropped_text += 1
+        else:
+            self._items_dropped_audio += 1
+
+    def _reset_diag_locked(self) -> None:
+        self._frames_seen = 0
+        self._last_audio_ts = 0.0
+        self._rms_current = 0.0
+        self._vad_active = False
+        self._in_speech = False
+        self._vad_frames = 0
+        self._vad_true_frames = 0
+        self._last_segment_ms = 0
+        self._device_label = ""
+        self._drop_reason = ""
+        self._items_total = 0
+        self._items_dropped = 0
+        self._items_dropped_audio = 0
+        self._items_dropped_text = 0
+        self._last_item_ts = 0.0
 
     def _build_worker_locked(self):
         from molbot_direct_chat import stt_local
@@ -835,10 +879,12 @@ class STTManager:
             channels=max(1, self._env_int("DIRECT_CHAT_STT_CHANNELS", 1)),
             device=selected_device,
             frame_ms=max(10, min(30, self._env_int("DIRECT_CHAT_STT_FRAME_MS", 30))),
-            vad_mode=max(0, min(3, self._env_int("DIRECT_CHAT_STT_VAD_MODE", 2))),
-            min_speech_ms=max(120, self._env_int("DIRECT_CHAT_STT_MIN_SPEECH_MS", 350)),
-            max_silence_ms=max(200, self._env_int("DIRECT_CHAT_STT_MAX_SILENCE_MS", 900)),
+            vad_mode=max(0, min(3, self._env_int("DIRECT_CHAT_STT_VAD_MODE", 1))),
+            min_speech_ms=max(120, self._env_int("DIRECT_CHAT_STT_MIN_SPEECH_MS", 220)),
+            max_silence_ms=max(200, self._env_int("DIRECT_CHAT_STT_MAX_SILENCE_MS", 1000)),
             max_segment_s=max(2.0, self._env_float("DIRECT_CHAT_STT_MAX_SEGMENT_SEC", 20.0)),
+            rms_speech_threshold=max(0.0005, float(state.get("stt_rms_threshold", 0.002) or 0.002)),
+            rms_min_frames=max(1, self._env_int("DIRECT_CHAT_STT_RMS_MIN_FRAMES", 2)),
             language=str(os.environ.get("DIRECT_CHAT_STT_LANGUAGE", "es")).strip() or "es",
             model=str(os.environ.get("DIRECT_CHAT_STT_MODEL", "small")).strip() or "small",
             fw_device=str(os.environ.get("DIRECT_CHAT_STT_FW_DEVICE", "cpu")).strip() or "cpu",
@@ -898,8 +944,12 @@ class STTManager:
     def enable(self, session_id: str = "") -> None:
         sid = _safe_session_id(session_id) if session_id else ""
         with self._lock:
+            was_enabled = bool(self._enabled)
             self._enabled = True
             if self._enabled_since_mono <= 0.0:
+                self._enabled_since_mono = time.monotonic()
+            if not was_enabled:
+                self._reset_diag_locked()
                 self._enabled_since_mono = time.monotonic()
             if sid and sid != "default" and sid != self._owner_session_id:
                 self._owner_session_id = sid
@@ -927,6 +977,7 @@ class STTManager:
             self._retry_idx = 0
             self._next_retry_mono = 0.0
             self._enabled_since_mono = 0.0
+            self._reset_diag_locked()
             self._clear_queue_locked()
         if worker is not None:
             try:
@@ -941,6 +992,7 @@ class STTManager:
             self._worker = None
             self._retry_idx = 0
             self._next_retry_mono = 0.0
+            self._reset_diag_locked()
         if worker is not None:
             try:
                 worker.stop(timeout=2.0)
@@ -1052,6 +1104,14 @@ class STTManager:
             no_audio_timeout = self._no_audio_timeout_sec()
             enabled_age = max(0.0, now - float(self._enabled_since_mono or 0.0)) if self._enabled_since_mono > 0.0 else 0.0
             no_audio_input = bool(self._enabled and running and enabled_age >= no_audio_timeout and int(self._frames_seen) <= 0)
+            no_speech_detected = bool(
+                self._enabled
+                and running
+                and enabled_age >= no_audio_timeout
+                and int(self._frames_seen) > 0
+                and int(self._vad_true_frames) <= 0
+            )
+            vad_true_ratio = (float(self._vad_true_frames) / float(self._frames_seen)) if self._frames_seen > 0 else 0.0
             return {
                 "stt_enabled": bool(self._enabled),
                 "stt_running": running,
@@ -1065,11 +1125,17 @@ class STTManager:
                 "stt_vad_active": bool(self._vad_active),
                 "stt_in_speech": bool(self._in_speech),
                 "stt_vad_frames": int(self._vad_frames),
+                "stt_vad_true_frames": int(self._vad_true_frames),
+                "stt_vad_true_ratio": float(vad_true_ratio),
+                "stt_last_segment_ms": int(self._last_segment_ms),
                 "stt_drop_reason": str(self._drop_reason),
                 "items_total": int(self._items_total),
                 "items_dropped": int(self._items_dropped),
+                "items_dropped_audio": int(self._items_dropped_audio),
+                "items_dropped_text": int(self._items_dropped_text),
                 "last_item_ts": float(self._last_item_ts or 0.0),
                 "stt_no_audio_input": bool(no_audio_input),
+                "stt_no_speech_detected": bool(no_speech_detected),
                 "stt_no_audio_timeout_sec": float(no_audio_timeout),
                 "stt_command_only": bool(self._command_only_enabled()),
             }
@@ -5341,12 +5407,16 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
     if any(k in normalized for k in ("mic nivel", "stt nivel", "nivel stt", "stt diag", "diagnostico stt")):
         st = _STT_MANAGER.status()
         no_audio = bool(st.get("stt_no_audio_input", False))
+        no_speech = bool(st.get("stt_no_speech_detected", False))
+        vad_ratio = float(st.get("stt_vad_true_ratio", 0.0) or 0.0) * 100.0
         return {
             "reply": (
                 f"STT diag: running={bool(st.get('stt_running', False))}, owner={st.get('stt_owner_session_id', '') or '-'}, "
                 f"frames={int(st.get('stt_frames_seen', 0) or 0)}, rms={float(st.get('stt_rms_current', 0.0) or 0.0):.4f}, "
-                f"vad={bool(st.get('stt_vad_active', False))}, dropped={int(st.get('items_dropped', 0) or 0)}, "
-                f"last_drop={str(st.get('stt_drop_reason', '') or '-')}, no_audio={no_audio}."
+                f"vad={bool(st.get('stt_vad_active', False))}, vad_true={vad_ratio:.1f}%, "
+                f"seg_ms={int(st.get('stt_last_segment_ms', 0) or 0)}, dropped_audio={int(st.get('items_dropped_audio', 0) or 0)}, "
+                f"dropped_text={int(st.get('items_dropped_text', 0) or 0)}, last_drop={str(st.get('stt_drop_reason', '') or '-')}, "
+                f"no_audio={no_audio}, no_speech={no_speech}."
             ),
             "no_auto_tts": True,
         }
@@ -6960,9 +7030,13 @@ class Handler(BaseHTTPRequestHandler):
                     "rms": float(stt_status.get("stt_rms_current", 0.0) or 0.0),
                     "threshold": float(cfg.get("rms_threshold", 0.012) or 0.012),
                     "in_speech": bool(stt_status.get("stt_vad_active", False)),
+                    "vad_true_ratio": float(stt_status.get("stt_vad_true_ratio", 0.0) or 0.0),
+                    "last_segment_ms": int(stt_status.get("stt_last_segment_ms", 0) or 0),
                     "frames_seen": int(stt_status.get("stt_frames_seen", 0) or 0),
                     "last_audio_ts": float(stt_status.get("stt_last_audio_ts", 0.0) or 0.0),
                     "no_audio_input": bool(stt_status.get("stt_no_audio_input", False)),
+                    "no_speech_detected": bool(stt_status.get("stt_no_speech_detected", False)),
+                    "drop_reason": str(stt_status.get("stt_drop_reason", "")),
                 },
             )
             return

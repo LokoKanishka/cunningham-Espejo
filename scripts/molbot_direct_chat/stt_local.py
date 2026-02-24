@@ -19,12 +19,14 @@ class STTConfig:
     channels: int = 1
     device: Optional[int | str] = None  # sounddevice device index or name
     frame_ms: int = 30  # webrtcvad supports 10/20/30ms
-    vad_mode: int = 2  # 0..3 (more aggressive -> fewer false positives)
+    vad_mode: int = 1  # 0..3 (more aggressive -> fewer false positives)
 
     # Segmentation
-    min_speech_ms: int = 350
-    max_silence_ms: int = 900
+    min_speech_ms: int = 220
+    max_silence_ms: int = 1000
     max_segment_s: float = 20.0
+    rms_speech_threshold: float = 0.002
+    rms_min_frames: int = 2
 
     # Transcription
     language: str = "es"
@@ -206,27 +208,79 @@ class STTWorker:
             return
 
         cfg = self.cfg
-        vad = webrtcvad.Vad(int(cfg.vad_mode))
+        target_rate = int(cfg.sample_rate or 16000)
+        if target_rate not in (8000, 16000, 32000, 48000):
+            target_rate = 16000
+            emit_diag({"kind": "stt_warn", "detail": f"unsupported_vad_rate_fallback:{cfg.sample_rate}->{target_rate}"})
+        vad = webrtcvad.Vad(int(max(0, min(3, cfg.vad_mode))))
 
-        frame_samples = int(cfg.sample_rate * cfg.frame_ms / 1000)
-        if frame_samples <= 0:
+        frame_samples_target = int(target_rate * cfg.frame_ms / 1000)
+        frame_bytes_target = int(frame_samples_target * 2)  # PCM16 mono
+        if frame_samples_target <= 0 or frame_bytes_target <= 0:
             self.last_error = "invalid_frame_samples"
-            return
-
-        # We'll use RawInputStream to get PCM16 bytes directly.
-        try:
-            stream = sd.RawInputStream(
-                samplerate=cfg.sample_rate,
-                channels=cfg.channels,
-                dtype="int16",
-                blocksize=frame_samples,
-                device=cfg.device,
-            )
-        except Exception as e:
-            self.last_error = f"sounddevice_stream_open_failed:{e}"
-            self.log(f"[stt] {self.last_error}")
             emit_diag({"kind": "stt_error", "detail": self.last_error})
             return
+
+        input_channels = 1
+        input_rate = target_rate
+        frame_samples_in = frame_samples_target
+
+        def _device_default_rate() -> int | None:
+            try:
+                info = sd.query_devices(cfg.device, kind="input")
+            except Exception:
+                try:
+                    info = sd.query_devices(cfg.device)
+                except Exception:
+                    return None
+            try:
+                rate = int(round(float(info.get("default_samplerate", 0.0) or 0.0)))
+            except Exception:
+                return None
+            return rate if rate >= 8000 else None
+
+        def _open_stream(rate: int):
+            samples = int(rate * cfg.frame_ms / 1000)
+            if samples <= 0:
+                raise RuntimeError(f"invalid_input_frame_samples:{samples}")
+            st = sd.RawInputStream(
+                samplerate=rate,
+                channels=input_channels,
+                dtype="int16",
+                blocksize=samples,
+                device=cfg.device,
+            )
+            return st, samples
+
+        stream = None
+        first_error = ""
+        sample_rate_fallback = False
+        try:
+            stream, frame_samples_in = _open_stream(target_rate)
+            input_rate = target_rate
+        except Exception as e:
+            first_error = str(e)
+            native_rate = _device_default_rate()
+            if native_rate is None:
+                self.last_error = f"sounddevice_stream_open_failed:{first_error}"
+                self.log(f"[stt] {self.last_error}")
+                emit_diag({"kind": "stt_error", "detail": self.last_error})
+                return
+            try:
+                stream, frame_samples_in = _open_stream(native_rate)
+                input_rate = int(native_rate)
+                sample_rate_fallback = True
+                emit_diag(
+                    {
+                        "kind": "stt_warn",
+                        "detail": f"stream_rate_fallback:{target_rate}->{input_rate}",
+                    }
+                )
+            except Exception as e2:
+                self.last_error = f"sounddevice_stream_open_failed:{first_error};fallback:{e2}"
+                self.log(f"[stt] {self.last_error}")
+                emit_diag({"kind": "stt_error", "detail": self.last_error})
+                return
 
         in_speech = False
         buf = bytearray()
@@ -234,11 +288,17 @@ class STTWorker:
         last_voice_mono = 0.0
         frames_seen = 0
         vad_frames = 0
+        vad_true_frames = 0
         rms_current = 0.0
         last_audio_ts = 0.0
         in_speech_now = False
+        last_segment_ms = 0
+        resample_state = None
+        frame_buffer = bytearray()
+        rms_consecutive = 0
 
         def emit_runtime_diag(extra: Optional[dict] = None) -> None:
+            vad_true_ratio = (float(vad_true_frames) / float(frames_seen)) if frames_seen > 0 else 0.0
             payload = {
                 "kind": "stt_diag",
                 "frames_seen": int(frames_seen),
@@ -247,6 +307,9 @@ class STTWorker:
                 "vad_active": bool(in_speech_now),
                 "in_speech": bool(in_speech),
                 "vad_frames": int(vad_frames),
+                "vad_true_frames": int(vad_true_frames),
+                "vad_true_ratio": float(vad_true_ratio),
+                "last_segment_ms": int(last_segment_ms),
             }
             if isinstance(extra, dict):
                 payload.update(extra)
@@ -260,8 +323,10 @@ class STTWorker:
             last_voice_mono = 0.0
 
         def maybe_emit_segment(pcm16: bytes):
+            nonlocal last_segment_ms
             # Segment length check
-            dur_ms = int(len(pcm16) / 2 / cfg.sample_rate * 1000)  # 2 bytes per sample mono
+            dur_ms = int(len(pcm16) / 2 / target_rate * 1000)  # 2 bytes per sample mono
+            last_segment_ms = int(max(0, dur_ms))
             if dur_ms < cfg.min_speech_ms:
                 emit_runtime_diag({"kind": "stt_drop", "reason": "segment_too_short", "dur_ms": int(dur_ms)})
                 return
@@ -287,19 +352,71 @@ class STTWorker:
                 emit_runtime_diag({"kind": "stt_drop", "reason": "queue_full"})
                 return
 
+        def process_frame(frame_pcm16: bytes) -> None:
+            nonlocal frames_seen, vad_frames, vad_true_frames, rms_current, last_audio_ts
+            nonlocal in_speech_now, rms_consecutive, in_speech, speech_start_mono, last_voice_mono, buf
+            if not frame_pcm16:
+                return
+            frames_seen += 1
+            last_audio_ts = time.time()
+            try:
+                rms_current = float(audioop.rms(frame_pcm16, 2) / 32768.0)
+            except Exception:
+                rms_current = 0.0
+
+            try:
+                vad_true = bool(vad.is_speech(frame_pcm16, target_rate))
+            except Exception:
+                vad_true = False
+            if vad_true:
+                vad_true_frames += 1
+                rms_consecutive = 0
+            elif rms_current >= max(0.0005, float(cfg.rms_speech_threshold)):
+                rms_consecutive += 1
+            else:
+                rms_consecutive = 0
+
+            speech_like = bool(vad_true or (rms_consecutive >= max(1, int(cfg.rms_min_frames))))
+            in_speech_now = speech_like
+
+            now = time.monotonic()
+            if speech_like:
+                vad_frames += 1
+                if not in_speech:
+                    in_speech = True
+                    speech_start_mono = now
+                    last_voice_mono = now
+                    buf = bytearray()
+                buf.extend(frame_pcm16)
+                last_voice_mono = now
+                if (now - speech_start_mono) > cfg.max_segment_s:
+                    maybe_emit_segment(bytes(buf))
+                    reset_segment()
+            else:
+                if not in_speech:
+                    emit_runtime_diag()
+                    return
+                silence_ms = int((now - last_voice_mono) * 1000)
+                if silence_ms >= cfg.max_silence_ms:
+                    maybe_emit_segment(bytes(buf))
+                    reset_segment()
+            emit_runtime_diag()
+
         try:
             with stream:
                 emit_runtime_diag(
                     {
                         "kind": "stt_started",
                         "device": str(cfg.device) if cfg.device is not None else "",
-                        "sample_rate": int(cfg.sample_rate),
+                        "sample_rate": int(target_rate),
+                        "input_rate": int(input_rate),
+                        "sample_rate_fallback": bool(sample_rate_fallback),
                         "frame_ms": int(cfg.frame_ms),
                     }
                 )
                 while not self._stop.is_set():
                     try:
-                        data, overflowed = stream.read(frame_samples)
+                        data, overflowed = stream.read(frame_samples_in)
                         if overflowed:
                             # Keep going; overflow just means missed audio
                             emit_runtime_diag({"kind": "stt_drop", "reason": "overflowed"})
@@ -313,50 +430,33 @@ class STTWorker:
                         # Anti-eco gating: drop everything and reset segments.
                         emit_runtime_diag({"kind": "stt_drop", "reason": "should_listen_false"})
                         reset_segment()
+                        frame_buffer = bytearray()
+                        rms_consecutive = 0
                         time.sleep(0.02)
                         continue
 
                     if not data:
                         continue
 
-                    frames_seen += 1
-                    last_audio_ts = time.time()
-                    try:
-                        rms_current = float(audioop.rms(data, 2) / 32768.0)
-                    except Exception:
-                        rms_current = 0.0
-
-                    # webrtcvad expects bytes of 16-bit PCM, mono
-                    try:
-                        is_speech = bool(vad.is_speech(data, cfg.sample_rate))
-                    except Exception:
-                        # On any VAD error, treat as non-speech to stay safe.
-                        is_speech = False
-                    in_speech_now = bool(is_speech)
-
-                    now = time.monotonic()
-                    if is_speech:
-                        vad_frames += 1
-                        if not in_speech:
-                            in_speech = True
-                            speech_start_mono = now
-                            last_voice_mono = now
-                            buf = bytearray()
-                        buf.extend(data)
-                        last_voice_mono = now
-                        # Hard cap segment length
-                        if (now - speech_start_mono) > cfg.max_segment_s:
-                            maybe_emit_segment(bytes(buf))
-                            reset_segment()
-                    else:
-                        if not in_speech:
+                    pcm = data
+                    if input_rate != target_rate:
+                        try:
+                            pcm, resample_state = audioop.ratecv(data, 2, 1, input_rate, target_rate, resample_state)
+                        except Exception as e:
+                            emit_runtime_diag({"kind": "stt_drop", "reason": f"resample_failed:{e}"})
                             continue
-                        # In speech: check silence duration
-                        silence_ms = int((now - last_voice_mono) * 1000)
-                        if silence_ms >= cfg.max_silence_ms:
-                            maybe_emit_segment(bytes(buf))
-                            reset_segment()
-                    emit_runtime_diag()
+                    if not pcm:
+                        continue
+                    frame_buffer.extend(pcm)
+                    while len(frame_buffer) >= frame_bytes_target:
+                        frame = bytes(frame_buffer[:frame_bytes_target])
+                        del frame_buffer[:frame_bytes_target]
+                        process_frame(frame)
+                if in_speech and buf:
+                    maybe_emit_segment(bytes(buf))
+                    reset_segment()
+                if (not in_speech_now) and int(vad_frames) <= 0 and int(frames_seen) > 0:
+                    emit_runtime_diag({"kind": "stt_drop", "reason": "no_speech_detected"})
         finally:
             reset_segment()
             emit_runtime_diag({"kind": "stt_stopped"})

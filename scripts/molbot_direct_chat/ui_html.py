@@ -267,10 +267,14 @@ HTML = r"""<!doctype html>
 	          const thr = Number(sj?.threshold || 0).toFixed(3);
 	          const inSpeech = !!sj?.in_speech;
 	          const noAudio = !!sj?.no_audio_input;
+	          const noSpeech = !!sj?.no_speech_detected;
+	          const vadPct = Math.round(Number(sj?.vad_true_ratio || 0) * 100);
 	          if (noAudio) {
 	            sttLabel = `NO_AUDIO rms ${rms}/${thr}`;
+	          } else if (noSpeech) {
+	            sttLabel = `NO_SPEECH vad ${vadPct}% rms ${rms}/${thr}`;
 	          } else {
-	            sttLabel = `${inSpeech ? "voz" : "sil"} ${rms}/${thr}`;
+	            sttLabel = `${inSpeech ? "voz" : "sil"} vad ${vadPct}% ${rms}/${thr}`;
 	          }
 	        }
 
