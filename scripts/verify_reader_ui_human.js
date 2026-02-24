@@ -143,16 +143,31 @@ async function main() {
     await waitSendEnabled(page, 30000);
     await sleep(250);
 
+    // Keep this verifier deterministic: anti-flood checks without TTS confirmations.
+    await sendAndWaitAssistant(page, "voz off", 80000);
+
     await sendAndWaitAssistant(page, "biblioteca rescan");
     await sendAndWaitAssistant(page, "biblioteca");
 
     const beforeRead = await getAssistantCount(page);
-    const firstRead = await sendAndWaitAssistant(page, "leer libro 1", 80000);
+    await sendViaUI(page, "leer libro 1");
+    await waitSendEnabled(page, 80000);
+    const firstRead = await waitUntil("leer_libro_block_reply", async () => {
+      const txt = await getLastAssistantText(page);
+      return /bloque\s+\d+\//i.test(txt) ? txt : false;
+    }, { timeoutMs: 80000, minDelayMs: 120, maxDelayMs: 1200 });
     if (!/bloque\s+\d+\//i.test(firstRead)) {
       throw new Error(`leer_libro_missing_block_header reply=${firstRead.slice(0, 220)}`);
     }
     if (firstRead.length < 100) {
       throw new Error(`leer_libro_reply_too_short len=${firstRead.length}`);
+    }
+
+    await sleep(3000);
+    const assistantsAfter3s = await getAssistantCount(page);
+    const chunksIn3s = assistantsAfter3s - beforeRead;
+    if (chunksIn3s > 2) {
+      throw new Error(`reader_flood_detected chunks_in_3s=${chunksIn3s} before=${beforeRead} after=${assistantsAfter3s}`);
     }
 
     const sessionId = await getSessionId(page);
@@ -185,10 +200,9 @@ async function main() {
       }
     }
 
-    // Interruption: trigger from UI, assert reader mode switches off via status API
-    // without waiting for model inference to finish.
-    await sendViaUI(page, "hola");
-    await waitUntil("reader_interrupted", async () => {
+    // Explicit pause should disable auto-continue immediately.
+    await sendViaUI(page, "pausa lectura");
+    await waitUntil("reader_paused", async () => {
       const st = await readerStatus(context.request, sessionId);
       return st.continuous_active === false;
     }, { timeoutMs: 25000, minDelayMs: 100, maxDelayMs: 1000 });
@@ -202,9 +216,29 @@ async function main() {
       throw new Error(`interrupt_not_applied reply=${estado.slice(0, 240)}`);
     }
 
-    const resumed = await sendAndWaitAssistant(page, "seguí", 80000);
-    if (!/bloque\s+\d+\//i.test(resumed) && !/fin de lectura/i.test(resumed)) {
-      throw new Error(`resume_missing_block reply=${resumed.slice(0, 220)}`);
+    const beforeManual = await readerStatus(context.request, sessionId);
+    const resumed1 = await sendAndWaitAssistant(page, "seguí", 80000);
+    if (!/bloque\s+\d+\//i.test(resumed1) && !/fin de lectura/i.test(resumed1)) {
+      throw new Error(`manual_1_missing_block reply=${resumed1.slice(0, 220)}`);
+    }
+    const afterManual1 = await readerStatus(context.request, sessionId);
+    if (Number(afterManual1.cursor || 0) > (Number(beforeManual.cursor || 0) + 1)) {
+      throw new Error(`manual_1_advanced_more_than_one before=${beforeManual.cursor} after=${afterManual1.cursor}`);
+    }
+    if (afterManual1.continuous_active === true) {
+      throw new Error(`manual_1_reactivated_continuous status=${JSON.stringify(afterManual1)}`);
+    }
+
+    const resumed2 = await sendAndWaitAssistant(page, "seguí", 80000);
+    if (!/bloque\s+\d+\//i.test(resumed2) && !/fin de lectura/i.test(resumed2)) {
+      throw new Error(`manual_2_missing_block reply=${resumed2.slice(0, 220)}`);
+    }
+    const afterManual2 = await readerStatus(context.request, sessionId);
+    if (Number(afterManual2.cursor || 0) > (Number(afterManual1.cursor || 0) + 1)) {
+      throw new Error(`manual_2_advanced_more_than_one prev=${afterManual1.cursor} after=${afterManual2.cursor}`);
+    }
+    if (afterManual2.continuous_active === true) {
+      throw new Error(`manual_2_reactivated_continuous status=${JSON.stringify(afterManual2)}`);
     }
 
     console.log(`READER_UI_HUMAN_OK base=${BASE} model=${model}`);

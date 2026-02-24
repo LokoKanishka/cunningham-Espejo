@@ -231,14 +231,17 @@ HTML = r"""<!doctype html>
 	    let pendingAttachments = [];
       let voiceEnabled = true;
       let speakingTimer = null;
-      let activeStreamController = null;
-      let readerAutoTimer = null;
-      let readerAutoActive = false;
-      let readerAutoInFlight = false;
-      let sttPollTimer = null;
-      let sttSending = false;
-      let sttLastText = "";
-      let sttLastTextAtMs = 0;
+	      let activeStreamController = null;
+	      let readerAutoTimer = null;
+	      let readerAutoActive = false;
+	      let readerAutoInFlight = false;
+	      let readerAutoNextAtMs = 0;
+	      let readerAutoMinDelayMs = 1500;
+	      let readerAutoTtsGate = null;
+	      let sttPollTimer = null;
+	      let sttSending = false;
+	      let sttLastText = "";
+	      let sttLastTextAtMs = 0;
 
 	    function fmtMb(mb) {
 	      if (mb == null || Number.isNaN(mb)) return "?";
@@ -284,11 +287,21 @@ HTML = r"""<!doctype html>
       return { model: value, model_backend: backend };
     }
 
-    function modelExists(id) {
-      const wanted = (id || "").trim();
-      if (!wanted) return false;
-      return Array.from(modelEl.options).some((o) => o.value === wanted);
-    }
+	    function modelExists(id) {
+	      const wanted = (id || "").trim();
+	      if (!wanted) return false;
+	      return Array.from(modelEl.options).some((o) => o.value === wanted);
+	    }
+
+	    function clampInt(value, fallback, min, max) {
+	      const n = Number(value);
+	      if (!Number.isFinite(n)) return fallback;
+	      return Math.max(min, Math.min(max, Math.trunc(n)));
+	    }
+
+	    function sleep(ms) {
+	      return new Promise((resolve) => setTimeout(resolve, ms));
+	    }
 
     async function refreshModels(force = false) {
       const qs = force ? "?refresh=1" : "";
@@ -589,32 +602,101 @@ HTML = r"""<!doctype html>
       speakingTimer = setTimeout(() => markSpeaking(false), 6000);
     }
 
-    function stopReaderAuto() {
-      readerAutoActive = false;
-      if (readerAutoTimer) {
-        clearTimeout(readerAutoTimer);
-        readerAutoTimer = null;
-      }
-    }
+	    function stopReaderAuto() {
+	      readerAutoActive = false;
+	      readerAutoNextAtMs = 0;
+	      readerAutoTtsGate = null;
+	      if (readerAutoTimer) {
+	        clearTimeout(readerAutoTimer);
+	        readerAutoTimer = null;
+	      }
+	    }
 
-    function scheduleReaderAuto() {
-      if (!readerAutoActive || readerAutoInFlight) return;
-      if (readerAutoTimer) return;
-      readerAutoTimer = setTimeout(() => {
-        readerAutoTimer = null;
-        runReaderAutoStep();
-      }, 220);
-    }
+	    function scheduleReaderAuto() {
+	      if (!readerAutoActive || readerAutoInFlight) return;
+	      if (readerAutoTimer) return;
+	      const now = Date.now();
+	      const waitMs = Math.max(0, readerAutoNextAtMs - now);
+	      readerAutoTimer = setTimeout(() => {
+	        readerAutoTimer = null;
+	        runReaderAutoStep();
+	      }, waitMs);
+	    }
 
-    function applyReaderMeta(meta) {
-      const auto = !!meta?.auto_continue;
-      readerAutoActive = auto;
-      if (auto) {
-        scheduleReaderAuto();
-      } else {
-        stopReaderAuto();
-      }
-    }
+	    function applyReaderMeta(meta) {
+	      const auto = !!meta?.auto_continue;
+	      readerAutoMinDelayMs = clampInt(meta?.pacing_min_delay_ms, 1500, 250, 15000);
+	      const nextAfterMs = clampInt(meta?.next_auto_after_ms, readerAutoMinDelayMs, 0, 60000);
+	      const requiresTtsGate = !!meta?.tts_gate_required && voiceEnabled;
+	      const ttsStreamId = clampInt(meta?.tts_wait_stream_id, 0, 0, 10000000);
+	      const ttsTimeoutMs = clampInt(meta?.tts_wait_timeout_ms, 15000, 1500, 120000);
+	      readerAutoActive = auto;
+	      readerAutoNextAtMs = auto ? (Date.now() + Math.max(nextAfterMs, readerAutoMinDelayMs)) : 0;
+	      readerAutoTtsGate = (auto && requiresTtsGate && ttsStreamId > 0)
+	        ? { streamId: ttsStreamId, timeoutMs: ttsTimeoutMs }
+	        : null;
+	      if (auto) {
+	        scheduleReaderAuto();
+	      } else {
+	        stopReaderAuto();
+	      }
+	    }
+
+	    async function fetchVoiceState() {
+	      try {
+	        const r = await fetch("/api/voice");
+	        if (!r.ok) return null;
+	        const j = await r.json();
+	        return (j && typeof j === "object") ? j : null;
+	      } catch {
+	        return null;
+	      }
+	    }
+
+	    async function pauseReaderContinuousSilently() {
+	      const sel = selectedModel();
+	      const payload = {
+	        message: "pausa lectura",
+	        model: sel.model || "openai-codex/gpt-5.1-codex-mini",
+	        model_backend: sel.model_backend || "cloud",
+	        history,
+	        mode: "operativo",
+	        session_id: sessionId,
+	        allowed_tools: allowedTools(),
+	        attachments: [],
+	      };
+	      try {
+	        await fetch("/api/chat", {
+	          method: "POST",
+	          headers: { "Content-Type": "application/json" },
+	          body: JSON.stringify(payload),
+	        });
+	      } catch {}
+	    }
+
+	    async function waitReaderTtsGateIfNeeded() {
+	      const gate = readerAutoTtsGate;
+	      if (!gate) return { ok: true };
+	      if (!voiceEnabled) return { ok: true };
+	      const streamId = clampInt(gate?.streamId, 0, 0, 10000000);
+	      const timeoutMs = clampInt(gate?.timeoutMs, 15000, 1500, 120000);
+	      if (streamId <= 0) return { ok: false, detail: "tts_stream_missing" };
+	      const deadline = Date.now() + timeoutMs;
+	      while (Date.now() < deadline) {
+	        const voice = await fetchVoiceState();
+	        if (voice && voice.enabled && voice.server_ok === false) {
+	          return { ok: false, detail: String(voice.server_detail || "voice_server_unavailable") };
+	        }
+	        const last = voice?.last_status || {};
+	        const sid = clampInt(last?.stream_id, 0, 0, 10000000);
+	        if (sid === streamId) {
+	          if (last?.ok === true) return { ok: true };
+	          if (last?.ok === false) return { ok: false, detail: String(last?.detail || "tts_failed") };
+	        }
+	        await sleep(180);
+	      }
+	      return { ok: false, detail: "tts_timeout" };
+	    }
 
     async function postChatJson(payload, controller) {
       const res = await fetch("/api/chat", {
@@ -641,22 +723,30 @@ HTML = r"""<!doctype html>
       return { data: j };
     }
 
-    async function runReaderAutoStep() {
-      if (!readerAutoActive || readerAutoInFlight) return;
-      if (sendEl.disabled) {
-        scheduleReaderAuto();
-        return;
-      }
-      readerAutoInFlight = true;
-      abortCurrentStream();
-      const controller = new AbortController();
-      activeStreamController = controller;
-      try {
-        const sel = selectedModel();
-        const payload = {
-          message: "seguí",
-          model: sel.model || "openai-codex/gpt-5.1-codex-mini",
-          model_backend: sel.model_backend || "cloud",
+	    async function runReaderAutoStep() {
+	      if (!readerAutoActive || readerAutoInFlight) return;
+	      if (sendEl.disabled) {
+	        scheduleReaderAuto();
+	        return;
+	      }
+	      readerAutoInFlight = true;
+	      abortCurrentStream();
+	      const controller = new AbortController();
+	      activeStreamController = controller;
+	      try {
+	        const gate = await waitReaderTtsGateIfNeeded();
+	        if (!gate?.ok) {
+	          stopReaderAuto();
+	          await pauseReaderContinuousSilently();
+	          await push("assistant", "voz no disponible, usá 'seguí' manual");
+	          return;
+	        }
+	        readerAutoTtsGate = null;
+	        const sel = selectedModel();
+	        const payload = {
+	          message: "seguí",
+	          model: sel.model || "openai-codex/gpt-5.1-codex-mini",
+	          model_backend: sel.model_backend || "cloud",
           history,
           mode: "operativo",
           session_id: sessionId,

@@ -104,7 +104,7 @@ READER_CACHE_DIR = Path(
 )
 
 _VOICE_LOCK = threading.Lock()
-_VOICE_LAST_STATUS = {"ok": None, "detail": "not_started", "ts": 0.0}
+_VOICE_LAST_STATUS = {"ok": None, "detail": "not_started", "ts": 0.0, "stream_id": 0}
 _TTS_PLAYBACK_PROC = None
 _TTS_STREAM_LOCK = threading.Lock()
 _TTS_STREAM_ID = 0
@@ -812,7 +812,7 @@ def _set_voice_status(stream_id: int, ok: bool | None, detail: str) -> None:
     with _TTS_STREAM_LOCK:
         if stream_id != _TTS_STREAM_ID:
             return
-    _VOICE_LAST_STATUS = {"ok": ok, "detail": str(detail), "ts": time.time()}
+    _VOICE_LAST_STATUS = {"ok": ok, "detail": str(detail), "ts": time.time(), "stream_id": int(stream_id)}
 
 
 def _stop_playback_process() -> None:
@@ -3305,7 +3305,7 @@ class ReaderSessionStore:
         if not out and str(text or "").strip():
             split = self._split_text_to_chunks(
                 text,
-                max_chars=max(320, _int_env("DIRECT_CHAT_READER_CHUNK_MAX_CHARS", 720)),
+                max_chars=max(320, _int_env("DIRECT_CHAT_READER_CHUNK_MAX_CHARS", 960)),
             )
             for idx, piece in enumerate(split):
                 out.append({"id": f"chunk_{idx + 1:03d}", "text": piece[:8000]})
@@ -3353,6 +3353,9 @@ class ReaderSessionStore:
             "continuous_active": bool(session.get("continuous_active", False)),
             "continuous_reason": str(session.get("continuous_reason", "")),
             "continuous_updated_ts": float(session.get("continuous_updated_ts", 0.0) or 0.0),
+            "last_chunk_emit_ts": float(session.get("last_chunk_emit_ts", 0.0) or 0.0),
+            "burst_window_start_ts": float(session.get("burst_window_start_ts", 0.0) or 0.0),
+            "burst_chunks_in_window": int(session.get("burst_chunks_in_window", 0) or 0),
         }
         meta = session.get("metadata")
         if isinstance(meta, dict):
@@ -3447,6 +3450,9 @@ class ReaderSessionStore:
                 "continuous_active": False,
                 "continuous_reason": "session_started",
                 "continuous_updated_ts": now,
+                "last_chunk_emit_ts": 0.0,
+                "burst_window_start_ts": 0.0,
+                "burst_chunks_in_window": 0,
                 "barge_in_count": 0,
                 "last_barge_in_detail": "",
                 "last_barge_in_ts": 0.0,
@@ -3489,11 +3495,26 @@ class ReaderSessionStore:
                 sess["chunks"] = chunks
             cursor = max(0, int(sess.get("cursor", 0) or 0))
             now = float(time.time())
+            pacing_cfg = _reader_pacing_config()
+            burst_window_sec = float(pacing_cfg.get("burst_window_ms", 0)) / 1000.0
+
+            def _touch_delivery_window() -> None:
+                prev_start = float(sess.get("burst_window_start_ts", 0.0) or 0.0)
+                prev_count = int(sess.get("burst_chunks_in_window", 0) or 0)
+                if prev_start <= 0.0 or burst_window_sec <= 0.0 or (now - prev_start) >= burst_window_sec:
+                    sess["burst_window_start_ts"] = now
+                    sess["burst_chunks_in_window"] = 1
+                else:
+                    sess["burst_window_start_ts"] = prev_start
+                    sess["burst_chunks_in_window"] = max(0, prev_count) + 1
+                sess["last_chunk_emit_ts"] = now
+
             pending = sess.get("pending")
             if isinstance(pending, dict):
                 deliveries = int(pending.get("deliveries", 0) or 0) + 1
                 pending["deliveries"] = deliveries
                 pending["last_delivery_ts"] = now
+                _touch_delivery_window()
                 sess["updated_ts"] = now
                 sess["last_event"] = "next_replay"
                 out = self._session_view(sid, sess, include_chunks=False)
@@ -3519,6 +3540,7 @@ class ReaderSessionStore:
                 "last_barge_in_ts": 0.0,
             }
             sess["pending"] = pending
+            _touch_delivery_window()
             sess["updated_ts"] = now
             sess["last_event"] = "next"
             out = self._session_view(sid, sess, include_chunks=False)
@@ -3984,6 +4006,45 @@ def _extract_allowed_tools(payload: dict) -> set[str]:
     return out
 
 
+def _reader_pacing_config() -> dict:
+    min_delay_ms = max(250, _int_env("DIRECT_CHAT_READER_PACING_MIN_MS", 1500))
+    burst_window_ms = max(1000, _int_env("DIRECT_CHAT_READER_BURST_WINDOW_MS", 10000))
+    burst_max_chunks = max(1, _int_env("DIRECT_CHAT_READER_BURST_MAX_CHUNKS", 6))
+    return {
+        "min_delay_ms": int(min_delay_ms),
+        "burst_window_ms": int(burst_window_ms),
+        "burst_max_chunks": int(burst_max_chunks),
+    }
+
+
+def _reader_tts_wait_timeout_ms() -> int:
+    return max(1500, _int_env("DIRECT_CHAT_READER_TTS_WAIT_TIMEOUT_MS", 15000))
+
+
+def _reader_pacing_wait_ms(state: dict | None, now_ts: float | None = None, cfg: dict | None = None) -> int:
+    st = state if isinstance(state, dict) else {}
+    conf = cfg if isinstance(cfg, dict) else _reader_pacing_config()
+    now = float(now_ts if now_ts is not None else time.time())
+    min_delay_ms = int(conf.get("min_delay_ms", 1500) or 1500)
+    burst_window_ms = int(conf.get("burst_window_ms", 10000) or 10000)
+    burst_max_chunks = int(conf.get("burst_max_chunks", 6) or 6)
+
+    last_emit_ts = float(st.get("last_chunk_emit_ts", 0.0) or 0.0)
+    wait_interval_ms = 0
+    if last_emit_ts > 0.0:
+        elapsed_ms = int((now - last_emit_ts) * 1000)
+        wait_interval_ms = max(0, min_delay_ms - max(0, elapsed_ms))
+
+    wait_burst_ms = 0
+    burst_count = int(st.get("burst_chunks_in_window", 0) or 0)
+    burst_start_ts = float(st.get("burst_window_start_ts", 0.0) or 0.0)
+    if burst_count >= burst_max_chunks and burst_start_ts > 0.0:
+        elapsed_window_ms = int((now - burst_start_ts) * 1000)
+        wait_burst_ms = max(0, burst_window_ms - max(0, elapsed_window_ms))
+
+    return max(wait_interval_ms, wait_burst_ms)
+
+
 def _is_reader_control_command(message: str) -> bool:
     normalized = _normalize_text(message)
     if not normalized:
@@ -4031,8 +4092,17 @@ def _reader_chunk_reply(chunk: dict, total_chunks: int, title: str = "", prefix:
     return "\n".join(parts)
 
 
-def _reader_meta(session_id: str, state: dict | None, chunk: dict | None = None, auto_continue: bool = False) -> dict:
+def _reader_meta(
+    session_id: str,
+    state: dict | None,
+    chunk: dict | None = None,
+    auto_continue: bool = False,
+    tts_stream_id: int = 0,
+    tts_gate_required: bool = False,
+) -> dict:
     st = state if isinstance(state, dict) else {}
+    pacing_cfg = _reader_pacing_config()
+    next_auto_after_ms = _reader_pacing_wait_ms(st, cfg=pacing_cfg) if auto_continue else 0
     out = {
         "session_id": _safe_session_id(session_id),
         "cursor": int(st.get("cursor", 0) or 0),
@@ -4042,6 +4112,13 @@ def _reader_meta(session_id: str, state: dict | None, chunk: dict | None = None,
         "continuous_active": bool(st.get("continuous_active", False)),
         "continuous_reason": str(st.get("continuous_reason", "")),
         "auto_continue": bool(auto_continue),
+        "pacing_min_delay_ms": int(pacing_cfg.get("min_delay_ms", 1500) or 1500),
+        "pacing_burst_window_ms": int(pacing_cfg.get("burst_window_ms", 10000) or 10000),
+        "pacing_burst_max_chunks": int(pacing_cfg.get("burst_max_chunks", 6) or 6),
+        "next_auto_after_ms": int(max(0, next_auto_after_ms)),
+        "tts_gate_required": bool(tts_gate_required),
+        "tts_wait_stream_id": int(tts_stream_id) if tts_gate_required and int(tts_stream_id) > 0 else 0,
+        "tts_wait_timeout_ms": _reader_tts_wait_timeout_ms() if tts_gate_required else 0,
     }
     if isinstance(chunk, dict):
         out["chunk_index"] = int(chunk.get("chunk_index", 0) or 0)
@@ -4094,7 +4171,7 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
                 "- segui\n"
                 "- repetir\n"
                 "- estado lectura\n"
-                "- pausar lectura"
+                "- pausa lectura"
             ),
             "no_auto_tts": True,
         }
@@ -4176,8 +4253,10 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         chunk_text = str(chunk.get("text", "")).strip()
         chunk_id = str(chunk.get("chunk_id", "")).strip()
         chunk_index = int(chunk.get("chunk_index", 0) or 0)
-        if ("tts" in allowed_tools) and _voice_enabled() and chunk_text:
-            _speak_reply_async(chunk_text)
+        tts_gate_required = ("tts" in allowed_tools) and _voice_enabled() and bool(chunk_text)
+        tts_stream_id = 0
+        if tts_gate_required:
+            tts_stream_id = _speak_reply_async(chunk_text)
         _READER_STORE.commit(
             session_id,
             chunk_id=chunk_id,
@@ -4197,7 +4276,14 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
                 prefix=f"Lectura iniciada de '{title}'.",
             ),
             "no_auto_tts": True,
-            "reader": _reader_meta(session_id, st_after, chunk=chunk, auto_continue=auto_continue),
+            "reader": _reader_meta(
+                session_id,
+                st_after,
+                chunk=chunk,
+                auto_continue=auto_continue,
+                tts_stream_id=tts_stream_id,
+                tts_gate_required=tts_gate_required,
+            ),
         }
 
     if any(k in normalized for k in ("pausa lectura", "pausar lectura", "detener lectura", "parar lectura", "stop lectura")):
@@ -4252,8 +4338,10 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
                 "text": str(raw.get("text", "")),
             }
         chunk_text = str(chunk.get("text", "")).strip()
-        if ("tts" in allowed_tools) and _voice_enabled() and chunk_text:
-            _speak_reply_async(chunk_text)
+        tts_gate_required = ("tts" in allowed_tools) and _voice_enabled() and bool(chunk_text)
+        tts_stream_id = 0
+        if tts_gate_required:
+            tts_stream_id = _speak_reply_async(chunk_text)
         return {
             "reply": _reader_chunk_reply(
                 chunk,
@@ -4267,13 +4355,24 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
                 st,
                 chunk=chunk,
                 auto_continue=bool(st.get("continuous_active", False)) and (not bool(st.get("done", False))),
+                tts_stream_id=tts_stream_id,
+                tts_gate_required=tts_gate_required,
             ),
         }
 
     if any(k in normalized for k in ("segui", "siguiente")) or bool(re.search(r"\bnext\b", normalized)):
         st_before = _READER_STORE.get_session(session_id, include_chunks=False)
-        if st_before.get("ok") and (not bool(st_before.get("continuous_active", False))):
-            _READER_STORE.set_continuous(session_id, True, reason="reader_resumed_by_user")
+        if not st_before.get("ok"):
+            return {"reply": "No hay sesión de lectura activa. Usá 'biblioteca' y 'leer libro <n>'.", "no_auto_tts": True}
+        was_continuous = bool(st_before.get("continuous_active", False))
+        if was_continuous:
+            wait_ms = _reader_pacing_wait_ms(st_before)
+            if wait_ms > 0:
+                return {
+                    "reply": f"Pausa breve de lectura ({wait_ms} ms) para evitar ráfaga.",
+                    "no_auto_tts": True,
+                    "reader": _reader_meta(session_id, st_before, auto_continue=True),
+                }
         out = _READER_STORE.next_chunk(session_id)
         if not out.get("ok"):
             return {"reply": "No hay sesión de lectura activa. Usá 'biblioteca' y 'leer libro <n>'.", "no_auto_tts": True}
@@ -4289,8 +4388,10 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         chunk_text = str(chunk.get("text", "")).strip()
         chunk_id = str(chunk.get("chunk_id", "")).strip()
         chunk_index = int(chunk.get("chunk_index", 0) or 0)
-        if ("tts" in allowed_tools) and _voice_enabled() and chunk_text:
-            _speak_reply_async(chunk_text)
+        tts_gate_required = ("tts" in allowed_tools) and _voice_enabled() and bool(chunk_text)
+        tts_stream_id = 0
+        if tts_gate_required:
+            tts_stream_id = _speak_reply_async(chunk_text)
         _READER_STORE.commit(
             session_id,
             chunk_id=chunk_id,
@@ -4314,7 +4415,14 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         return {
             "reply": reply,
             "no_auto_tts": True,
-            "reader": _reader_meta(session_id, st_after, chunk=chunk, auto_continue=auto_continue),
+            "reader": _reader_meta(
+                session_id,
+                st_after,
+                chunk=chunk,
+                auto_continue=auto_continue,
+                tts_stream_id=tts_stream_id,
+                tts_gate_required=tts_gate_required,
+            ),
         }
 
     yt_transport = _extract_youtube_transport_request(message)
@@ -5160,6 +5268,7 @@ class Handler(BaseHTTPRequestHandler):
             "server_url": _alltalk_base_url(),
             "server_ok": bool(server_ok),
             "server_detail": str(server_detail),
+            "tts_playing": bool(_tts_is_playing()),
             "last_status": _VOICE_LAST_STATUS,
             **_bargein_status(),
             **stt_status,
