@@ -140,6 +140,17 @@ class TestReaderSessionStore(unittest.TestCase):
         self.assertTrue(rew.get("rewound"))
         self.assertEqual(str(rew.get("rewind_unit", "")), "sentence")
 
+    def test_manual_mode_toggle_controls_autopilot(self) -> None:
+        self.store.start_session("sess_g", chunks=["uno", "dos"], reset=True)
+        man_on = self.store.set_manual_mode("sess_g", True, reason="unit_manual_on")
+        self.assertTrue(man_on.get("ok"))
+        self.assertTrue(bool(man_on.get("manual_mode", False)))
+        self.assertFalse(bool(man_on.get("continuous_enabled", True)))
+        cont_on = self.store.set_continuous("sess_g", True, reason="unit_cont_on")
+        self.assertTrue(cont_on.get("ok"))
+        self.assertTrue(bool(cont_on.get("continuous_enabled", False)))
+        self.assertFalse(bool(cont_on.get("manual_mode", True)))
+
 
 class TestReaderHttpEndpoints(unittest.TestCase):
     def setUp(self) -> None:

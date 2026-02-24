@@ -10,7 +10,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "== verify reader ux dc v0.6 ==" >&2
+echo "== verify reader ux dc v0.7 ==" >&2
 echo "tmp_dir=${TMP_DIR}" >&2
 
 python3 - "${TMP_DIR}" <<'PY'
@@ -105,6 +105,15 @@ def post_chat(message: str, allowed_tools=None) -> dict:
         return body if isinstance(body, dict) else {}
 
 
+def post_reader_step(message: str) -> dict:
+    out = post_chat(message)
+    reply = str(out.get("reply", "")).lower()
+    if "pausa breve de lectura" in reply:
+        time.sleep(1.7)
+        out = post_chat("seguí")
+    return out
+
+
 def get_status() -> dict:
     req = Request(base + f"/api/reader/session?session_id={session_id}", method="GET")
     with urlopen(req, timeout=5) as resp:
@@ -140,29 +149,28 @@ try:
     ensure("1)" in str(r.get("reply", "")) or "biblioteca" in str(r.get("reply", "")).lower(), f"biblioteca_failed reply={r}")
     print("PASS biblioteca_list")
 
-    # Manual default start + visible content in the same reply.
+    # v0.7 default: autopilot ON at start + visible content in the same reply.
     blocks = []
     r = post_chat("leer libro 1")
     reply = str(r.get("reply", ""))
     ensure("bloque" in reply.lower(), f"leer_libro_no_block reply={reply}")
     ensure("PARTE" in reply, f"leer_libro_no_text reply={reply[:220]}")
-    ensure(not bool(r.get("reader", {}).get("auto_continue", True)), f"leer_libro_should_be_manual payload={r}")
-    ensure(not bool(r.get("reader", {}).get("continuous_enabled", True)), f"leer_libro_continuous_enabled payload={r}")
+    ensure(bool(r.get("reader", {}).get("auto_continue", False)), f"leer_libro_autopilot_off payload={r}")
+    ensure(bool(r.get("reader", {}).get("continuous_enabled", False)), f"leer_libro_continuous_disabled payload={r}")
+    ensure(not bool(r.get("reader", {}).get("manual_mode", True)), f"leer_libro_manual_mode_unexpected payload={r}")
     blocks.append(reply)
-    print("PASS leer_libro_manual_start")
+    print("PASS leer_libro_autopilot_default")
 
-    # No auto-run in manual mode: cursor must remain unchanged without commands.
-    status_before_wait = get_status()
-    time.sleep(3.0)
-    status_after_wait = get_status()
-    ensure(
-        int(status_after_wait.get("cursor", -1)) == int(status_before_wait.get("cursor", -2)),
-        f"manual_autorun_detected before={status_before_wait} after={status_after_wait}",
-    )
-    print("PASS manual_no_auto_run")
+    # Manual is explicit in v0.7.
+    man_on = post_chat("modo manual on")
+    ensure("manual" in str(man_on.get("reply", "")).lower(), f"manual_on_bad_reply payload={man_on}")
+    st_manual_on = get_status()
+    ensure(bool(st_manual_on.get("manual_mode", False)), f"manual_mode_not_enabled status={st_manual_on}")
+    ensure(not bool(st_manual_on.get("continuous_enabled", True)), f"manual_on_continuous_still_on status={st_manual_on}")
+    print("PASS manual_mode_on")
 
-    # Manual mode: two explicit "seguí" should advance one block each and stay manual.
-    cursor0 = int(status_after_wait.get("cursor", 0) or 0)
+    # In manual mode, two explicit "seguí" advance one block each and stay manual.
+    cursor0 = int(st_manual_on.get("cursor", 0) or 0)
     manual_1 = post_chat("seguí")
     reply_1 = str(manual_1.get("reply", ""))
     ensure("bloque" in reply_1.lower() or "fin de lectura" in reply_1.lower(), f"manual_seg1_bad_reply={manual_1}")
@@ -177,17 +185,13 @@ try:
     ensure(int(st2.get("cursor", 0) or 0) == (cursor0 + 2), f"manual_seg2_bad_cursor status={st2} cursor0={cursor0}")
     print("PASS manual_segui_two_steps")
 
-    # Continuous opt-in.
-    cont_on = post_chat("continuo on")
-    ensure("continua" in str(cont_on.get("reply", "")).lower(), f"continuo_on_bad_reply={cont_on}")
-    st_cont_on = get_status()
-    ensure(bool(st_cont_on.get("continuous_enabled", False)), f"continuo_on_not_enabled status={st_cont_on}")
-    step_cont = post_chat("seguí")
-    ensure(
-        bool(step_cont.get("reader", {}).get("continuous_enabled", False)),
-        f"continuous_step_missing_enabled payload={step_cont}",
-    )
-    print("PASS continuous_opt_in")
+    # Exit manual mode: autopilot can resume.
+    man_off = post_chat("modo manual off")
+    ensure("autopiloto" in str(man_off.get("reply", "")).lower(), f"manual_off_bad_reply payload={man_off}")
+    st_manual_off = get_status()
+    ensure(not bool(st_manual_off.get("manual_mode", True)), f"manual_mode_not_disabled status={st_manual_off}")
+    ensure(bool(st_manual_off.get("continuous_enabled", False)), f"manual_off_continuous_off status={st_manual_off}")
+    print("PASS manual_mode_off")
 
     # Interruption: any non-reader message should stop continuous mode.
     post_chat("hola")
@@ -203,7 +207,7 @@ try:
     ensure(not bool(status.get("continuous_enabled", True)), f"pause_not_applied status={status}")
     print("PASS pausa_lectura_stops_continuous")
 
-    # v0.6: barge-in bookmark + continue/seek/rewind commands.
+    # v0.6/v0.7: barge-in bookmark + continue/seek/rewind commands.
     reader_post(
         "/api/reader/session/start",
         {
@@ -224,17 +228,27 @@ try:
     print("PASS barge_in_bookmark")
 
     post_chat("comentario académico breve")
-    resumed = post_chat("continuar")
+    resumed = post_reader_step("continuar")
     resumed_reply = str(resumed.get("reply", ""))
     ensure("bloque" in resumed_reply.lower(), f"continuar_no_block payload={resumed}")
+    rmeta = resumed.get("reader", {}) if isinstance(resumed.get("reader"), dict) else {}
+    ensure(
+        bool(rmeta.get("continuous_enabled", False)) or bool(rmeta.get("done", False)),
+        f"continuar_should_resume_autopilot payload={resumed}",
+    )
     print("PASS continuar_from_bookmark")
 
-    resumed_from = post_chat('continuar desde "matriz"')
+    resumed_from = post_reader_step('continuar desde "matriz"')
     resumed_from_reply = str(resumed_from.get("reply", "")).lower()
     ensure(("matriz" in resumed_from_reply) or ("bloque" in resumed_from_reply), f"continuar_desde_bad payload={resumed_from}")
+    rmeta_from = resumed_from.get("reader", {}) if isinstance(resumed_from.get("reader"), dict) else {}
+    ensure(
+        bool(rmeta_from.get("continuous_enabled", False)) or bool(rmeta_from.get("done", False)),
+        f"continuar_desde_should_resume_autopilot payload={resumed_from}",
+    )
     print("PASS continuar_desde_phrase")
 
-    rewind = post_chat("volver una frase")
+    rewind = post_reader_step("volver una frase")
     rewind_reply = str(rewind.get("reply", ""))
     ensure("bloque" in rewind_reply.lower(), f"volver_una_frase_bad payload={rewind}")
     print("PASS volver_una_frase")

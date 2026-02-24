@@ -586,6 +586,8 @@ HTML = r"""<!doctype html>
         t.includes("volver un párrafo") ||
         t.includes("continuo on") ||
         t.includes("continuo off") ||
+        t.includes("modo manual on") ||
+        t.includes("modo manual off") ||
         t.includes("detenete") ||
         t.includes("detente") ||
         t.includes("pausa lectura") ||
@@ -749,7 +751,8 @@ HTML = r"""<!doctype html>
 	        if (!gate?.ok) {
 	          stopReaderAuto();
 	          await pauseReaderContinuousSilently();
-	          await push("assistant", "voz no disponible, usá 'seguí' manual");
+	          const detail = String(gate?.detail || "tts_unavailable");
+	          await push("assistant", `voz no disponible (${detail}), usá 'modo manual on' o 'continuar' manual`);
 	          return;
 	        }
 	        readerAutoTtsGate = null;

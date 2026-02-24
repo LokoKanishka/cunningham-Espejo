@@ -3527,6 +3527,7 @@ class ReaderSessionStore:
             "last_commit_ts": float(session.get("last_commit_ts", 0.0) or 0.0),
             "continuous_active": bool(session.get("continuous_active", False)),
             "continuous_enabled": bool(session.get("continuous_enabled", session.get("continuous_active", False))),
+            "manual_mode": bool(session.get("manual_mode", False)),
             "continuous_reason": str(session.get("continuous_reason", "")),
             "continuous_updated_ts": float(session.get("continuous_updated_ts", 0.0) or 0.0),
             "last_chunk_emit_ts": float(session.get("last_chunk_emit_ts", 0.0) or 0.0),
@@ -3626,6 +3627,7 @@ class ReaderSessionStore:
                 "bookmark": None,
                 "continuous_active": False,
                 "continuous_enabled": False,
+                "manual_mode": False,
                 "continuous_reason": "session_started",
                 "continuous_updated_ts": now,
                 "last_chunk_emit_ts": 0.0,
@@ -3887,6 +3889,8 @@ class ReaderSessionStore:
             now = float(time.time())
             sess["continuous_active"] = bool(active)
             sess["continuous_enabled"] = bool(active)
+            if bool(active):
+                sess["manual_mode"] = False
             sess["continuous_reason"] = reason_clean or ("continuous_on" if active else "continuous_off")
             sess["continuous_updated_ts"] = now
             sess["updated_ts"] = now
@@ -3897,6 +3901,34 @@ class ReaderSessionStore:
                 sess["reader_state"] = "paused"
             out = self._session_view(sid, sess, include_chunks=False)
             out["continuous_changed"] = True
+            return out
+
+        return self._with_state(True, _write)
+
+    def set_manual_mode(self, session_id: str, enabled: bool, reason: str = "") -> dict:
+        sid = _safe_session_id(session_id)
+        reason_clean = str(reason or "").strip()[:120]
+
+        def _write(state_obj: dict) -> dict:
+            sessions = state_obj.get("sessions", {})
+            if not isinstance(sessions, dict) or sid not in sessions or not isinstance(sessions.get(sid), dict):
+                return self._session_missing(sid)
+            sess = sessions[sid]
+            now = float(time.time())
+            on = bool(enabled)
+            sess["manual_mode"] = on
+            sess["updated_ts"] = now
+            sess["last_event"] = "manual_mode_on" if on else "manual_mode_off"
+            sess["manual_mode_reason"] = reason_clean or ("manual_mode_on" if on else "manual_mode_off")
+            if on:
+                sess["continuous_active"] = False
+                sess["continuous_enabled"] = False
+                sess["continuous_reason"] = "manual_mode_on"
+                sess["continuous_updated_ts"] = now
+                if str(sess.get("reader_state", "")) == "reading":
+                    sess["reader_state"] = "paused"
+            out = self._session_view(sid, sess, include_chunks=False)
+            out["manual_mode_changed"] = True
             return out
 
         return self._with_state(True, _write)
@@ -4469,6 +4501,8 @@ def _is_reader_control_command(message: str) -> bool:
             "volver un párrafo",
             "continuo on",
             "continuo off",
+            "modo manual on",
+            "modo manual off",
             "detenete",
             "detente",
             "pausa lectura",
@@ -4518,6 +4552,7 @@ def _reader_meta(
         "has_pending": bool(st.get("has_pending", False)),
         "continuous_active": bool(st.get("continuous_active", False)),
         "continuous_enabled": bool(st.get("continuous_enabled", st.get("continuous_active", False))),
+        "manual_mode": bool(st.get("manual_mode", False)),
         "continuous_reason": str(st.get("continuous_reason", "")),
         "reader_state": str(st.get("reader_state", "paused") or "paused"),
         "auto_continue": bool(auto_continue),
@@ -4544,12 +4579,22 @@ def _reader_meta(
     return out
 
 
+def _reader_voice_unavailable_detail() -> str:
+    ok, detail = _alltalk_health(timeout_s=0.35)
+    if not ok:
+        return f"alltalk_unavailable:{str(detail or 'health_failed')}"
+    last = str((_VOICE_LAST_STATUS or {}).get("detail", "")).strip()
+    if last and last not in ("not_started", "queued"):
+        return f"tts_start_failed:{last}"
+    return "tts_start_failed:stream_not_created"
+
+
 def _reader_emit_chunk(
     session_id: str,
     chunk: dict,
     allowed_tools: set[str],
     commit_reason: str,
-) -> tuple[bool, int, bool]:
+) -> tuple[bool, int, bool, str]:
     chunk_text = str(chunk.get("text", "")).strip()
     chunk_id = str(chunk.get("chunk_id", "")).strip()
     chunk_index = int(chunk.get("chunk_index", 0) or 0)
@@ -4557,6 +4602,7 @@ def _reader_emit_chunk(
     tts_gate_required = ("tts" in allowed_tools) and _voice_enabled() and bool(chunk_text)
     tts_stream_id = 0
     committed = False
+    tts_unavailable_detail = ""
     if tts_gate_required:
         tts_stream_id = int(_speak_reply_async(chunk_text) or 0)
         if tts_stream_id > 0:
@@ -4570,6 +4616,9 @@ def _reader_emit_chunk(
             )
         else:
             tts_gate_required = False
+            tts_unavailable_detail = _reader_voice_unavailable_detail()
+            _READER_STORE.set_continuous(session_id, False, reason="reader_voice_unavailable")
+            _READER_STORE.set_reader_state(session_id, "paused", reason="reader_voice_unavailable")
     if not tts_gate_required:
         _READER_STORE.commit(
             session_id,
@@ -4578,7 +4627,7 @@ def _reader_emit_chunk(
             reason=commit_reason,
         )
         committed = True
-    return tts_gate_required, tts_stream_id, committed
+    return tts_gate_required, tts_stream_id, committed, tts_unavailable_detail
 
 
 def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id: str) -> dict | None:
@@ -4627,7 +4676,8 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
                 "- continuar\n"
                 "- continuar desde \"<frase>\"\n"
                 "- volver una frase | volver un párrafo\n"
-                "- continuo on|off\n"
+                "- modo manual on|off\n"
+                "- continuo on|off (alias)\n"
                 "- repetir\n"
                 "- estado lectura\n"
                 "- pausa lectura | detenete"
@@ -4670,6 +4720,34 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
             "no_auto_tts": True,
         }
 
+    m_manual = re.search(r"\b(?:modo\s+manual|manual)\s+(on|off)\b", normalized, flags=re.IGNORECASE)
+    if m_manual:
+        st = _READER_STORE.get_session(session_id, include_chunks=False)
+        if not st.get("ok"):
+            return {"reply": "No hay sesión de lectura activa en este chat.", "no_auto_tts": True}
+        mode = str(m_manual.group(1) or "").strip().lower()
+        manual_on = mode == "on"
+        _READER_STORE.set_manual_mode(session_id, manual_on, reason="reader_manual_mode_command")
+        if manual_on:
+            _READER_STORE.set_continuous(session_id, False, reason="reader_manual_mode_on")
+        else:
+            _READER_STORE.set_continuous(session_id, True, reason="reader_manual_mode_off_autopilot")
+        st_after = _READER_STORE.get_session(session_id, include_chunks=False)
+        has_more = (not bool(st_after.get("done", False))) and int(st_after.get("cursor", 0) or 0) < int(
+            st_after.get("total_chunks", 0) or 0
+        )
+        if manual_on:
+            return {
+                "reply": "Modo manual activado. Avanza de a un bloque con 'seguí'.",
+                "no_auto_tts": True,
+                "reader": _reader_meta(session_id, st_after, auto_continue=False),
+            }
+        return {
+            "reply": "Modo manual desactivado. Vuelve el autopiloto de lectura.",
+            "no_auto_tts": True,
+            "reader": _reader_meta(session_id, st_after, auto_continue=has_more),
+        }
+
     m_cont = re.search(r"\bcontinuo\s+(on|off)\b", normalized, flags=re.IGNORECASE)
     if m_cont:
         st = _READER_STORE.get_session(session_id, include_chunks=False)
@@ -4678,13 +4756,17 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         mode = str(m_cont.group(1) or "").strip().lower()
         enable = mode == "on"
         reason = "reader_continuous_opt_in" if enable else "reader_continuous_opt_out"
+        _READER_STORE.set_manual_mode(session_id, not enable, reason="reader_continuous_alias")
         _READER_STORE.set_continuous(session_id, enable, reason=reason)
         st_after = _READER_STORE.get_session(session_id, include_chunks=False)
+        has_more = (not bool(st_after.get("done", False))) and int(st_after.get("cursor", 0) or 0) < int(
+            st_after.get("total_chunks", 0) or 0
+        )
         if enable:
             return {
                 "reply": "Lectura continua activada. Va a avanzar sola con pacing hasta que la pauses.",
                 "no_auto_tts": True,
-                "reader": _reader_meta(session_id, st_after, auto_continue=not bool(st_after.get("done", False))),
+                "reader": _reader_meta(session_id, st_after, auto_continue=has_more),
             }
         return {
             "reply": "Lectura continua desactivada. Quedó en modo manual (usá 'seguí').",
@@ -4712,7 +4794,7 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
             return {"reply": f"No pude abrir el libro ({loaded.get('error', 'reader_book_error')}).", "no_auto_tts": True}
         book_meta = loaded.get("book", {})
         title = str(book_meta.get("title", item.get("title", "libro"))).strip() if isinstance(book_meta, dict) else "libro"
-        explicit_continuous = bool(re.search(r"\bcontinuo\b", normalized, flags=re.IGNORECASE))
+        explicit_manual = bool(re.search(r"\bmanual\b", normalized, flags=re.IGNORECASE))
         started = _READER_STORE.start_session(
             session_id,
             chunks=[],
@@ -4722,10 +4804,11 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         )
         if not started.get("ok"):
             return {"reply": f"No pude iniciar lectura ({started.get('error', 'reader_start_failed')}).", "no_auto_tts": True}
+        _READER_STORE.set_manual_mode(session_id, explicit_manual, reason="reader_start_mode")
         _READER_STORE.set_continuous(
             session_id,
-            explicit_continuous,
-            reason="reader_start_continuous_opt_in" if explicit_continuous else "reader_start_manual_default",
+            not explicit_manual,
+            reason="reader_start_manual_explicit" if explicit_manual else "reader_start_autopilot_default",
         )
         first = _READER_STORE.next_chunk(session_id)
         chunk = first.get("chunk") if isinstance(first, dict) else None
@@ -4736,7 +4819,7 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
                 "no_auto_tts": True,
                 "reader": _reader_meta(session_id, _READER_STORE.get_session(session_id), auto_continue=False),
             }
-        tts_gate_required, tts_stream_id, _committed = _reader_emit_chunk(
+        tts_gate_required, tts_stream_id, _committed, tts_unavailable_detail = _reader_emit_chunk(
             session_id=session_id,
             chunk=chunk,
             allowed_tools=allowed_tools,
@@ -4747,16 +4830,19 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
             st_after.get("total_chunks", 0) or 0
         )
         auto_continue = bool(st_after.get("continuous_enabled", False)) and has_more
+        start_prefix = (
+            f"Lectura iniciada de '{title}' (modo manual)."
+            if explicit_manual
+            else f"Lectura iniciada de '{title}' (autopiloto ON)."
+        )
+        if tts_unavailable_detail:
+            start_prefix += f" Voz no disponible ({tts_unavailable_detail}). Queda en manual estable."
         return {
             "reply": _reader_chunk_reply(
                 chunk,
                 total_chunks=int(st_after.get("total_chunks", 0) or 0),
                 title=title,
-                prefix=(
-                    f"Lectura iniciada de '{title}' (continuo ON)."
-                    if explicit_continuous
-                    else f"Lectura iniciada de '{title}' (modo manual)."
-                ),
+                prefix=start_prefix,
             ),
             "no_auto_tts": True,
             "reader": _reader_meta(
@@ -4794,7 +4880,7 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         _READER_STORE.set_reader_state(session_id, "paused", reason="reader_user_paused")
         st_after = _READER_STORE.get_session(session_id, include_chunks=False)
         return {
-            "reply": "Lectura en pausa. Para retomar, decí: seguí",
+            "reply": "Lectura en pausa. Para retomar, decí: continuar",
             "no_auto_tts": True,
             "reader": _reader_meta(session_id, st_after, auto_continue=False),
         }
@@ -4806,6 +4892,15 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         phrase = str(m_continue_from.group(1) or "").strip()
         if not phrase:
             return {"reply": "Indicá una frase para continuar. Ejemplo: continuar desde \"matriz\".", "no_auto_tts": True}
+        st_before = _READER_STORE.get_session(session_id, include_chunks=False)
+        if not st_before.get("ok"):
+            return {"reply": "No hay sesión de lectura activa. Usá 'biblioteca' y 'leer libro <n>'.", "no_auto_tts": True}
+        manual_mode = bool(st_before.get("manual_mode", False))
+        _READER_STORE.set_continuous(
+            session_id,
+            not manual_mode,
+            reason="reader_continue_from_phrase_autopilot" if (not manual_mode) else "reader_continue_from_phrase_manual_mode",
+        )
         sought = _READER_STORE.seek_phrase(session_id, phrase=phrase)
         if not sought.get("ok"):
             return {
@@ -4819,7 +4914,7 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         if not isinstance(chunk, dict):
             st_now = _READER_STORE.get_session(session_id, include_chunks=False)
             return {"reply": "No pude retomar desde esa frase.", "no_auto_tts": True, "reader": _reader_meta(session_id, st_now)}
-        tts_gate_required, tts_stream_id, _committed = _reader_emit_chunk(
+        tts_gate_required, tts_stream_id, _committed, tts_unavailable_detail = _reader_emit_chunk(
             session_id=session_id,
             chunk=chunk,
             allowed_tools=allowed_tools,
@@ -4831,12 +4926,15 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
             st_after.get("total_chunks", 0) or 0
         )
         auto_continue = bool(st_after.get("continuous_enabled", False)) and has_more
+        prefix = f"Retomo desde: \"{phrase}\"."
+        if tts_unavailable_detail:
+            prefix += f" Voz no disponible ({tts_unavailable_detail}). Queda en manual estable."
         return {
             "reply": _reader_chunk_reply(
                 chunk,
                 total_chunks=int(st_after.get("total_chunks", 0) or 0),
                 title=str(meta_after.get("book_title", "")),
-                prefix=f"Retomo desde: \"{phrase}\".",
+                prefix=prefix,
             ),
             "no_auto_tts": True,
             "reader": _reader_meta(
@@ -4850,6 +4948,15 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         }
 
     if any(k in normalized for k in ("volver una frase",)):
+        st_before = _READER_STORE.get_session(session_id, include_chunks=False)
+        if not st_before.get("ok"):
+            return {"reply": "No hay sesión de lectura activa. Usá 'biblioteca' y 'leer libro <n>'.", "no_auto_tts": True}
+        manual_mode = bool(st_before.get("manual_mode", False))
+        _READER_STORE.set_continuous(
+            session_id,
+            not manual_mode,
+            reason="reader_rewind_sentence_autopilot" if (not manual_mode) else "reader_rewind_sentence_manual_mode",
+        )
         rew = _READER_STORE.rewind(session_id, unit="sentence")
         if not rew.get("ok"):
             return {"reply": "No pude retroceder una frase en esta sesión.", "no_auto_tts": True}
@@ -4858,7 +4965,7 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         if not isinstance(chunk, dict):
             st_now = _READER_STORE.get_session(session_id, include_chunks=False)
             return {"reply": "No pude retomar tras volver una frase.", "no_auto_tts": True, "reader": _reader_meta(session_id, st_now)}
-        tts_gate_required, tts_stream_id, _committed = _reader_emit_chunk(
+        tts_gate_required, tts_stream_id, _committed, tts_unavailable_detail = _reader_emit_chunk(
             session_id=session_id,
             chunk=chunk,
             allowed_tools=allowed_tools,
@@ -4870,12 +4977,15 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
             st_after.get("total_chunks", 0) or 0
         )
         auto_continue = bool(st_after.get("continuous_enabled", False)) and has_more
+        prefix = "Retrocedí una frase y retomo desde ahí."
+        if tts_unavailable_detail:
+            prefix += f" Voz no disponible ({tts_unavailable_detail}). Queda en manual estable."
         return {
             "reply": _reader_chunk_reply(
                 chunk,
                 total_chunks=int(st_after.get("total_chunks", 0) or 0),
                 title=str(meta_after.get("book_title", "")),
-                prefix="Retrocedí una frase y retomo desde ahí.",
+                prefix=prefix,
             ),
             "no_auto_tts": True,
             "reader": _reader_meta(
@@ -4889,6 +4999,15 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         }
 
     if any(k in normalized for k in ("volver un parrafo", "volver un párrafo")):
+        st_before = _READER_STORE.get_session(session_id, include_chunks=False)
+        if not st_before.get("ok"):
+            return {"reply": "No hay sesión de lectura activa. Usá 'biblioteca' y 'leer libro <n>'.", "no_auto_tts": True}
+        manual_mode = bool(st_before.get("manual_mode", False))
+        _READER_STORE.set_continuous(
+            session_id,
+            not manual_mode,
+            reason="reader_rewind_paragraph_autopilot" if (not manual_mode) else "reader_rewind_paragraph_manual_mode",
+        )
         rew = _READER_STORE.rewind(session_id, unit="paragraph")
         if not rew.get("ok"):
             return {"reply": "No pude retroceder un párrafo en esta sesión.", "no_auto_tts": True}
@@ -4897,7 +5016,7 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         if not isinstance(chunk, dict):
             st_now = _READER_STORE.get_session(session_id, include_chunks=False)
             return {"reply": "No pude retomar tras volver un párrafo.", "no_auto_tts": True, "reader": _reader_meta(session_id, st_now)}
-        tts_gate_required, tts_stream_id, _committed = _reader_emit_chunk(
+        tts_gate_required, tts_stream_id, _committed, tts_unavailable_detail = _reader_emit_chunk(
             session_id=session_id,
             chunk=chunk,
             allowed_tools=allowed_tools,
@@ -4909,12 +5028,15 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
             st_after.get("total_chunks", 0) or 0
         )
         auto_continue = bool(st_after.get("continuous_enabled", False)) and has_more
+        prefix = "Retrocedí un párrafo y retomo desde ahí."
+        if tts_unavailable_detail:
+            prefix += f" Voz no disponible ({tts_unavailable_detail}). Queda en manual estable."
         return {
             "reply": _reader_chunk_reply(
                 chunk,
                 total_chunks=int(st_after.get("total_chunks", 0) or 0),
                 title=str(meta_after.get("book_title", "")),
-                prefix="Retrocedí un párrafo y retomo desde ahí.",
+                prefix=prefix,
             ),
             "no_auto_tts": True,
             "reader": _reader_meta(
@@ -4935,6 +5057,7 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         title = str(meta.get("book_title", "")).strip()
         label = f"'{title}' | " if title else ""
         continuous = "on" if bool(st.get("continuous_enabled", st.get("continuous_active", False))) else "off"
+        manual_mode = "on" if bool(st.get("manual_mode", False)) else "off"
         reason = str(st.get("continuous_reason", "")).strip() or "-"
         bookmark = st.get("bookmark") if isinstance(st.get("bookmark"), dict) else {}
         b_chunk = int(bookmark.get("chunk_index", -1) or -1)
@@ -4945,7 +5068,7 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
             "reply": (
                 f"Estado lectura: {label}cursor={int(st.get('cursor', 0))}/"
                 f"{int(st.get('total_chunks', 0))}, pending={bool(st.get('has_pending', False))}, "
-                f"done={bool(st.get('done', False))}, continua={continuous}({reason}), "
+                f"done={bool(st.get('done', False))}, continua={continuous}({reason}), manual={manual_mode}, "
                 f"barge_in={int(st.get('barge_in_count', 0))}, state={r_state}, "
                 f"bookmark=chunk:{b_chunk},offset:{b_off},quality:{b_quality}."
             ),
@@ -5007,6 +5130,13 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         st_before = _READER_STORE.get_session(session_id, include_chunks=False)
         if not st_before.get("ok"):
             return {"reply": "No hay sesión de lectura activa. Usá 'biblioteca' y 'leer libro <n>'.", "no_auto_tts": True}
+        manual_mode = bool(st_before.get("manual_mode", False))
+        _READER_STORE.set_continuous(
+            session_id,
+            not manual_mode,
+            reason="reader_continue_autopilot_resume" if (not manual_mode) else "reader_continue_manual_mode",
+        )
+        st_before = _READER_STORE.get_session(session_id, include_chunks=False)
         _READER_STORE.set_reader_state(session_id, "reading", reason="reader_continue")
         was_continuous = bool(st_before.get("continuous_enabled", st_before.get("continuous_active", False)))
         if was_continuous:
@@ -5029,7 +5159,7 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
                 "no_auto_tts": True,
                 "reader": _reader_meta(session_id, st_end, auto_continue=False),
             }
-        tts_gate_required, tts_stream_id, _committed = _reader_emit_chunk(
+        tts_gate_required, tts_stream_id, _committed, tts_unavailable_detail = _reader_emit_chunk(
             session_id=session_id,
             chunk=chunk,
             allowed_tools=allowed_tools,
@@ -5047,6 +5177,11 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
             total_chunks=int(st_after.get("total_chunks", 0) or 0),
             title=title,
         )
+        if tts_unavailable_detail:
+            reply = (
+                f"Autopiloto pausado: voz no disponible ({tts_unavailable_detail}). "
+                "Sigo en manual estable.\n\n" + reply
+            )
         if not str(chunk.get("text", "")).strip():
             reply = f"Error: bloque {int(chunk.get('chunk_index', 0) or 0) + 1} sin texto legible."
         return {

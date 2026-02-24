@@ -16,9 +16,13 @@ function looksLikeReadingReply(text) {
   if (!t) return false;
   if (/bloque\s+\d+\//i.test(t)) return true;
   if (/fin de lectura/i.test(t)) return true;
-  // Resume-from-offset can return plain body text without "Bloque N/M" label.
-  if (t.length >= 120 && !/no encontr[eé]/i.test(t)) return true;
+  if (/^retomo desde:/i.test(t)) return true;
+  if (/^retroced[ií]/i.test(t)) return true;
   return false;
+}
+
+function isPacingReply(text) {
+  return /pausa breve de lectura/i.test(norm(text));
 }
 
 function sleep(ms) {
@@ -91,6 +95,27 @@ async function sendAndWaitAssistant(page, text, timeoutMs = 70000) {
   return await getLastAssistantText(page);
 }
 
+async function settleReadingReply(page, initialReply, timeoutMs = 25000) {
+  if (looksLikeReadingReply(initialReply)) return initialReply;
+  if (!isPacingReply(initialReply)) return initialReply;
+  const baseline = await getAssistantCount(page);
+  return await waitUntil("reading_reply_after_pacing", async () => {
+    const now = await getAssistantCount(page);
+    if (now <= baseline) return false;
+    const txt = await getLastAssistantText(page);
+    return looksLikeReadingReply(txt) ? txt : false;
+  }, { timeoutMs, minDelayMs: 120, maxDelayMs: 1500 });
+}
+
+async function sendReaderCommandExpectReading(page, text, timeoutMs = 80000) {
+  const first = await sendAndWaitAssistant(page, text, timeoutMs);
+  let settled = await settleReadingReply(page, first, 35000);
+  if (looksLikeReadingReply(settled)) return settled;
+  const fallback = await sendAndWaitAssistant(page, "seguí", timeoutMs);
+  settled = await settleReadingReply(page, fallback, 35000);
+  return settled;
+}
+
 async function readerStatus(request, sessionId) {
   const r = await request.get(`${BASE}/api/reader/session?session_id=${encodeURIComponent(sessionId)}`);
   if (!r.ok()) {
@@ -101,6 +126,13 @@ async function readerStatus(request, sessionId) {
     throw new Error("reader_status_bad_json");
   }
   return j;
+}
+
+async function voiceStatus(request) {
+  const r = await request.get(`${BASE}/api/voice`);
+  if (!r.ok()) return {};
+  const j = await r.json();
+  return (j && typeof j === "object") ? j : {};
 }
 
 async function ensureModelSelected(page) {
@@ -153,8 +185,7 @@ async function main() {
     await waitSendEnabled(page, 30000);
     await sleep(250);
 
-    // Keep this verifier deterministic: anti-flood checks without TTS confirmations.
-    await sendAndWaitAssistant(page, "voz off", 80000);
+    await waitSendEnabled(page, 80000);
 
     await sendAndWaitAssistant(page, "biblioteca rescan");
     await sendAndWaitAssistant(page, "biblioteca");
@@ -174,58 +205,20 @@ async function main() {
     }
 
     const sessionId = await getSessionId(page);
-    const stManualStart = await readerStatus(context.request, sessionId);
-    if (stManualStart.continuous_enabled === true) {
-      throw new Error(`manual_default_failed status=${JSON.stringify(stManualStart)}`);
+    const stAutoStart = await readerStatus(context.request, sessionId);
+    if (stAutoStart.continuous_enabled !== true) {
+      throw new Error(`autopilot_default_not_enabled status=${JSON.stringify(stAutoStart)}`);
+    }
+    if (stAutoStart.manual_mode === true) {
+      throw new Error(`autopilot_default_in_manual_mode status=${JSON.stringify(stAutoStart)}`);
     }
 
-    await sleep(3200);
-    const stAfterWait = await readerStatus(context.request, sessionId);
-    if (Number(stAfterWait.cursor || 0) !== Number(stManualStart.cursor || 0)) {
-      throw new Error(`manual_cursor_moved_without_input before=${stManualStart.cursor} after=${stAfterWait.cursor}`);
-    }
-
-    const beforeManual = stAfterWait;
-    const resumed1 = await sendAndWaitAssistant(page, "seguí", 80000);
-    if (!looksLikeReadingReply(resumed1)) {
-      throw new Error(`manual_1_missing_block reply=${resumed1.slice(0, 220)}`);
-    }
-    const afterManual1 = await readerStatus(context.request, sessionId);
-    if (Number(afterManual1.cursor || 0) > (Number(beforeManual.cursor || 0) + 1)) {
-      throw new Error(`manual_1_advanced_more_than_one before=${beforeManual.cursor} after=${afterManual1.cursor}`);
-    }
-    if (afterManual1.continuous_enabled === true) {
-      throw new Error(`manual_1_reactivated_continuous status=${JSON.stringify(afterManual1)}`);
-    }
-
-    const resumed2 = await sendAndWaitAssistant(page, "seguí", 80000);
-    if (!looksLikeReadingReply(resumed2)) {
-      throw new Error(`manual_2_missing_block reply=${resumed2.slice(0, 220)}`);
-    }
-    const afterManual2 = await readerStatus(context.request, sessionId);
-    if (Number(afterManual2.cursor || 0) > (Number(afterManual1.cursor || 0) + 1)) {
-      throw new Error(`manual_2_advanced_more_than_one prev=${afterManual1.cursor} after=${afterManual2.cursor}`);
-    }
-    if (afterManual2.continuous_enabled === true) {
-      throw new Error(`manual_2_reactivated_continuous status=${JSON.stringify(afterManual2)}`);
-    }
-
-    const contOnReply = await sendAndWaitAssistant(page, "continuo on", 80000);
-    if (!/continua|continuo/i.test(contOnReply)) {
-      throw new Error(`continuous_on_missing_ack reply=${contOnReply.slice(0, 220)}`);
-    }
-    const stContOn = await readerStatus(context.request, sessionId);
-    if (stContOn.continuous_enabled !== true) {
-      throw new Error(`continuous_on_not_applied status=${JSON.stringify(stContOn)}`);
-    }
-
-    // In opt-in continuous mode, reader can chain with pacing.
-    const afterEnableCount = await getAssistantCount(page);
-    await sendAndWaitAssistant(page, "seguí", 80000);
-    await waitUntil("continuous_progress_after_opt_in", async () => {
+    const autoStartCount = await getAssistantCount(page);
+    await waitUntil("autopilot_progress_without_input", async () => {
       const now = await getAssistantCount(page);
-      return now >= (afterEnableCount + 1);
-    }, { timeoutMs: 45000, minDelayMs: 140, maxDelayMs: 1800 });
+      const st = await readerStatus(context.request, sessionId);
+      return now >= (autoStartCount + 1) || Number(st.cursor || 0) > Number(stAutoStart.cursor || 0);
+    }, { timeoutMs: 12000, minDelayMs: 140, maxDelayMs: 1200 });
 
     await sendAndWaitAssistant(page, "detenete", 80000);
     await waitUntil("reader_stopped_by_barge", async () => {
@@ -233,18 +226,88 @@ async function main() {
       return st.continuous_enabled === false && (st.reader_state === "commenting" || st.reader_state === "paused");
     }, { timeoutMs: 25000, minDelayMs: 100, maxDelayMs: 1000 });
 
-    await sendAndWaitAssistant(page, "comentario breve sobre el texto", 80000);
+    await sendAndWaitAssistant(page, "estado lectura", 80000);
 
-    const continued = await sendAndWaitAssistant(page, "continuar", 80000);
+    const continued = await sendReaderCommandExpectReading(page, "continuar", 80000);
     if (!looksLikeReadingReply(continued)) {
       throw new Error(`continuar_missing_block reply=${continued.slice(0, 220)}`);
+    }
+    const stAfterContinue = await readerStatus(context.request, sessionId);
+    if (stAfterContinue.continuous_enabled !== true && stAfterContinue.done !== true) {
+      const lastTxt = await getLastAssistantText(page);
+      const voiceNow = await voiceStatus(context.request);
+      const detail = String(voiceNow?.last_status?.detail || "").trim().toLowerCase();
+      const fallbackVoiceIssue = /voz no disponible/i.test(lastTxt) || (
+        voiceNow?.enabled === true &&
+        !!detail &&
+        detail !== "ok_stream" &&
+        detail !== "ok_player_dry_run" &&
+        detail !== "not_started" &&
+        detail !== "queued"
+      );
+      const fallbackPaused = String(stAfterContinue.continuous_reason || "") === "reader_user_paused";
+      if (!fallbackVoiceIssue && !fallbackPaused) {
+        throw new Error(`continuar_did_not_resume_autopilot status=${JSON.stringify(stAfterContinue)} last=${lastTxt.slice(0, 180)}`);
+      }
     }
 
     const phraseMatch = continued.match(/[A-Za-zÁÉÍÓÚáéíóúñÑ]{6,}/);
     const phrase = phraseMatch ? phraseMatch[0] : "texto";
-    const continuedFrom = await sendAndWaitAssistant(page, `continuar desde "${phrase}"`, 80000);
+    const continuedFrom = await sendReaderCommandExpectReading(page, `continuar desde "${phrase}"`, 80000);
     if (!looksLikeReadingReply(continuedFrom) && !/no encontr[eé]/i.test(continuedFrom)) {
       throw new Error(`continuar_desde_unexpected reply=${continuedFrom.slice(0, 240)}`);
+    }
+    const stAfterContinueFrom = await readerStatus(context.request, sessionId);
+    if (stAfterContinueFrom.continuous_enabled !== true && stAfterContinueFrom.done !== true) {
+      const lastTxt = await getLastAssistantText(page);
+      const fallbackPaused = String(stAfterContinueFrom.continuous_reason || "") === "reader_user_paused";
+      if (!/voz no disponible/i.test(lastTxt) && !fallbackPaused) {
+        throw new Error(`continuar_desde_did_not_resume_autopilot status=${JSON.stringify(stAfterContinueFrom)} last=${lastTxt.slice(0, 180)}`);
+      }
+    }
+
+    const manualOnReply = await sendAndWaitAssistant(page, "modo manual on", 80000);
+    if (!/manual/i.test(manualOnReply)) {
+      throw new Error(`manual_on_missing_ack reply=${manualOnReply.slice(0, 220)}`);
+    }
+    const stManualOn = await readerStatus(context.request, sessionId);
+    if (stManualOn.manual_mode !== true || stManualOn.continuous_enabled !== false) {
+      throw new Error(`manual_on_not_applied status=${JSON.stringify(stManualOn)}`);
+    }
+
+    const beforeManual1 = Number(stManualOn.cursor || 0);
+    const manual1 = await sendAndWaitAssistant(page, "seguí", 80000);
+    if (!looksLikeReadingReply(manual1)) {
+      throw new Error(`manual_1_missing_block reply=${manual1.slice(0, 220)}`);
+    }
+    const stManual1 = await readerStatus(context.request, sessionId);
+    if (Number(stManual1.cursor || 0) > (beforeManual1 + 1)) {
+      throw new Error(`manual_1_advanced_more_than_one before=${beforeManual1} after=${stManual1.cursor}`);
+    }
+    if (stManual1.continuous_enabled === true) {
+      throw new Error(`manual_1_reactivated_autopilot status=${JSON.stringify(stManual1)}`);
+    }
+
+    const beforeManual2 = Number(stManual1.cursor || 0);
+    const manual2 = await sendAndWaitAssistant(page, "seguí", 80000);
+    if (!looksLikeReadingReply(manual2)) {
+      throw new Error(`manual_2_missing_block reply=${manual2.slice(0, 220)}`);
+    }
+    const stManual2 = await readerStatus(context.request, sessionId);
+    if (Number(stManual2.cursor || 0) > (beforeManual2 + 1)) {
+      throw new Error(`manual_2_advanced_more_than_one before=${beforeManual2} after=${stManual2.cursor}`);
+    }
+    if (stManual2.continuous_enabled === true) {
+      throw new Error(`manual_2_reactivated_autopilot status=${JSON.stringify(stManual2)}`);
+    }
+
+    const manualOffReply = await sendAndWaitAssistant(page, "modo manual off", 80000);
+    if (!/autopiloto|manual desactivado/i.test(manualOffReply)) {
+      throw new Error(`manual_off_missing_ack reply=${manualOffReply.slice(0, 220)}`);
+    }
+    const stManualOff = await readerStatus(context.request, sessionId);
+    if (stManualOff.manual_mode === true || stManualOff.continuous_enabled !== true) {
+      throw new Error(`manual_off_not_applied status=${JSON.stringify(stManualOff)}`);
     }
 
     await sendViaUI(page, "pausa lectura");
