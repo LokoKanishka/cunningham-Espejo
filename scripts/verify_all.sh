@@ -23,6 +23,9 @@ echo "== verify_reader_library ==" >&2
 echo "== verify_reader_ux_dc ==" >&2
 ./scripts/verify_reader_ux_dc.sh
 
+echo "== verify_stt_barge_in_smoke ==" >&2
+./scripts/verify_stt_barge_in_smoke.sh
+
 echo "== verify_slash_reader_ui ==" >&2
 ./scripts/verify_slash_reader_ui.sh
 

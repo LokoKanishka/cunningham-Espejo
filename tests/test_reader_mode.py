@@ -17,6 +17,22 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
 import openclaw_direct_chat as direct_chat  # noqa: E402
 
 
+class _DummyWorker:
+    def __init__(self, running: bool = True, last_error: str = "") -> None:
+        self._running = running
+        self.last_error = last_error
+
+    def start(self) -> None:
+        return
+
+    def stop(self, timeout: float = 0.0) -> None:
+        self._running = False
+        return
+
+    def is_running(self) -> bool:
+        return self._running
+
+
 class TestReaderSessionStore(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -415,6 +431,59 @@ class TestReaderHttpEndpoints(unittest.TestCase):
         self.assertIn("tts_health_url", out)
         self.assertIn("tts_health_timeout_sec", out)
         self.assertIn("tts_available", out)
+
+    def test_stt_poll_owner_mismatch_returns_409(self) -> None:
+        mgr = direct_chat._STT_MANAGER
+        with mgr._lock:
+            prev_enabled = bool(mgr._enabled)
+            prev_owner = str(mgr._owner_session_id)
+            prev_worker = mgr._worker
+            mgr._enabled = True
+            mgr._owner_session_id = "owner_session"
+            mgr._worker = _DummyWorker(running=True)
+        try:
+            code, out = self._request("GET", "/api/stt/poll?session_id=other_session")
+            self.assertEqual(code, 409)
+            self.assertEqual(str(out.get("error", "")), "stt_owner_mismatch")
+            self.assertEqual(str(out.get("stt_owner_session_id", "")), "owner_session")
+        finally:
+            with mgr._lock:
+                mgr._enabled = prev_enabled
+                mgr._owner_session_id = prev_owner
+                mgr._worker = prev_worker
+
+    def test_stt_inject_and_poll_returns_voice_command(self) -> None:
+        mgr = direct_chat._STT_MANAGER
+        with mgr._lock:
+            prev_enabled = bool(mgr._enabled)
+            prev_owner = str(mgr._owner_session_id)
+            prev_worker = mgr._worker
+            mgr._enabled = True
+            mgr._owner_session_id = "inject_session"
+            mgr._worker = _DummyWorker(running=True)
+            mgr._clear_queue_locked()
+        try:
+            code, out = self._request(
+                "POST",
+                "/api/stt/inject",
+                {"session_id": "inject_session", "cmd": "pausa"},
+            )
+            self.assertEqual(code, 200)
+            self.assertTrue(bool(out.get("ok", False)))
+            code, polled = self._request("GET", "/api/stt/poll?session_id=inject_session&limit=2")
+            self.assertEqual(code, 200)
+            items = polled.get("items", [])
+            self.assertIsInstance(items, list)
+            self.assertTrue(items)
+            first = items[0] if isinstance(items[0], dict) else {}
+            self.assertEqual(str(first.get("cmd", "")), "pause")
+            self.assertEqual(str(first.get("kind", "")), "voice_cmd")
+        finally:
+            with mgr._lock:
+                mgr._enabled = prev_enabled
+                mgr._owner_session_id = prev_owner
+                mgr._worker = prev_worker
+                mgr._clear_queue_locked()
 
 if __name__ == "__main__":
     unittest.main()

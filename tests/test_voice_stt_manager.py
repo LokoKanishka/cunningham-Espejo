@@ -57,8 +57,8 @@ class TestVoiceSttManager(unittest.TestCase):
             mgr._enabled = True
             mgr._owner_session_id = "sess_a"
             mgr._worker = _DummyWorker(running=True)
-        mgr._queue.put({"text": "hola", "ts": 1.0})
-        mgr._queue.put({"text": "mundo", "ts": 2.0})
+        mgr._queue.put({"text": "pausa", "ts": 1.0})
+        mgr._queue.put({"text": "continuar", "ts": 2.0})
 
         self.assertEqual(mgr.poll("sess_b", limit=5), [])
 
@@ -67,6 +67,8 @@ class TestVoiceSttManager(unittest.TestCase):
         items = mgr.poll("sess_a", limit=5)
         direct_chat._tts_is_playing = prev_tts_is_playing  # type: ignore
         self.assertEqual(len(items), 2)
+        self.assertEqual(str(items[0].get("cmd", "")), "pause")
+        self.assertEqual(str(items[1].get("cmd", "")), "continue")
         self.assertEqual(mgr.poll("sess_a", limit=5), [])
         mgr.disable()
 

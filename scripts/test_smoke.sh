@@ -25,6 +25,7 @@ pytest -q \
 ./scripts/verify_reader_mode_v01.sh
 ./scripts/verify_reader_library.sh
 ./scripts/verify_reader_ux_dc.sh
+./scripts/verify_stt_barge_in_smoke.sh
 
 ./scripts/verify_slash_reader_ui.sh
 ./scripts/verify_history_export.sh

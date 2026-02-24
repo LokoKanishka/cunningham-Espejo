@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import audioop
 import dataclasses
 import queue
 import threading
@@ -107,6 +108,17 @@ def list_input_devices() -> list[dict]:
     """Utility for debugging. Returns a list of input-capable devices (best-effort)."""
     sd = _lazy_import_sounddevice()
     out = []
+    default_input = None
+    try:
+        default_pair = getattr(sd, "default", None)
+        if default_pair is not None:
+            default_device = getattr(default_pair, "device", None)
+            if isinstance(default_device, (list, tuple)) and len(default_device) >= 1:
+                default_input = int(default_device[0])
+            elif isinstance(default_device, int):
+                default_input = int(default_device)
+    except Exception:
+        default_input = None
     try:
         devices = sd.query_devices()
     except Exception:
@@ -114,7 +126,14 @@ def list_input_devices() -> list[dict]:
     for i, d in enumerate(devices):
         try:
             if int(d.get("max_input_channels", 0)) > 0:
-                out.append({"index": i, "name": str(d.get("name", "")), "max_input_channels": int(d.get("max_input_channels", 0))})
+                out.append(
+                    {
+                        "index": i,
+                        "name": str(d.get("name", "")),
+                        "max_input_channels": int(d.get("max_input_channels", 0)),
+                        "default": bool(default_input is not None and i == default_input),
+                    }
+                )
         except Exception:
             continue
     return out
@@ -135,11 +154,13 @@ class STTWorker:
         *,
         should_listen: Callable[[], bool] = lambda: True,
         logger: Callable[[str], None] = lambda msg: None,
+        telemetry: Callable[[dict], None] = lambda _evt: None,
     ):
         self.cfg = cfg
         self.out_queue = out_queue
         self.should_listen = should_listen
         self.log = logger
+        self.telemetry = telemetry
 
         self._stop = threading.Event()
         self._th: Optional[threading.Thread] = None
@@ -169,12 +190,19 @@ class STTWorker:
         return self._engine
 
     def _run(self) -> None:
+        def emit_diag(payload: dict) -> None:
+            try:
+                self.telemetry(payload)
+            except Exception:
+                return
+
         try:
             sd = _lazy_import_sounddevice()
             webrtcvad = _lazy_import_webrtcvad()
         except Exception as e:
             self.last_error = str(e)
             self.log(f"[stt] deps error: {self.last_error}")
+            emit_diag({"kind": "stt_error", "detail": self.last_error})
             return
 
         cfg = self.cfg
@@ -197,12 +225,32 @@ class STTWorker:
         except Exception as e:
             self.last_error = f"sounddevice_stream_open_failed:{e}"
             self.log(f"[stt] {self.last_error}")
+            emit_diag({"kind": "stt_error", "detail": self.last_error})
             return
 
         in_speech = False
         buf = bytearray()
         speech_start_mono = 0.0
         last_voice_mono = 0.0
+        frames_seen = 0
+        vad_frames = 0
+        rms_current = 0.0
+        last_audio_ts = 0.0
+        in_speech_now = False
+
+        def emit_runtime_diag(extra: Optional[dict] = None) -> None:
+            payload = {
+                "kind": "stt_diag",
+                "frames_seen": int(frames_seen),
+                "last_audio_ts": float(last_audio_ts or 0.0),
+                "rms_current": float(rms_current),
+                "vad_active": bool(in_speech_now),
+                "in_speech": bool(in_speech),
+                "vad_frames": int(vad_frames),
+            }
+            if isinstance(extra, dict):
+                payload.update(extra)
+            emit_diag(payload)
 
         def reset_segment():
             nonlocal in_speech, buf, speech_start_mono, last_voice_mono
@@ -215,6 +263,7 @@ class STTWorker:
             # Segment length check
             dur_ms = int(len(pcm16) / 2 / cfg.sample_rate * 1000)  # 2 bytes per sample mono
             if dur_ms < cfg.min_speech_ms:
+                emit_runtime_diag({"kind": "stt_drop", "reason": "segment_too_short", "dur_ms": int(dur_ms)})
                 return
             try:
                 engine = self._ensure_engine()
@@ -222,33 +271,47 @@ class STTWorker:
             except Exception as e:
                 self.last_error = f"transcribe_failed:{e}"
                 self.log(f"[stt] {self.last_error}")
+                emit_runtime_diag({"kind": "stt_error", "detail": self.last_error})
                 return
 
             text = (text or "").strip()
             if len(text) < cfg.min_chars:
+                emit_runtime_diag({"kind": "stt_drop", "reason": "text_too_short", "chars": int(len(text))})
                 return
 
             try:
                 self.out_queue.put_nowait({"text": text, "ts": time.time()})
+                emit_runtime_diag({"kind": "stt_emit", "chars": int(len(text))})
             except Exception:
                 # If queue is full or consumer is slow, we drop silently to avoid blocking audio thread.
+                emit_runtime_diag({"kind": "stt_drop", "reason": "queue_full"})
                 return
 
         try:
             with stream:
+                emit_runtime_diag(
+                    {
+                        "kind": "stt_started",
+                        "device": str(cfg.device) if cfg.device is not None else "",
+                        "sample_rate": int(cfg.sample_rate),
+                        "frame_ms": int(cfg.frame_ms),
+                    }
+                )
                 while not self._stop.is_set():
                     try:
                         data, overflowed = stream.read(frame_samples)
                         if overflowed:
                             # Keep going; overflow just means missed audio
-                            pass
+                            emit_runtime_diag({"kind": "stt_drop", "reason": "overflowed"})
                     except Exception as e:
                         self.last_error = f"sounddevice_read_failed:{e}"
                         self.log(f"[stt] {self.last_error}")
+                        emit_runtime_diag({"kind": "stt_error", "detail": self.last_error})
                         break
 
                     if not self.should_listen():
                         # Anti-eco gating: drop everything and reset segments.
+                        emit_runtime_diag({"kind": "stt_drop", "reason": "should_listen_false"})
                         reset_segment()
                         time.sleep(0.02)
                         continue
@@ -256,15 +319,24 @@ class STTWorker:
                     if not data:
                         continue
 
+                    frames_seen += 1
+                    last_audio_ts = time.time()
+                    try:
+                        rms_current = float(audioop.rms(data, 2) / 32768.0)
+                    except Exception:
+                        rms_current = 0.0
+
                     # webrtcvad expects bytes of 16-bit PCM, mono
                     try:
                         is_speech = bool(vad.is_speech(data, cfg.sample_rate))
                     except Exception:
                         # On any VAD error, treat as non-speech to stay safe.
                         is_speech = False
+                    in_speech_now = bool(is_speech)
 
                     now = time.monotonic()
                     if is_speech:
+                        vad_frames += 1
                         if not in_speech:
                             in_speech = True
                             speech_start_mono = now
@@ -284,5 +356,7 @@ class STTWorker:
                         if silence_ms >= cfg.max_silence_ms:
                             maybe_emit_segment(bytes(buf))
                             reset_segment()
+                    emit_runtime_diag()
         finally:
             reset_segment()
+            emit_runtime_diag({"kind": "stt_stopped"})

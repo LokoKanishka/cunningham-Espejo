@@ -133,13 +133,20 @@ _TTS_HEALTH_CACHE = {
 
 
 def _bargein_config() -> dict:
+    state = _load_voice_state()
+    try:
+        rms_state = float(state.get("stt_rms_threshold", 0.0))
+    except Exception:
+        rms_state = 0.0
+    rms_env = float(os.environ.get("DIRECT_CHAT_BARGEIN_RMS_THRESHOLD", "0.012"))
+    rms_threshold = rms_state if rms_state > 0 else rms_env
     return {
         "enabled": _env_flag("DIRECT_CHAT_BARGEIN_ENABLED", True),
         "sample_rate": max(8000, _int_env("DIRECT_CHAT_BARGEIN_SAMPLE_RATE", 16000)),
         "frame_ms": max(10, min(30, _int_env("DIRECT_CHAT_BARGEIN_FRAME_MS", 30))),
         "vad_mode": max(0, min(3, _int_env("DIRECT_CHAT_BARGEIN_VAD_MODE", 2))),
         "min_voice_frames": max(2, _int_env("DIRECT_CHAT_BARGEIN_MIN_VOICE_FRAMES", 8)),
-        "rms_threshold": max(0.001, float(os.environ.get("DIRECT_CHAT_BARGEIN_RMS_THRESHOLD", "0.012"))),
+        "rms_threshold": max(0.001, float(rms_threshold)),
         "cooldown_sec": max(0.2, float(os.environ.get("DIRECT_CHAT_BARGEIN_COOLDOWN_SEC", "1.5"))),
     }
 
@@ -541,6 +548,11 @@ def _default_voice_state() -> dict:
         "enabled": _env_flag("DIRECT_CHAT_TTS_ENABLED_DEFAULT", True),
         "speaker": str(os.environ.get("DIRECT_CHAT_TTS_SPEAKER", "Ana Florence")).strip() or "Ana Florence",
         "speaker_wav": str(os.environ.get("DIRECT_CHAT_TTS_SPEAKER_WAV", "")).strip(),
+        "stt_device": str(os.environ.get("DIRECT_CHAT_STT_DEVICE", "")).strip(),
+        "stt_min_chars": max(1, _int_env("DIRECT_CHAT_STT_MIN_CHARS", 3)),
+        "stt_command_only": _env_flag("DIRECT_CHAT_STT_COMMAND_ONLY", True),
+        "stt_no_audio_timeout_sec": max(1.0, float(os.environ.get("DIRECT_CHAT_STT_NO_AUDIO_TIMEOUT_SEC", "3.0"))),
+        "stt_rms_threshold": max(0.001, float(os.environ.get("DIRECT_CHAT_BARGEIN_RMS_THRESHOLD", "0.012"))),
     }
 
 
@@ -557,6 +569,25 @@ def _load_voice_state() -> dict:
                 speaker_wav = str(raw.get("speaker_wav", "")).strip()
                 if speaker_wav:
                     state["speaker_wav"] = speaker_wav
+                state["stt_device"] = str(raw.get("stt_device", state.get("stt_device", ""))).strip()
+                try:
+                    state["stt_min_chars"] = max(1, int(raw.get("stt_min_chars", state.get("stt_min_chars", 3))))
+                except Exception:
+                    state["stt_min_chars"] = max(1, int(state.get("stt_min_chars", 3)))
+                if "stt_command_only" in raw:
+                    state["stt_command_only"] = bool(raw.get("stt_command_only"))
+                try:
+                    state["stt_no_audio_timeout_sec"] = max(
+                        1.0, float(raw.get("stt_no_audio_timeout_sec", state.get("stt_no_audio_timeout_sec", 3.0)))
+                    )
+                except Exception:
+                    state["stt_no_audio_timeout_sec"] = max(1.0, float(state.get("stt_no_audio_timeout_sec", 3.0)))
+                try:
+                    state["stt_rms_threshold"] = max(
+                        0.001, float(raw.get("stt_rms_threshold", state.get("stt_rms_threshold", 0.012)))
+                    )
+                except Exception:
+                    state["stt_rms_threshold"] = max(0.001, float(state.get("stt_rms_threshold", 0.012)))
     except Exception:
         pass
     return state
@@ -646,6 +677,18 @@ class STTManager:
         self._last_error = ""
         self._retry_idx = 0
         self._next_retry_mono = 0.0
+        self._enabled_since_mono = 0.0
+        self._frames_seen = 0
+        self._last_audio_ts = 0.0
+        self._rms_current = 0.0
+        self._vad_active = False
+        self._in_speech = False
+        self._vad_frames = 0
+        self._device_label = ""
+        self._drop_reason = ""
+        self._items_total = 0
+        self._items_dropped = 0
+        self._last_item_ts = 0.0
 
     @staticmethod
     def _env_int(name: str, default: int) -> int:
@@ -679,6 +722,8 @@ class STTManager:
                 self._queue.get_nowait()
             except queue.Empty:
                 return
+            except Exception:
+                return
 
     def _should_listen(self) -> bool:
         with self._lock:
@@ -689,13 +734,106 @@ class STTManager:
             return _env_flag("DIRECT_CHAT_STT_ALLOW_DURING_TTS", True)
         return True
 
+    @staticmethod
+    def _parse_device(raw) -> int | str | None:
+        s = str(raw or "").strip()
+        if not s:
+            return None
+        if re.fullmatch(r"-?\d+", s):
+            try:
+                return int(s)
+            except Exception:
+                return s
+        return s
+
+    def _voice_state(self) -> dict:
+        try:
+            out = _load_voice_state()
+            return out if isinstance(out, dict) else {}
+        except Exception:
+            return {}
+
+    def _selected_stt_device(self):
+        state = self._voice_state()
+        raw = str(state.get("stt_device", "")).strip()
+        if not raw:
+            raw = str(os.environ.get("DIRECT_CHAT_STT_DEVICE", "")).strip()
+        return self._parse_device(raw)
+
+    def _command_only_enabled(self) -> bool:
+        state = self._voice_state()
+        if "stt_command_only" in state:
+            return bool(state.get("stt_command_only"))
+        return _env_flag("DIRECT_CHAT_STT_COMMAND_ONLY", True)
+
+    def _no_audio_timeout_sec(self) -> float:
+        state = self._voice_state()
+        try:
+            return max(1.0, float(state.get("stt_no_audio_timeout_sec", 3.0)))
+        except Exception:
+            return 3.0
+
+    def _on_worker_telemetry(self, event: dict) -> None:
+        if not isinstance(event, dict):
+            return
+        with self._lock:
+            kind = str(event.get("kind", "")).strip().lower()
+            if "frames_seen" in event:
+                try:
+                    self._frames_seen = max(self._frames_seen, int(event.get("frames_seen", self._frames_seen)))
+                except Exception:
+                    pass
+            if "last_audio_ts" in event:
+                try:
+                    self._last_audio_ts = max(self._last_audio_ts, float(event.get("last_audio_ts", 0.0) or 0.0))
+                except Exception:
+                    pass
+            if "rms_current" in event:
+                try:
+                    self._rms_current = max(0.0, float(event.get("rms_current", 0.0) or 0.0))
+                except Exception:
+                    pass
+            if "vad_active" in event:
+                self._vad_active = bool(event.get("vad_active"))
+            if "in_speech" in event:
+                self._in_speech = bool(event.get("in_speech"))
+            if "vad_frames" in event:
+                try:
+                    self._vad_frames = max(self._vad_frames, int(event.get("vad_frames", self._vad_frames)))
+                except Exception:
+                    pass
+            if "device" in event:
+                self._device_label = str(event.get("device", "")).strip()
+            if kind in ("stt_drop", "stt_error"):
+                self._items_dropped += 1
+            if kind == "stt_drop":
+                self._drop_reason = str(event.get("reason", "drop_unknown"))[:120]
+            elif kind == "stt_error":
+                detail = str(event.get("detail", "")).strip()
+                if detail:
+                    self._last_error = detail[:240]
+                    self._drop_reason = self._last_error
+            elif kind == "stt_emit":
+                self._drop_reason = ""
+
+    def _register_drop_locked(self, reason: str) -> None:
+        self._items_dropped += 1
+        self._drop_reason = str(reason or "drop_unknown")[:120]
+
     def _build_worker_locked(self):
         from molbot_direct_chat import stt_local
 
+        state = self._voice_state()
+        min_chars_default = self._env_int("DIRECT_CHAT_STT_MIN_CHARS", 3)
+        try:
+            min_chars = max(1, int(state.get("stt_min_chars", min_chars_default)))
+        except Exception:
+            min_chars = max(1, int(min_chars_default))
+        selected_device = self._selected_stt_device()
         cfg = stt_local.STTConfig(
             sample_rate=max(8000, self._env_int("DIRECT_CHAT_STT_SAMPLE_RATE", 16000)),
             channels=max(1, self._env_int("DIRECT_CHAT_STT_CHANNELS", 1)),
-            device=str(os.environ.get("DIRECT_CHAT_STT_DEVICE", "")).strip() or None,
+            device=selected_device,
             frame_ms=max(10, min(30, self._env_int("DIRECT_CHAT_STT_FRAME_MS", 30))),
             vad_mode=max(0, min(3, self._env_int("DIRECT_CHAT_STT_VAD_MODE", 2))),
             min_speech_ms=max(120, self._env_int("DIRECT_CHAT_STT_MIN_SPEECH_MS", 350)),
@@ -706,9 +844,15 @@ class STTManager:
             fw_device=str(os.environ.get("DIRECT_CHAT_STT_FW_DEVICE", "cpu")).strip() or "cpu",
             fw_compute_type=str(os.environ.get("DIRECT_CHAT_STT_FW_COMPUTE_TYPE", "int8")).strip() or "int8",
             initial_prompt=str(os.environ.get("DIRECT_CHAT_STT_INITIAL_PROMPT", "")).strip(),
-            min_chars=max(1, self._env_int("DIRECT_CHAT_STT_MIN_CHARS", 3)),
+            min_chars=min_chars,
         )
-        return stt_local.STTWorker(cfg, self._queue, should_listen=self._should_listen, logger=self._log)
+        return stt_local.STTWorker(
+            cfg,
+            self._queue,
+            should_listen=self._should_listen,
+            logger=self._log,
+            telemetry=self._on_worker_telemetry,
+        )
 
     def _schedule_retry_locked(self, now_mono: float) -> None:
         idx = min(self._retry_idx, len(self._RETRY_DELAYS_SEC) - 1)
@@ -755,6 +899,8 @@ class STTManager:
         sid = _safe_session_id(session_id) if session_id else ""
         with self._lock:
             self._enabled = True
+            if self._enabled_since_mono <= 0.0:
+                self._enabled_since_mono = time.monotonic()
             if sid and sid != "default" and sid != self._owner_session_id:
                 self._owner_session_id = sid
                 self._clear_queue_locked()
@@ -780,12 +926,71 @@ class STTManager:
             self._worker = None
             self._retry_idx = 0
             self._next_retry_mono = 0.0
+            self._enabled_since_mono = 0.0
             self._clear_queue_locked()
         if worker is not None:
             try:
                 worker.stop(timeout=2.0)
             except Exception:
                 pass
+
+    def restart(self) -> None:
+        worker = None
+        with self._lock:
+            worker = self._worker
+            self._worker = None
+            self._retry_idx = 0
+            self._next_retry_mono = 0.0
+        if worker is not None:
+            try:
+                worker.stop(timeout=2.0)
+            except Exception:
+                pass
+        with self._lock:
+            if self._enabled:
+                self._enabled_since_mono = time.monotonic()
+                self._sync_worker_locked(time.monotonic())
+
+    def inject(self, session_id: str, text: str = "", cmd: str = "") -> dict:
+        sid = _safe_session_id(session_id)
+        voice_cmd = str(cmd or "").strip().lower()
+        raw_text = str(text or "").strip()
+        if voice_cmd and (not raw_text):
+            if voice_cmd in ("pause", "pausa", "stop", "detenete", "detente"):
+                raw_text = "pausa"
+            elif voice_cmd in ("continue", "continuar", "segui", "seguir"):
+                raw_text = "continuar"
+            elif voice_cmd in ("repeat", "repetir", "repeti"):
+                raw_text = "repetir"
+            else:
+                raw_text = voice_cmd
+        if not raw_text:
+            return {"ok": False, "error": "stt_inject_empty_text"}
+        with self._lock:
+            self._sync_worker_locked(time.monotonic())
+            if not self._enabled:
+                return {"ok": False, "error": "stt_disabled"}
+            if sid and sid != "default" and not self._owner_session_id:
+                self._owner_session_id = sid
+            if self._owner_session_id and sid and sid != self._owner_session_id:
+                return {"ok": False, "error": "stt_owner_mismatch", "stt_owner_session_id": str(self._owner_session_id)}
+            payload = {"text": raw_text, "ts": time.time(), "injected": True}
+            try:
+                self._queue.put_nowait(payload)
+            except Exception:
+                self._register_drop_locked("inject_queue_full")
+                return {"ok": False, "error": "stt_queue_full"}
+        return {"ok": True, "item": payload}
+
+    def list_devices(self) -> list[dict]:
+        try:
+            from molbot_direct_chat import stt_local
+
+            out = stt_local.list_input_devices()
+            return out if isinstance(out, list) else []
+        except Exception as e:
+            self._log(f"[stt] list_devices_failed:{e}")
+            return []
 
     def poll(self, session_id: str, limit: int = 3) -> list[dict]:
         sid = _safe_session_id(session_id)
@@ -805,6 +1010,7 @@ class STTManager:
 
         out: list[dict] = []
         tts_playing = _tts_is_playing()
+        command_only = self._command_only_enabled()
         for _ in range(limit):
             try:
                 item = self._queue.get_nowait()
@@ -813,10 +1019,27 @@ class STTManager:
             if isinstance(item, dict):
                 text = str(item.get("text", "")).strip()
                 if not text:
+                    with self._lock:
+                        self._register_drop_locked("empty_text")
                     continue
-                if tts_playing and (not _is_voice_control_phrase(text)):
+                cmd = _voice_command_kind(text)
+                if tts_playing and (not cmd):
+                    with self._lock:
+                        self._register_drop_locked("tts_guard_non_command")
                     continue
-                out.append({"text": text, "ts": float(item.get("ts", time.time()))})
+                if command_only and (not cmd):
+                    with self._lock:
+                        self._register_drop_locked("command_only_non_command")
+                    continue
+                ts = float(item.get("ts", time.time()))
+                event = {"text": text, "ts": ts}
+                if cmd:
+                    event["kind"] = "voice_cmd"
+                    event["cmd"] = cmd
+                out.append(event)
+                with self._lock:
+                    self._items_total += 1
+                    self._last_item_ts = max(self._last_item_ts, ts)
         return out
 
     def status(self) -> dict:
@@ -826,12 +1049,29 @@ class STTManager:
             retry_in = 0.0
             if self._next_retry_mono > now:
                 retry_in = max(0.0, self._next_retry_mono - now)
+            no_audio_timeout = self._no_audio_timeout_sec()
+            enabled_age = max(0.0, now - float(self._enabled_since_mono or 0.0)) if self._enabled_since_mono > 0.0 else 0.0
+            no_audio_input = bool(self._enabled and running and enabled_age >= no_audio_timeout and int(self._frames_seen) <= 0)
             return {
                 "stt_enabled": bool(self._enabled),
                 "stt_running": running,
                 "stt_owner_session_id": str(self._owner_session_id),
                 "stt_last_error": str(self._last_error),
                 "stt_retry_in_sec": round(retry_in, 3),
+                "stt_device_name": str(self._device_label),
+                "stt_frames_seen": int(self._frames_seen),
+                "stt_last_audio_ts": float(self._last_audio_ts or 0.0),
+                "stt_rms_current": float(self._rms_current or 0.0),
+                "stt_vad_active": bool(self._vad_active),
+                "stt_in_speech": bool(self._in_speech),
+                "stt_vad_frames": int(self._vad_frames),
+                "stt_drop_reason": str(self._drop_reason),
+                "items_total": int(self._items_total),
+                "items_dropped": int(self._items_dropped),
+                "last_item_ts": float(self._last_item_ts or 0.0),
+                "stt_no_audio_input": bool(no_audio_input),
+                "stt_no_audio_timeout_sec": float(no_audio_timeout),
+                "stt_command_only": bool(self._command_only_enabled()),
             }
 
     def shutdown(self) -> None:
@@ -851,6 +1091,42 @@ def _sync_stt_with_voice(enabled: bool, session_id: str = "") -> None:
         _STT_MANAGER.disable()
     except Exception as e:
         print(f"[stt] sync_failed:{e}", file=sys.stderr)
+
+
+def _stt_list_input_devices() -> list[dict]:
+    try:
+        return _STT_MANAGER.list_devices()
+    except Exception:
+        return []
+
+
+def _set_stt_runtime_config(
+    *,
+    stt_device: str | None = None,
+    stt_command_only: bool | None = None,
+    stt_min_chars: int | None = None,
+    stt_no_audio_timeout_sec: float | None = None,
+    stt_rms_threshold: float | None = None,
+) -> dict:
+    with _VOICE_LOCK:
+        state = _load_voice_state()
+        if stt_device is not None:
+            state["stt_device"] = str(stt_device).strip()
+        if stt_command_only is not None:
+            state["stt_command_only"] = bool(stt_command_only)
+        if stt_min_chars is not None:
+            state["stt_min_chars"] = max(1, int(stt_min_chars))
+        if stt_no_audio_timeout_sec is not None:
+            state["stt_no_audio_timeout_sec"] = max(1.0, float(stt_no_audio_timeout_sec))
+        if stt_rms_threshold is not None:
+            state["stt_rms_threshold"] = max(0.001, float(stt_rms_threshold))
+        _save_voice_state(state)
+    os.environ["DIRECT_CHAT_STT_DEVICE"] = str(state.get("stt_device", "")).strip()
+    try:
+        _STT_MANAGER.restart()
+    except Exception:
+        pass
+    return state
 
 
 def _alltalk_base_url() -> str:
@@ -5012,6 +5288,69 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
             _speak_reply_async("Prueba de voz activada. Sistema listo.")
             return {"reply": "Ejecuté prueba de voz."}
 
+    if any(k in normalized for k in ("mic lista", "microfono lista", "microfono listar", "mic list", "listar microfonos")):
+        devices = _stt_list_input_devices()
+        state = _load_voice_state()
+        current = str(state.get("stt_device", "")).strip()
+        if not devices:
+            return {"reply": "No pude listar micrófonos de entrada (sounddevice sin dispositivos).", "no_auto_tts": True}
+        lines = []
+        for d in devices[:24]:
+            if not isinstance(d, dict):
+                continue
+            idx = int(d.get("index", -1))
+            name = str(d.get("name", "")).strip() or "sin_nombre"
+            max_in = int(d.get("max_input_channels", 0) or 0)
+            is_default = bool(d.get("default", False))
+            marker = ""
+            if current and current == str(idx):
+                marker = " [activo]"
+            elif (not current) and is_default:
+                marker = " [default]"
+            lines.append(f"- {idx}: {name} (in={max_in}){marker}")
+        return {
+            "reply": "Micrófonos de entrada:\n" + "\n".join(lines) + "\nUsá: mic usar <indice> | mic usar default",
+            "no_auto_tts": True,
+        }
+
+    match_mic_use = re.search(r"\bmic(?:rofono)?\s+usar\s+([^\s]+)", normalized)
+    if match_mic_use:
+        token = str(match_mic_use.group(1) or "").strip().lower()
+        if token in ("default", "defecto", "por_defecto", "por-defecto"):
+            _set_stt_runtime_config(stt_device="")
+            return {"reply": "Listo: micrófono STT en modo default.", "no_auto_tts": True}
+        if not re.fullmatch(r"-?\d+", token):
+            return {"reply": "Formato inválido. Usá: mic usar <indice> o mic usar default.", "no_auto_tts": True}
+        devices = _stt_list_input_devices()
+        idx = int(token)
+        exists = any(isinstance(d, dict) and int(d.get("index", -1)) == idx for d in devices)
+        if (not exists) and devices:
+            return {"reply": f"No existe el micrófono {idx}. Probá primero 'mic lista'.", "no_auto_tts": True}
+        _set_stt_runtime_config(stt_device=str(idx))
+        return {"reply": f"Listo: STT usará micrófono {idx}.", "no_auto_tts": True}
+
+    match_stt_threshold = re.search(r"\bstt\s+umbral\s+([0-9]+(?:\.[0-9]+)?)", normalized)
+    if match_stt_threshold:
+        try:
+            thr = max(0.001, float(match_stt_threshold.group(1)))
+        except Exception:
+            thr = 0.012
+        _set_stt_runtime_config(stt_rms_threshold=thr)
+        return {"reply": f"Listo: umbral STT/Barge-In en {thr:.4f}.", "no_auto_tts": True}
+
+    if any(k in normalized for k in ("mic nivel", "stt nivel", "nivel stt", "stt diag", "diagnostico stt")):
+        st = _STT_MANAGER.status()
+        no_audio = bool(st.get("stt_no_audio_input", False))
+        return {
+            "reply": (
+                f"STT diag: running={bool(st.get('stt_running', False))}, owner={st.get('stt_owner_session_id', '') or '-'}, "
+                f"frames={int(st.get('stt_frames_seen', 0) or 0)}, rms={float(st.get('stt_rms_current', 0.0) or 0.0):.4f}, "
+                f"vad={bool(st.get('stt_vad_active', False))}, dropped={int(st.get('items_dropped', 0) or 0)}, "
+                f"last_drop={str(st.get('stt_drop_reason', '') or '-')}, no_audio={no_audio}."
+            ),
+            "no_auto_tts": True,
+        }
+
     # Reader UX v0.3: local commands in DC chat, no model round-trip needed.
     if any(k in normalized for k in ("ayuda lectura", "help lectura")):
         return {
@@ -6388,10 +6727,27 @@ class Handler(BaseHTTPRequestHandler):
         health_path = str(health.get("health_path", _alltalk_health_path()) or _alltalk_health_path())
         timeout_s = float(health.get("timeout_s", _alltalk_health_timeout_sec()) or _alltalk_health_timeout_sec())
         fallback_tools = _tts_fallback_available_tools()
+        try:
+            stt_min_chars = max(1, int(state.get("stt_min_chars", 3)))
+        except Exception:
+            stt_min_chars = 3
+        try:
+            stt_no_audio_timeout = max(1.0, float(state.get("stt_no_audio_timeout_sec", 3.0)))
+        except Exception:
+            stt_no_audio_timeout = 3.0
+        try:
+            stt_rms_threshold = max(0.001, float(state.get("stt_rms_threshold", 0.012)))
+        except Exception:
+            stt_rms_threshold = 0.012
         return {
             "enabled": enabled,
             "speaker": str(state.get("speaker", "")),
             "speaker_wav": str(state.get("speaker_wav", "")),
+            "stt_device": str(state.get("stt_device", "")),
+            "stt_min_chars": int(stt_min_chars),
+            "stt_command_only": bool(state.get("stt_command_only", True)),
+            "stt_no_audio_timeout_sec": float(stt_no_audio_timeout),
+            "stt_rms_threshold": float(stt_rms_threshold),
             "provider": "alltalk",
             "tts_backend": "alltalk",
             "server_url": base_url,
@@ -6524,14 +6880,89 @@ class Handler(BaseHTTPRequestHandler):
                 limit = int(str(query.get("limit", ["3"])[0]).strip() or "3")
             except Exception:
                 limit = 3
+            stt_status = _STT_MANAGER.status()
+            owner = str(stt_status.get("stt_owner_session_id", "")).strip()
+            if owner and sid != owner:
+                self._json(
+                    409,
+                    {
+                        "ok": False,
+                        "error": "stt_owner_mismatch",
+                        "session_id": sid,
+                        "items": [],
+                        **stt_status,
+                    },
+                )
+                return
             items = _STT_MANAGER.poll(session_id=sid, limit=limit)
             stt_status = _STT_MANAGER.status()
             self._json(
                 200,
                 {
+                    "ok": True,
                     "session_id": sid,
                     "items": items,
                     **stt_status,
+                },
+            )
+            return
+
+        if path == "/api/stt/diag":
+            query = parse_qs(parsed.query)
+            sid = _safe_session_id((query.get("session_id", ["default"])[0]))
+            stt_status = _STT_MANAGER.status()
+            owner = str(stt_status.get("stt_owner_session_id", "")).strip()
+            if owner and sid != owner:
+                self._json(
+                    409,
+                    {
+                        "ok": False,
+                        "error": "stt_owner_mismatch",
+                        "session_id": sid,
+                        **stt_status,
+                    },
+                )
+                return
+            self._json(
+                200,
+                {
+                    "ok": True,
+                    "session_id": sid,
+                    "state": _load_voice_state(),
+                    "devices": _stt_list_input_devices(),
+                    **stt_status,
+                },
+            )
+            return
+
+        if path == "/api/stt/level":
+            query = parse_qs(parsed.query)
+            sid = _safe_session_id((query.get("session_id", ["default"])[0]))
+            stt_status = _STT_MANAGER.status()
+            owner = str(stt_status.get("stt_owner_session_id", "")).strip()
+            if owner and sid != owner:
+                self._json(
+                    409,
+                    {
+                        "ok": False,
+                        "error": "stt_owner_mismatch",
+                        "session_id": sid,
+                        **stt_status,
+                    },
+                )
+                return
+            cfg = _bargein_config()
+            self._json(
+                200,
+                {
+                    "ok": True,
+                    "session_id": sid,
+                    "rms": float(stt_status.get("stt_rms_current", 0.0) or 0.0),
+                    "threshold": float(cfg.get("rms_threshold", 0.012) or 0.012),
+                    "in_speech": bool(stt_status.get("stt_vad_active", False)),
+                    "frames_seen": int(stt_status.get("stt_frames_seen", 0) or 0),
+                    "last_audio_ts": float(stt_status.get("stt_last_audio_ts", 0.0) or 0.0),
+                    "no_audio_input": bool(stt_status.get("stt_no_audio_input", False)),
                 },
             )
             return
@@ -6760,6 +7191,24 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(500, {"ok": False, "error": str(e)})
             return
 
+        if self.path == "/api/stt/inject":
+            try:
+                if not _env_flag("DIRECT_CHAT_STT_INJECT_ENABLED", True):
+                    self._json(403, {"ok": False, "error": "stt_inject_disabled"})
+                    return
+                payload = self._parse_payload()
+                sid = _safe_session_id(str(payload.get("session_id", "default")))
+                text = str(payload.get("text", "")).strip()
+                cmd = str(payload.get("cmd", "")).strip()
+                out = _STT_MANAGER.inject(session_id=sid, text=text, cmd=cmd)
+                status = 200 if bool(out.get("ok", False)) else 400
+                if str(out.get("error", "")) == "stt_owner_mismatch":
+                    status = 409
+                self._json(status, {"session_id": sid, **out, **_STT_MANAGER.status()})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": str(e)})
+            return
+
         if self.path == "/api/voice":
             try:
                 payload = self._parse_payload()
@@ -6778,7 +7227,33 @@ class Handler(BaseHTTPRequestHandler):
                 speaker_wav = str(payload.get("speaker_wav", "")).strip()
                 if speaker_wav:
                     state["speaker_wav"] = speaker_wav
+                if "stt_device" in payload:
+                    state["stt_device"] = str(payload.get("stt_device", "")).strip()
+                if "stt_command_only" in payload:
+                    state["stt_command_only"] = bool(payload.get("stt_command_only"))
+                if "stt_min_chars" in payload:
+                    try:
+                        state["stt_min_chars"] = max(1, int(payload.get("stt_min_chars", state.get("stt_min_chars", 3))))
+                    except Exception:
+                        pass
+                if "stt_no_audio_timeout_sec" in payload:
+                    try:
+                        state["stt_no_audio_timeout_sec"] = max(
+                            1.0, float(payload.get("stt_no_audio_timeout_sec", state.get("stt_no_audio_timeout_sec", 3.0)))
+                        )
+                    except Exception:
+                        pass
+                if "stt_rms_threshold" in payload:
+                    try:
+                        state["stt_rms_threshold"] = max(
+                            0.001, float(payload.get("stt_rms_threshold", state.get("stt_rms_threshold", 0.012)))
+                        )
+                    except Exception:
+                        pass
                 _save_voice_state(state)
+                os.environ["DIRECT_CHAT_STT_DEVICE"] = str(state.get("stt_device", "")).strip()
+                if "stt_device" in payload or "stt_command_only" in payload or "stt_min_chars" in payload:
+                    _STT_MANAGER.restart()
                 self._json(
                     200,
                     {

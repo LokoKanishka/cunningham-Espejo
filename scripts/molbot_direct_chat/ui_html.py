@@ -252,11 +252,27 @@ HTML = r"""<!doctype html>
 
 	    async function refreshMeter() {
 	      try {
-	        const r = await fetch("/api/metrics");
-	        const j = await r.json();
+	        const [mRes, sttRes] = await Promise.all([
+	          fetch("/api/metrics"),
+	          fetch(`/api/stt/level?${new URLSearchParams({ session_id: sessionId }).toString()}`),
+	        ]);
+	        const j = await mRes.json();
 	        const sys = j.sys || {};
 	        const proc = j.proc || {};
 	        const gpu = (j.gpu || {}).vram;
+	        let sttLabel = "off";
+	        if (sttRes.ok) {
+	          const sj = await sttRes.json();
+	          const rms = Number(sj?.rms || 0).toFixed(3);
+	          const thr = Number(sj?.threshold || 0).toFixed(3);
+	          const inSpeech = !!sj?.in_speech;
+	          const noAudio = !!sj?.no_audio_input;
+	          if (noAudio) {
+	            sttLabel = `NO_AUDIO rms ${rms}/${thr}`;
+	          } else {
+	            sttLabel = `${inSpeech ? "voz" : "sil"} ${rms}/${thr}`;
+	          }
+	        }
 
 	        const ram = `${fmtMb(sys.ram_used_mb)}/${fmtMb(sys.ram_total_mb)}`;
 	        const pr = fmtMb(proc.rss_mb);
@@ -264,7 +280,7 @@ HTML = r"""<!doctype html>
 	        if (gpu && gpu.total_mb != null) {
 	          vram = `${fmtMb(gpu.used_mb)}/${fmtMb(gpu.total_mb)}`;
 	        }
-	        meterEl.innerHTML = `RAM: <strong>${ram}</strong> | Proc: <strong>${pr}</strong> | VRAM: <strong>${vram}</strong>`;
+	        meterEl.innerHTML = `RAM: <strong>${ram}</strong> | Proc: <strong>${pr}</strong> | VRAM: <strong>${vram}</strong> | STT: <strong>${sttLabel}</strong>`;
 	      } catch {
 	        // keep last value
 	      }
@@ -457,13 +473,18 @@ HTML = r"""<!doctype html>
 	      try {
 	        const q = new URLSearchParams({ session_id: sessionId, limit: "2" });
 	        const r = await fetch(`/api/stt/poll?${q.toString()}`);
+	        if (r.status === 409) {
+	          await claimVoiceOwner();
+	          return;
+	        }
 	        if (!r.ok) return;
 	        const j = await r.json();
         const items = Array.isArray(j?.items) ? j.items : [];
 	        for (const item of items) {
 	          const text = String(item?.text || "").trim();
 	          if (!shouldAcceptSttText(text)) continue;
-	          const command = voiceCommandFromText(text);
+	          const cmdRaw = String(item?.cmd || "").trim().toLowerCase();
+	          const command = cmdRaw || voiceCommandFromText(text);
 	          if (command) {
 	            sttSending = true;
 	            try {
