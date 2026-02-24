@@ -697,18 +697,26 @@ HTML = r"""<!doctype html>
 	      const deadline = Date.now() + timeoutMs;
 	      while (Date.now() < deadline) {
 	        const voice = await fetchVoiceState();
-	        if (voice && voice.enabled && voice.server_ok === false) {
-	          return { ok: false, detail: String(voice.server_detail || "voice_server_unavailable") };
-	        }
 	        const last = voice?.last_status || {};
 	        const sid = clampInt(last?.stream_id, 0, 0, 10000000);
 	        if (sid === streamId) {
 	          if (last?.ok === true) return { ok: true };
-	          if (last?.ok === false) return { ok: false, detail: String(last?.detail || "tts_failed") };
+	          if (last?.ok === false) {
+	            const backend = String(voice?.tts_backend || voice?.provider || "tts");
+	            const healthUrl = String(voice?.tts_health_url || voice?.server_url || "");
+	            const healthTimeout = Number(voice?.tts_health_timeout_sec || 0);
+	            const detail = String(last?.detail || "tts_failed");
+	            return { ok: false, detail: `${backend} failed (${detail}) health=${healthUrl} timeout=${healthTimeout}s` };
+	          }
 	        }
 	        await sleep(180);
 	      }
-	      return { ok: false, detail: "tts_timeout" };
+	      const voice = await fetchVoiceState();
+	      const backend = String(voice?.tts_backend || voice?.provider || "tts");
+	      const healthUrl = String(voice?.tts_health_url || voice?.server_url || "");
+	      const healthTimeout = Number(voice?.tts_health_timeout_sec || 0);
+	      const serverDetail = String(voice?.server_detail || "health_unknown");
+	      return { ok: false, detail: `${backend} timeout waiting end (health=${healthUrl} timeout=${healthTimeout}s detail=${serverDetail})` };
 	    }
 
     async function postChatJson(payload, controller) {

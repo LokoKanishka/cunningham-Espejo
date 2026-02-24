@@ -327,6 +327,14 @@ class TestReaderHttpEndpoints(unittest.TestCase):
         self.assertFalse(bool(st.get("continuous_active", True)))
         self.assertEqual(str(st.get("continuous_reason", "")), "reader_user_interrupt")
 
+    def test_voice_payload_exposes_diagnostics(self) -> None:
+        code, out = self._request("GET", "/api/voice")
+        self.assertEqual(code, 200)
+        self.assertIn("tts_backend", out)
+        self.assertIn("tts_health_url", out)
+        self.assertIn("tts_health_timeout_sec", out)
+        self.assertIn("tts_available", out)
+
 
 if __name__ == "__main__":
     unittest.main()

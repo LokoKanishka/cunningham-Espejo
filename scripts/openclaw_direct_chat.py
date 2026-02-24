@@ -119,6 +119,16 @@ _BARGEIN_MONITOR = None
 _BARGEIN_STATS = {"count": 0, "last_ts": 0.0, "last_keyword": "", "last_detail": "not_started"}
 _READER_AUTOCOMMIT_LOCK = threading.Lock()
 _READER_AUTOCOMMIT_BY_STREAM: dict[int, dict] = {}
+_TTS_HEALTH_LOCK = threading.Lock()
+_TTS_HEALTH_CACHE = {
+    "ok": None,
+    "detail": "not_checked",
+    "checked_ts": 0.0,
+    "backend": "alltalk",
+    "base_url": "",
+    "health_path": "",
+    "timeout_s": 0.0,
+}
 
 
 def _bargein_config() -> dict:
@@ -732,11 +742,32 @@ def _alltalk_base_url() -> str:
     return str(os.environ.get("DIRECT_CHAT_ALLTALK_URL", "http://127.0.0.1:7851")).strip().rstrip("/")
 
 
+def _alltalk_health_timeout_sec(default: float = 1.5) -> float:
+    raw = str(os.environ.get("DIRECT_CHAT_ALLTALK_HEALTH_TIMEOUT_SEC", str(default))).strip()
+    try:
+        return max(0.2, float(raw))
+    except Exception:
+        return max(0.2, float(default))
+
+
 def _alltalk_health_path() -> str:
     path = str(os.environ.get("DIRECT_CHAT_ALLTALK_HEALTH_PATH", "/ready")).strip()
     if not path.startswith("/"):
         path = "/" + path
     return path
+
+
+def _alltalk_health_paths() -> list[str]:
+    raw = str(os.environ.get("DIRECT_CHAT_ALLTALK_HEALTH_PATHS", "")).strip()
+    items = [p.strip() for p in raw.split(",") if p.strip()]
+    if not items:
+        items = [_alltalk_health_path(), "/health", "/ready", "/api/health", "/"]
+    out: list[str] = []
+    for item in items:
+        p = item if item.startswith("/") else f"/{item}"
+        if p not in out:
+            out.append(p)
+    return out
 
 
 def _alltalk_tts_path() -> str:
@@ -746,26 +777,162 @@ def _alltalk_tts_path() -> str:
     return path
 
 
-def _alltalk_health(timeout_s: float = 0.5) -> tuple[bool, str]:
-    req = Request(url=_alltalk_base_url() + _alltalk_health_path(), method="GET")
+def _alltalk_tts_timeout_sec(default: float = 15.0) -> float:
+    raw = str(os.environ.get("DIRECT_CHAT_ALLTALK_TIMEOUT_SEC", str(default))).strip()
     try:
-        with urlopen(req, timeout=max(0.2, timeout_s)) as resp:
-            body = resp.read().decode("utf-8", errors="ignore")
-            status = int(getattr(resp, "status", 200))
-        if status != 200:
-            return False, f"health_http_{status}"
+        return max(1.0, float(raw))
+    except Exception:
+        return max(1.0, float(default))
+
+
+def _alltalk_health_probe(timeout_s: float | None = None) -> dict:
+    timeout = _alltalk_health_timeout_sec(default=float(timeout_s or 1.5))
+    base_url = _alltalk_base_url()
+    paths = _alltalk_health_paths()
+    last_err = "health_error:unknown"
+    used_path = paths[0] if paths else _alltalk_health_path()
+    for health_path in paths:
+        req = Request(url=base_url + health_path, method="GET")
         try:
-            data = json.loads(body or "{}")
-            marker = str(data.get("status") or data.get("message") or "ok")
-            return True, marker
+            with urlopen(req, timeout=timeout) as resp:
+                body = resp.read().decode("utf-8", errors="ignore")
+                status = int(getattr(resp, "status", 200))
+            if status != 200:
+                last_err = f"health_http_{status}@{health_path}"
+                used_path = health_path
+                continue
+            marker = "ok"
+            try:
+                data = json.loads(body or "{}")
+                marker = str(data.get("status") or data.get("message") or "ok")
+            except Exception:
+                marker = "ok"
+            return {
+                "ok": True,
+                "detail": marker,
+                "checked_ts": time.time(),
+                "backend": "alltalk",
+                "base_url": base_url,
+                "health_path": health_path,
+                "timeout_s": float(timeout),
+            }
+        except HTTPError as e:
+            last_err = f"health_http_error:{e.code}@{health_path}"
+            used_path = health_path
+            continue
+        except URLError as e:
+            last_err = f"health_url_error:{e.reason}@{health_path}"
+            used_path = health_path
+            continue
+        except Exception as e:
+            last_err = f"health_error:{e}@{health_path}"
+            used_path = health_path
+            continue
+    return {
+        "ok": False,
+        "detail": last_err,
+        "checked_ts": time.time(),
+        "backend": "alltalk",
+        "base_url": base_url,
+        "health_path": used_path,
+        "timeout_s": float(timeout),
+    }
+
+
+def _alltalk_health_cached(force: bool = False, timeout_s: float | None = None) -> dict:
+    timeout = _alltalk_health_timeout_sec(default=float(timeout_s or 1.5))
+    ok_ttl = max(0.1, float(os.environ.get("DIRECT_CHAT_TTS_HEALTH_CACHE_OK_SEC", "2.0")))
+    fail_ttl = max(0.1, float(os.environ.get("DIRECT_CHAT_TTS_HEALTH_CACHE_FAIL_SEC", "0.8")))
+    now = time.time()
+    with _TTS_HEALTH_LOCK:
+        cached = dict(_TTS_HEALTH_CACHE)
+        age = max(0.0, now - float(cached.get("checked_ts", 0.0) or 0.0))
+        cached_ok = cached.get("ok")
+        cached_timeout = float(cached.get("timeout_s", 0.0) or 0.0)
+        if (not force) and cached_ok is not None and abs(cached_timeout - timeout) < 0.001:
+            ttl = ok_ttl if bool(cached_ok) else fail_ttl
+            if age <= ttl:
+                return cached
+
+    fresh = _alltalk_health_probe(timeout_s=timeout)
+    with _TTS_HEALTH_LOCK:
+        _TTS_HEALTH_CACHE.update(fresh)
+        return dict(_TTS_HEALTH_CACHE)
+
+
+def _alltalk_health(timeout_s: float = 0.5) -> tuple[bool, str]:
+    data = _alltalk_health_cached(force=False, timeout_s=timeout_s)
+    return bool(data.get("ok", False)), str(data.get("detail", "health_unknown"))
+
+
+def _tts_fallback_order() -> list[str]:
+    raw = str(os.environ.get("DIRECT_CHAT_TTS_FALLBACK_ORDER", "espeak-ng,espeak,pico2wave")).strip()
+    items = [x.strip() for x in raw.split(",") if x.strip()]
+    out: list[str] = []
+    for item in items:
+        if item not in out:
+            out.append(item)
+    return out
+
+
+def _tts_fallback_available_tools() -> list[str]:
+    tools: list[str] = []
+    for name in _tts_fallback_order():
+        if shutil.which(name):
+            tools.append(name)
+    return tools
+
+
+def _tts_speak_local_fallback(text: str) -> tuple[Path | None, str]:
+    if not _env_flag("DIRECT_CHAT_TTS_FALLBACK_ENABLED", True):
+        return None, "fallback_disabled"
+    msg = str(text or "").strip()
+    if not msg:
+        return None, "fallback_empty_text"
+    tools = _tts_fallback_available_tools()
+    if not tools:
+        return None, "fallback_no_local_engine"
+    voice = str(os.environ.get("DIRECT_CHAT_TTS_FALLBACK_VOICE", "es")).strip() or "es"
+    timeout_s = max(1.0, float(os.environ.get("DIRECT_CHAT_TTS_FALLBACK_TIMEOUT_SEC", "8")))
+    out = Path("/tmp") / f"openclaw_tts_fallback_{int(time.time() * 1000)}.wav"
+    errs: list[str] = []
+    for tool in tools:
+        if tool in ("espeak", "espeak-ng"):
+            cmd = [tool, "-v", voice, "-w", str(out), msg]
+        elif tool == "pico2wave":
+            cmd = [tool, "-w", str(out), msg]
+        else:
+            errs.append(f"{tool}:unsupported")
+            continue
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+            if proc.returncode == 0 and out.exists() and out.stat().st_size > 64:
+                return out, f"ok_fallback_{tool}"
+            err = (proc.stderr or proc.stdout or "").strip().replace("\n", " ")
+            errs.append(f"{tool}:rc{proc.returncode}:{err[:120]}")
+        except Exception as e:
+            errs.append(f"{tool}:{e}")
+        try:
+            out.unlink(missing_ok=True)
         except Exception:
-            return True, "ok"
-    except HTTPError as e:
-        return False, f"health_http_error:{e.code}"
-    except URLError as e:
-        return False, f"health_url_error:{e.reason}"
-    except Exception as e:
-        return False, f"health_error:{e}"
+            pass
+    detail = ";".join(errs)[:280] if errs else "fallback_failed"
+    return None, f"fallback_failed:{detail}"
+
+
+def _voice_diagnostics(detail: str = "") -> str:
+    health = _alltalk_health_cached(force=False)
+    backend = str(health.get("backend", "alltalk") or "alltalk")
+    base_url = str(health.get("base_url", _alltalk_base_url()) or _alltalk_base_url())
+    health_path = str(health.get("health_path", _alltalk_health_path()) or _alltalk_health_path())
+    timeout_s = float(health.get("timeout_s", _alltalk_health_timeout_sec()) or _alltalk_health_timeout_sec())
+    hdetail = str(health.get("detail", "")).strip()
+    fallback_tools = ",".join(_tts_fallback_available_tools()) or "none"
+    extra = str(detail or hdetail or "unknown").strip()
+    return (
+        f"backend={backend} url={base_url} health={health_path} timeout={timeout_s:.2f}s "
+        f"detail={extra} fallback={fallback_tools}"
+    )
 
 
 _EMOJI_RE = re.compile(
@@ -1007,6 +1174,10 @@ def _tts_speak_alltalk(text: str, state: dict) -> tuple[Path | None, str]:
     msg = str(text or "").strip()
     if not msg:
         return None, "empty_text"
+    if _env_flag("DIRECT_CHAT_ALLTALK_SKIP_WHEN_UNHEALTHY", True):
+        h = _alltalk_health_cached(force=False, timeout_s=_alltalk_health_timeout_sec())
+        if not bool(h.get("ok", False)):
+            return None, f"alltalk_unhealthy:{_voice_diagnostics(str(h.get('detail', 'health_failed')))}"
 
     def _alltalk_character_voice() -> str:
         explicit = str(os.environ.get("DIRECT_CHAT_ALLTALK_CHARACTER_VOICE", "")).strip()
@@ -1040,7 +1211,7 @@ def _tts_speak_alltalk(text: str, state: dict) -> tuple[Path | None, str]:
         "autoplay": "false",
         "autoplay_volume": str(os.environ.get("DIRECT_CHAT_ALLTALK_AUTOPLAY_VOLUME", "1.0")).strip() or "1.0",
     }
-    timeout_s = float(_int_env("DIRECT_CHAT_ALLTALK_TIMEOUT_SEC", 60))
+    timeout_s = _alltalk_tts_timeout_sec(default=15.0)
     base_url = _alltalk_base_url() + "/"
     req_url = _alltalk_base_url() + _alltalk_tts_path()
 
@@ -1178,8 +1349,11 @@ def _speak_reply_async(text: str) -> int:
                         return
                     wav_path, detail = _tts_speak_alltalk(chunk, state)
                     if wav_path is None:
-                        producer_error["detail"] = detail
-                        return
+                        fb_path, fb_detail = _tts_speak_local_fallback(chunk)
+                        if fb_path is None:
+                            producer_error["detail"] = f"{detail}|{fb_detail}"
+                            return
+                        wav_path, detail = fb_path, fb_detail
                     while not stop_event.is_set():
                         try:
                             tts_queue.put(wav_path, timeout=0.2)
@@ -4580,13 +4754,13 @@ def _reader_meta(
 
 
 def _reader_voice_unavailable_detail() -> str:
-    ok, detail = _alltalk_health(timeout_s=0.35)
-    if not ok:
-        return f"alltalk_unavailable:{str(detail or 'health_failed')}"
+    health = _alltalk_health_cached(force=False)
+    if not bool(health.get("ok", False)):
+        return _voice_diagnostics(str(health.get("detail", "health_failed")))
     last = str((_VOICE_LAST_STATUS or {}).get("detail", "")).strip()
     if last and last not in ("not_started", "queued"):
-        return f"tts_start_failed:{last}"
-    return "tts_start_failed:stream_not_created"
+        return _voice_diagnostics(f"tts_start_failed:{last}")
+    return _voice_diagnostics("tts_start_failed:stream_not_created")
 
 
 def _reader_emit_chunk(
@@ -6031,15 +6205,28 @@ class Handler(BaseHTTPRequestHandler):
     def _voice_payload(self, state: dict) -> dict:
         enabled = bool(state.get("enabled", False))
         stt_status = _STT_MANAGER.status()
-        server_ok, server_detail = _alltalk_health(timeout_s=0.35)
+        health = _alltalk_health_cached(force=False)
+        server_ok = bool(health.get("ok", False))
+        server_detail = str(health.get("detail", "health_unknown"))
+        base_url = str(health.get("base_url", _alltalk_base_url()) or _alltalk_base_url())
+        health_path = str(health.get("health_path", _alltalk_health_path()) or _alltalk_health_path())
+        timeout_s = float(health.get("timeout_s", _alltalk_health_timeout_sec()) or _alltalk_health_timeout_sec())
+        fallback_tools = _tts_fallback_available_tools()
         return {
             "enabled": enabled,
             "speaker": str(state.get("speaker", "")),
             "speaker_wav": str(state.get("speaker_wav", "")),
             "provider": "alltalk",
-            "server_url": _alltalk_base_url(),
+            "tts_backend": "alltalk",
+            "server_url": base_url,
+            "tts_health_url": f"{base_url}{health_path}",
+            "tts_health_path": health_path,
+            "tts_health_timeout_sec": timeout_s,
             "server_ok": bool(server_ok),
             "server_detail": str(server_detail),
+            "tts_fallback_tools": fallback_tools,
+            "tts_available": bool(server_ok or fallback_tools),
+            "tts_diagnostic": _voice_diagnostics(),
             "tts_playing": bool(_tts_is_playing()),
             "last_status": _VOICE_LAST_STATUS,
             **_bargein_status(),
