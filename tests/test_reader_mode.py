@@ -165,6 +165,8 @@ class TestReaderHttpEndpoints(unittest.TestCase):
             state_path=self._state_path,
             lock_path=self._lock_path,
         )
+        with direct_chat._READER_AUTOCOMMIT_LOCK:
+            direct_chat._READER_AUTOCOMMIT_BY_STREAM.clear()
         self._httpd = direct_chat.ThreadingHTTPServer(("127.0.0.1", 0), direct_chat.Handler)
         self._httpd.gateway_token = "test-token"
         self._httpd.gateway_port = 18789
@@ -326,6 +328,67 @@ class TestReaderHttpEndpoints(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertFalse(bool(st.get("continuous_active", True)))
         self.assertEqual(str(st.get("continuous_reason", "")), "reader_user_interrupt")
+
+    def test_autocommit_timeout_commits_pending(self) -> None:
+        direct_chat._READER_STORE.start_session("timeout_commit", chunks=["uno", "dos"], reset=True)
+        out = direct_chat._READER_STORE.next_chunk("timeout_commit")
+        chunk = out.get("chunk", {})
+        stream_id = 99001
+        direct_chat._reader_autocommit_register(
+            stream_id=stream_id,
+            session_id="timeout_commit",
+            chunk_id=str(chunk.get("chunk_id", "")),
+            chunk_index=int(chunk.get("chunk_index", 0)),
+            text_len=len(str(chunk.get("text", ""))),
+            start_offset_chars=0,
+        )
+        direct_chat._reader_autocommit_finalize(stream_id, False, detail="tts_end_timeout", force_timeout_commit=True)
+        st = direct_chat._READER_STORE.get_session("timeout_commit", include_chunks=False)
+        self.assertEqual(int(st.get("cursor", -1)), 1)
+        self.assertFalse(bool(st.get("has_pending", True)))
+
+    def test_autocommit_interrupt_keeps_pending(self) -> None:
+        direct_chat._READER_STORE.start_session("interrupt_keep", chunks=["uno", "dos"], reset=True)
+        out = direct_chat._READER_STORE.next_chunk("interrupt_keep")
+        chunk = out.get("chunk", {})
+        stream_id = 99002
+        direct_chat._reader_autocommit_register(
+            stream_id=stream_id,
+            session_id="interrupt_keep",
+            chunk_id=str(chunk.get("chunk_id", "")),
+            chunk_index=int(chunk.get("chunk_index", 0)),
+            text_len=len(str(chunk.get("text", ""))),
+            start_offset_chars=0,
+        )
+        direct_chat._reader_autocommit_finalize(stream_id, False, detail="playback_interrupted", force_timeout_commit=False)
+        st = direct_chat._READER_STORE.get_session("interrupt_keep", include_chunks=False)
+        self.assertEqual(int(st.get("cursor", -1)), 0)
+        self.assertTrue(bool(st.get("has_pending", False)))
+
+    def test_continuar_unstucks_pending_after_tts_failure(self) -> None:
+        code, started = self._request(
+            "POST",
+            "/api/reader/session/start",
+            {"session_id": "unstuck_sess", "chunks": ["uno", "dos"], "reset": True},
+        )
+        self.assertEqual(code, 200)
+        self.assertTrue(started.get("ok"))
+        direct_chat._READER_STORE.set_continuous("unstuck_sess", True, reason="test_unstuck")  # type: ignore
+        self._request("GET", "/api/reader/session/next?session_id=unstuck_sess")
+        direct_chat._VOICE_LAST_STATUS = {"ok": False, "detail": "tts_end_timeout", "ts": time.time(), "stream_id": 42}  # type: ignore
+        time.sleep(1.6)
+        code, out = self._request(
+            "POST",
+            "/api/chat",
+            {
+                "session_id": "unstuck_sess",
+                "message": "continuar",
+                "allowed_tools": [],
+                "history": [],
+            },
+        )
+        self.assertEqual(code, 200)
+        self.assertIn("bloque 2/2", str(out.get("reply", "")).lower())
 
     def test_voice_payload_exposes_diagnostics(self) -> None:
         code, out = self._request("GET", "/api/voice")

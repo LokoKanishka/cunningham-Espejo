@@ -228,6 +228,51 @@ def _reader_autocommit_register(
             "text_len": max(0, int(text_len)),
             "start_offset_chars": max(0, int(start_offset_chars)),
         }
+    max_wait = _reader_tts_end_max_wait_sec(text_len=max(0, int(text_len)))
+    th = threading.Thread(target=_reader_autocommit_timeout_worker, args=(int(stream_id), float(max_wait)), daemon=True)
+    th.start()
+
+
+def _reader_tts_end_max_wait_sec(text_len: int = 0) -> float:
+    min_wait = max(0.5, float(os.environ.get("DIRECT_CHAT_TTS_END_MIN_WAIT_SEC", "20")))
+    base = max(min_wait, float(os.environ.get("DIRECT_CHAT_TTS_END_MAX_WAIT_SEC", "90")))
+    cps = max(4.0, float(os.environ.get("DIRECT_CHAT_TTS_EST_CHARS_PER_SEC", "16")))
+    buffer_sec = max(2.0, float(os.environ.get("DIRECT_CHAT_TTS_END_BUFFER_SEC", "10")))
+    dynamic = max(min_wait, (max(0, int(text_len)) / cps) + buffer_sec)
+    return min(300.0, max(base, dynamic))
+
+
+def _reader_should_commit_on_tts_failure(detail: str) -> bool:
+    d = str(detail or "").strip().lower()
+    if not d:
+        return True
+    # User-initiated stops preserve pending chunk for explicit resume.
+    if any(k in d for k in ("reader_user_barge_in", "reader_user_interrupt", "playback_interrupted", "typed_interrupt")):
+        return False
+    return True
+
+
+def _reader_commit_from_autocommit(pending: dict, reason: str) -> None:
+    try:
+        _READER_STORE.commit(
+            str(pending.get("session_id", "default")),
+            chunk_id=str(pending.get("chunk_id", "")),
+            chunk_index=int(pending.get("chunk_index", 0)),
+            reason=str(reason or "tts_end_autocommit")[:120],
+        )
+    except Exception:
+        return
+
+
+def _reader_autocommit_timeout_worker(stream_id: int, max_wait_sec: float) -> None:
+    wait_s = max(0.1, float(max_wait_sec))
+    time.sleep(wait_s)
+    _reader_autocommit_finalize(
+        int(stream_id),
+        ok=False,
+        detail="tts_end_timeout",
+        force_timeout_commit=True,
+    )
 
 
 def _reader_autocommit_peek(stream_id: int) -> dict | None:
@@ -270,24 +315,26 @@ def _reader_mark_barge_in_from_stream(
         return
 
 
-def _reader_autocommit_finalize(stream_id: int, ok: bool | None) -> None:
+def _reader_autocommit_finalize(
+    stream_id: int,
+    ok: bool | None,
+    detail: str = "",
+    force_timeout_commit: bool = False,
+) -> None:
     if stream_id <= 0 or ok is None:
         return
     with _READER_AUTOCOMMIT_LOCK:
         pending = _READER_AUTOCOMMIT_BY_STREAM.pop(int(stream_id), None)
     if not pending:
         return
-    if ok is not True:
+    if ok is True:
+        _reader_commit_from_autocommit(pending, reason="tts_end_autocommit")
         return
-    try:
-        _READER_STORE.commit(
-            str(pending.get("session_id", "default")),
-            chunk_id=str(pending.get("chunk_id", "")),
-            chunk_index=int(pending.get("chunk_index", 0)),
-            reason="tts_end_autocommit",
-        )
-    except Exception:
+    if force_timeout_commit:
+        _reader_commit_from_autocommit(pending, reason="tts_end_timeout")
         return
+    if _reader_should_commit_on_tts_failure(detail):
+        _reader_commit_from_autocommit(pending, reason=f"tts_end_failed:{str(detail or 'unknown')[:80]}")
 
 
 class _BargeInMonitor:
@@ -1037,7 +1084,7 @@ def _chunk_text_for_tts(text: str, max_len: int = 250) -> list[str]:
 
 def _set_voice_status(stream_id: int, ok: bool | None, detail: str) -> None:
     global _VOICE_LAST_STATUS
-    _reader_autocommit_finalize(stream_id, ok)
+    _reader_autocommit_finalize(stream_id, ok, detail=str(detail or ""))
     with _TTS_STREAM_LOCK:
         if stream_id != _TTS_STREAM_ID:
             return
@@ -4620,8 +4667,11 @@ def _reader_pacing_config() -> dict:
     }
 
 
-def _reader_tts_wait_timeout_ms() -> int:
-    return max(1500, _int_env("DIRECT_CHAT_READER_TTS_WAIT_TIMEOUT_MS", 15000))
+def _reader_tts_wait_timeout_ms(text_len: int = 0) -> int:
+    env_ms = _int_env("DIRECT_CHAT_READER_TTS_WAIT_TIMEOUT_MS", 0)
+    if env_ms > 0:
+        return max(1500, int(env_ms))
+    return int(max(1500.0, _reader_tts_end_max_wait_sec(text_len=max(0, int(text_len))) * 1000.0))
 
 
 def _reader_pacing_wait_ms(state: dict | None, now_ts: float | None = None, cfg: dict | None = None) -> int:
@@ -4718,6 +4768,9 @@ def _reader_meta(
     st = state if isinstance(state, dict) else {}
     pacing_cfg = _reader_pacing_config()
     next_auto_after_ms = _reader_pacing_wait_ms(st, cfg=pacing_cfg) if auto_continue else 0
+    chunk_text_len = 0
+    if isinstance(chunk, dict):
+        chunk_text_len = len(str(chunk.get("text", "")))
     out = {
         "session_id": _safe_session_id(session_id),
         "cursor": int(st.get("cursor", 0) or 0),
@@ -4736,7 +4789,7 @@ def _reader_meta(
         "next_auto_after_ms": int(max(0, next_auto_after_ms)),
         "tts_gate_required": bool(tts_gate_required),
         "tts_wait_stream_id": int(tts_stream_id) if tts_gate_required and int(tts_stream_id) > 0 else 0,
-        "tts_wait_timeout_ms": _reader_tts_wait_timeout_ms() if tts_gate_required else 0,
+        "tts_wait_timeout_ms": _reader_tts_wait_timeout_ms(chunk_text_len) if tts_gate_required else 0,
     }
     if isinstance(chunk, dict):
         out["chunk_index"] = int(chunk.get("chunk_index", 0) or 0)
@@ -4802,6 +4855,45 @@ def _reader_emit_chunk(
         )
         committed = True
     return tts_gate_required, tts_stream_id, committed, tts_unavailable_detail
+
+
+def _reader_force_commit_pending_if_stalled(session_id: str, state: dict | None) -> tuple[bool, dict]:
+    st = state if isinstance(state, dict) else _READER_STORE.get_session(session_id, include_chunks=False)
+    if not st.get("ok"):
+        return False, st
+    pending = st.get("pending") if isinstance(st.get("pending"), dict) else None
+    if not isinstance(pending, dict):
+        return False, st
+    # Preserve mid-chunk resume semantics (barge-in/bookmark).
+    if int(pending.get("offset_chars", 0) or 0) > 0:
+        return False, st
+    now = time.time()
+    last_delivery_ts = float(pending.get("last_delivery_ts", 0.0) or 0.0)
+    pending_text_len = len(str(pending.get("text", "")))
+    max_wait = _reader_tts_end_max_wait_sec(text_len=pending_text_len)
+    age = max(0.0, now - last_delivery_ts) if last_delivery_ts > 0.0 else 0.0
+    detail = str((_VOICE_LAST_STATUS or {}).get("detail", "")).strip().lower()
+    detail_is_failure = bool(detail) and any(
+        k in detail for k in ("timeout", "tts_", "alltalk_", "health_", "player_", "fallback_failed")
+    )
+    if any(k in detail for k in ("reader_user_barge_in", "reader_user_interrupt", "playback_interrupted")):
+        return False, st
+    should_force = False
+    if age >= max_wait:
+        should_force = True
+    elif (not _tts_is_playing()) and detail_is_failure:
+        should_force = True
+    if not should_force:
+        return False, st
+    committed = _READER_STORE.commit(
+        session_id,
+        chunk_id=str(pending.get("chunk_id", "")),
+        chunk_index=int(pending.get("chunk_index", 0) or 0),
+        reason="tts_end_timeout_force_continue",
+    )
+    return bool(committed.get("ok", False) and committed.get("committed", False)), _READER_STORE.get_session(
+        session_id, include_chunks=False
+    )
 
 
 def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id: str) -> dict | None:
@@ -5304,6 +5396,8 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         st_before = _READER_STORE.get_session(session_id, include_chunks=False)
         if not st_before.get("ok"):
             return {"reply": "No hay sesión de lectura activa. Usá 'biblioteca' y 'leer libro <n>'.", "no_auto_tts": True}
+        _reader_force_commit_pending_if_stalled(session_id, st_before)
+        st_before = _READER_STORE.get_session(session_id, include_chunks=False)
         manual_mode = bool(st_before.get("manual_mode", False))
         _READER_STORE.set_continuous(
             session_id,

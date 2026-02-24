@@ -238,6 +238,7 @@ HTML = r"""<!doctype html>
 	      let readerAutoNextAtMs = 0;
 	      let readerAutoMinDelayMs = 1500;
 	      let readerAutoTtsGate = null;
+	      let readerAutoLastGateWarnAt = 0;
 	      let sttPollTimer = null;
 	      let sttSending = false;
 	      let sttLastText = "";
@@ -687,7 +688,7 @@ HTML = r"""<!doctype html>
 	      } catch {}
 	    }
 
-	    async function waitReaderTtsGateIfNeeded() {
+		    async function waitReaderTtsGateIfNeeded() {
 	      const gate = readerAutoTtsGate;
 	      if (!gate) return { ok: true };
 	      if (!voiceEnabled) return { ok: true };
@@ -695,29 +696,33 @@ HTML = r"""<!doctype html>
 	      const timeoutMs = clampInt(gate?.timeoutMs, 15000, 1500, 120000);
 	      if (streamId <= 0) return { ok: false, detail: "tts_stream_missing" };
 	      const deadline = Date.now() + timeoutMs;
-	      while (Date.now() < deadline) {
-	        const voice = await fetchVoiceState();
-	        const last = voice?.last_status || {};
-	        const sid = clampInt(last?.stream_id, 0, 0, 10000000);
-	        if (sid === streamId) {
-	          if (last?.ok === true) return { ok: true };
-	          if (last?.ok === false) {
-	            const backend = String(voice?.tts_backend || voice?.provider || "tts");
-	            const healthUrl = String(voice?.tts_health_url || voice?.server_url || "");
-	            const healthTimeout = Number(voice?.tts_health_timeout_sec || 0);
-	            const detail = String(last?.detail || "tts_failed");
-	            return { ok: false, detail: `${backend} failed (${detail}) health=${healthUrl} timeout=${healthTimeout}s` };
-	          }
-	        }
-	        await sleep(180);
-	      }
-	      const voice = await fetchVoiceState();
-	      const backend = String(voice?.tts_backend || voice?.provider || "tts");
-	      const healthUrl = String(voice?.tts_health_url || voice?.server_url || "");
-	      const healthTimeout = Number(voice?.tts_health_timeout_sec || 0);
-	      const serverDetail = String(voice?.server_detail || "health_unknown");
-	      return { ok: false, detail: `${backend} timeout waiting end (health=${healthUrl} timeout=${healthTimeout}s detail=${serverDetail})` };
-	    }
+		      while (Date.now() < deadline) {
+		        const voice = await fetchVoiceState();
+		        const last = voice?.last_status || {};
+		        const sid = clampInt(last?.stream_id, 0, 0, 10000000);
+		        if (sid === streamId) {
+		          if (last?.ok === true) return { ok: true };
+		          if (last?.ok === false) {
+		            const backend = String(voice?.tts_backend || voice?.provider || "tts");
+		            const healthUrl = String(voice?.tts_health_url || voice?.server_url || "");
+		            const healthTimeout = Number(voice?.tts_health_timeout_sec || 0);
+		            const detail = String(last?.detail || "tts_failed");
+		            const diag = `${backend} failed (${detail}) health=${healthUrl} timeout=${healthTimeout}s`;
+		            if (/reader_user|playback_interrupted/i.test(detail)) {
+		              return { ok: false, detail: diag };
+		            }
+		            return { ok: true, degraded: true, detail: diag };
+		          }
+		        }
+		        await sleep(180);
+		      }
+		      const voice = await fetchVoiceState();
+		      const backend = String(voice?.tts_backend || voice?.provider || "tts");
+		      const healthUrl = String(voice?.tts_health_url || voice?.server_url || "");
+		      const healthTimeout = Number(voice?.tts_health_timeout_sec || 0);
+		      const serverDetail = String(voice?.server_detail || "health_unknown");
+		      return { ok: true, degraded: true, detail: `${backend} timeout waiting end (health=${healthUrl} timeout=${healthTimeout}s detail=${serverDetail})` };
+		    }
 
     async function postChatJson(payload, controller) {
       const res = await fetch("/api/chat", {
@@ -754,16 +759,24 @@ HTML = r"""<!doctype html>
 	      abortCurrentStream();
 	      const controller = new AbortController();
 	      activeStreamController = controller;
-	      try {
-	        const gate = await waitReaderTtsGateIfNeeded();
-	        if (!gate?.ok) {
-	          stopReaderAuto();
-	          await pauseReaderContinuousSilently();
-	          const detail = String(gate?.detail || "tts_unavailable");
-	          await push("assistant", `voz no disponible (${detail}), usá 'modo manual on' o 'continuar' manual`);
-	          return;
-	        }
-	        readerAutoTtsGate = null;
+		      try {
+		        const gate = await waitReaderTtsGateIfNeeded();
+		        if (!gate?.ok) {
+		          stopReaderAuto();
+		          await pauseReaderContinuousSilently();
+		          const detail = String(gate?.detail || "tts_unavailable");
+		          await push("assistant", `voz no disponible (${detail}), usá 'modo manual on' o 'continuar' manual`);
+		          return;
+		        }
+		        if (gate?.degraded) {
+		          const now = Date.now();
+		          if ((now - readerAutoLastGateWarnAt) > 12000) {
+		            readerAutoLastGateWarnAt = now;
+		            const detail = String(gate?.detail || "tts_degraded");
+		            await push("assistant", `voz degradada (${detail}), sigo en lectura continua`);
+		          }
+		        }
+		        readerAutoTtsGate = null;
 	        const sel = selectedModel();
 	        const payload = {
 	          message: "seguí",

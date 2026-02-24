@@ -30,6 +30,10 @@ sys.path.insert(0, str(repo_root / "scripts"))
 import openclaw_direct_chat as direct_chat  # noqa: E402
 
 os.environ["DIRECT_CHAT_TTS_DRY_RUN"] = "1"
+os.environ["DIRECT_CHAT_TTS_END_MIN_WAIT_SEC"] = "1"
+os.environ["DIRECT_CHAT_TTS_END_MAX_WAIT_SEC"] = "1"
+os.environ["DIRECT_CHAT_TTS_END_BUFFER_SEC"] = "2"
+os.environ["DIRECT_CHAT_TTS_EST_CHARS_PER_SEC"] = "1000"
 os.environ["DIRECT_CHAT_READER_CHUNK_MAX_CHARS"] = "600"
 os.environ["DIRECT_CHAT_READER_PACING_MIN_MS"] = "1500"
 os.environ["DIRECT_CHAT_READER_BURST_WINDOW_MS"] = "10000"
@@ -138,6 +142,15 @@ def reader_post(path: str, payload: dict) -> dict:
     with urlopen(req, timeout=8) as resp:
         body = json.loads(resp.read().decode("utf-8") or "{}")
         return body if isinstance(body, dict) else {}
+
+
+def reader_next(session: str, speak: bool = False, autocommit: bool = False) -> dict:
+    qs = f"/api/reader/session/next?session_id={session}"
+    if speak:
+        qs += "&speak=1"
+    if autocommit:
+        qs += "&autocommit=1"
+    return reader_get(qs)
 
 
 try:
@@ -252,6 +265,42 @@ try:
     rewind_reply = str(rewind.get("reply", ""))
     ensure("bloque" in rewind_reply.lower(), f"volver_una_frase_bad payload={rewind}")
     print("PASS volver_una_frase")
+
+    # Voice path: if tts_end never arrives, timeout commit should still advance.
+    orig_speak = direct_chat._speak_reply_async
+    stream_counter = {"n": 97000}
+
+    def fake_speak_no_end(text: str) -> int:
+        stream_id, _stop = direct_chat._start_new_tts_stream()
+        stream_counter["n"] = max(stream_counter["n"] + 1, int(stream_id))
+        return int(stream_counter["n"])
+
+    direct_chat._speak_reply_async = fake_speak_no_end
+    try:
+        tts_sid = f"{session_id}_tts_timeout"
+        reader_post(
+            "/api/reader/session/start",
+            {
+                "session_id": tts_sid,
+                "chunks": [
+                    "Bloque uno para timeout de tts.",
+                    "Bloque dos debe avanzar tras timeout.",
+                    "Bloque tres para confirmar continuidad.",
+                ],
+                "reset": True,
+            },
+        )
+        n1 = reader_next(tts_sid, speak=True, autocommit=True)
+        ensure(bool(n1.get("ok", False)), f"tts_timeout_next1_failed payload={n1}")
+        time.sleep(2.8)
+        st_tts = reader_get(f"/api/reader/session?session_id={tts_sid}")
+        ensure(int(st_tts.get("cursor", -1)) >= 1, f"tts_timeout_not_committed status={st_tts}")
+        n2 = reader_next(tts_sid, speak=True, autocommit=True)
+        ch2 = n2.get("chunk", {}) if isinstance(n2.get("chunk"), dict) else {}
+        ensure(int(ch2.get("chunk_index", -1)) >= 1, f"tts_timeout_not_advanced payload={n2}")
+        print("PASS tts_timeout_autocommit_advances")
+    finally:
+        direct_chat._speak_reply_async = orig_speak
 
     # Estado should show progress and continuous mode state.
     r = post_chat("estado lectura")
