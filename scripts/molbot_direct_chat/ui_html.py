@@ -361,14 +361,12 @@ HTML = r"""<!doctype html>
       }
     }
 
-	    let sttLastSendAtMs = 0;
-	    const STT_MIN_SEND_INTERVAL_MS = 1500;
 	    let sttLastBargeAtMs = 0;
 	    const STT_BARGE_COOLDOWN_MS = 1200;
 
-	    function isBargeInText(text) {
+	    function voiceCommandFromText(text) {
 	      const t = norm(text).toLowerCase();
-	      if (!t) return false;
+	      if (!t) return "";
 	      if (
 	        t === "detenete" ||
 	        t === "detente" ||
@@ -380,19 +378,66 @@ HTML = r"""<!doctype html>
 	        t === "basta" ||
 	        t === "stop" ||
 	        t === "stop lectura"
-	      ) return true;
-	      return /^(detenete|detente|pausa|pausa lectura|pausar lectura|detener lectura|parar lectura|basta|stop)\b/i.test(t);
+	      ) return "pause";
+	      if (/^(detenete|detente|pausa|pausa lectura|pausar lectura|detener lectura|parar lectura|basta|stop)\b/i.test(t)) {
+	        return "pause";
+	      }
+	      if (
+	        t === "continuar" ||
+	        t === "segui" ||
+	        t === "seguir" ||
+	        t === "seguir leyendo" ||
+	        t === "continue" ||
+	        t === "resume"
+	      ) return "continue";
+	      if (/^(continuar|segui|seguir|seguir leyendo|continue|resume)\b/i.test(t)) return "continue";
+	      if (t === "repetir" || t === "repeti" || t === "repeat") return "repeat";
+	      if (/^(repetir|repeti|repeat)\b/i.test(t)) return "repeat";
+	      return "";
 	    }
 
-	    async function applyVoiceBargeIn(text) {
+	    function voiceCommandMessage(kind) {
+	      if (kind === "pause") return "pausa lectura";
+	      if (kind === "continue") return "continuar";
+	      if (kind === "repeat") return "repetir";
+	      return "";
+	    }
+
+	    async function runVoiceReaderCommand(kind, text) {
 	      const now = Date.now();
 	      if ((now - sttLastBargeAtMs) < STT_BARGE_COOLDOWN_MS) return;
 	      sttLastBargeAtMs = now;
+	      const message = voiceCommandMessage(kind);
+	      if (!message) return;
+	      const spoken = norm(text).toLowerCase() || message;
+	      await push("assistant", `Comando por voz: "${spoken}".`);
 	      stopReaderAuto();
 	      abortCurrentStream();
-	      await pauseReaderContinuousSilently();
-	      await push("user", text);
-	      await push("assistant", "Pausado por voz.");
+	      if (kind === "pause") {
+	        await pauseReaderContinuousSilently();
+	        await push("assistant", "Pausado por voz.");
+	        await saveServerHistory();
+	        return;
+	      }
+	      const sel = selectedModel();
+	      const payload = {
+	        message,
+	        model: sel.model || "openai-codex/gpt-5.1-codex-mini",
+	        model_backend: sel.model_backend || "cloud",
+	        history,
+	        mode: "operativo",
+	        session_id: sessionId,
+	        allowed_tools: allowedTools(),
+	        attachments: [],
+	      };
+	      const out = await postChatJson(payload, null);
+	      if (out?.recovered) return;
+	      const reply = String(out?.data?.reply || "").trim();
+	      if (reply) {
+	        await push("assistant", reply);
+	        bumpSpeakingVisual();
+	      }
+	      applyReaderMeta(out?.data?.reader || {});
 	      await saveServerHistory();
 	    }
 
@@ -418,27 +463,16 @@ HTML = r"""<!doctype html>
 	        for (const item of items) {
 	          const text = String(item?.text || "").trim();
 	          if (!shouldAcceptSttText(text)) continue;
-	          const barge = isBargeInText(text);
-	          if (barge) {
+	          const command = voiceCommandFromText(text);
+	          if (command) {
 	            sttSending = true;
 	            try {
-	              await applyVoiceBargeIn(text);
+	              await runVoiceReaderCommand(command, text);
 	            } finally {
 	              sttSending = false;
 	            }
 	            break;
 	          }
-	          if (sendEl.disabled) continue;
-	          const nowSend = Date.now();
-	          if ((nowSend - sttLastSendAtMs) < STT_MIN_SEND_INTERVAL_MS) break;
-	          sttLastSendAtMs = nowSend;
-	          sttSending = true;
-          try {
-            await sendMessage(text);
-          } finally {
-            sttSending = false;
-          }
-          break;
         }
       } catch {}
     }
@@ -751,8 +785,8 @@ HTML = r"""<!doctype html>
 		            const healthTimeout = Number(voice?.tts_health_timeout_sec || 0);
 		            const detail = String(last?.detail || "tts_failed");
 		            const diag = `${backend} failed (${detail}) health=${healthUrl} timeout=${healthTimeout}s`;
-		            if (/reader_user|playback_interrupted/i.test(detail)) {
-		              return { ok: false, detail: diag };
+		            if (/reader_user|typed_interrupt|barge_in|voice_command|playback_interrupted/i.test(detail)) {
+		              return { ok: false, pausedByVoice: true, detail: diag };
 		            }
 		            return { ok: true, degraded: true, detail: diag };
 		          }
@@ -807,8 +841,12 @@ HTML = r"""<!doctype html>
 		        if (!gate?.ok) {
 		          stopReaderAuto();
 		          await pauseReaderContinuousSilently();
-		          const detail = String(gate?.detail || "tts_unavailable");
-		          await push("assistant", `voz no disponible (${detail}), usá 'modo manual on' o 'continuar' manual`);
+		          if (gate?.pausedByVoice) {
+		            await push("assistant", "Pausado por voz.");
+		          } else {
+		            const detail = String(gate?.detail || "tts_unavailable");
+		            await push("assistant", `voz no disponible (${detail}), usá 'modo manual on' o 'continuar' manual`);
+		          }
 		          return;
 		        }
 		        if (gate?.degraded) {

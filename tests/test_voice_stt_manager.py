@@ -70,7 +70,7 @@ class TestVoiceSttManager(unittest.TestCase):
         self.assertEqual(mgr.poll("sess_a", limit=5), [])
         mgr.disable()
 
-    def test_stt_manager_poll_filters_non_bargein_while_tts_playing(self) -> None:
+    def test_stt_manager_poll_filters_non_voice_commands_while_tts_playing(self) -> None:
         mgr = direct_chat.STTManager()
         with mgr._lock:
             mgr._enabled = True
@@ -78,15 +78,23 @@ class TestVoiceSttManager(unittest.TestCase):
             mgr._worker = _DummyWorker(running=True)
         mgr._queue.put({"text": "comentario normal", "ts": 1.0})
         mgr._queue.put({"text": "detenete", "ts": 2.0})
+        mgr._queue.put({"text": "continuar", "ts": 3.0})
+        mgr._queue.put({"text": "repetir", "ts": 4.0})
         prev_tts_is_playing = direct_chat._tts_is_playing
         try:
             direct_chat._tts_is_playing = lambda: True  # type: ignore
             items = mgr.poll("sess_a", limit=5)
         finally:
             direct_chat._tts_is_playing = prev_tts_is_playing  # type: ignore
-        self.assertEqual(len(items), 1)
-        self.assertEqual(str(items[0].get("text", "")).strip().lower(), "detenete")
+        texts = [str(i.get("text", "")).strip().lower() for i in items]
+        self.assertEqual(texts, ["detenete", "continuar", "repetir"])
         mgr.disable()
+
+    def test_voice_command_kind(self) -> None:
+        self.assertEqual(direct_chat._voice_command_kind("pausa lectura"), "pause")
+        self.assertEqual(direct_chat._voice_command_kind("continuar"), "continue")
+        self.assertEqual(direct_chat._voice_command_kind("repetir"), "repeat")
+        self.assertEqual(direct_chat._voice_command_kind("frase libre"), "")
 
     def test_tts_is_playing_uses_event_proc_and_guard_window(self) -> None:
         prev_last = direct_chat._TTS_LAST_ACTIVITY_MONO

@@ -114,6 +114,7 @@ _TTS_PLAYING_EVENT = threading.Event()
 _TTS_PLAYING_STREAM_ID = 0
 _TTS_LAST_ACTIVITY_MONO = 0.0
 _TTS_ECHO_GUARD_SEC = 0.8
+_TTS_STOP_REASON_BY_STREAM: dict[int, str] = {}
 _BARGEIN_LOCK = threading.Lock()
 _BARGEIN_MONITOR = None
 _BARGEIN_STATS = {"count": 0, "last_ts": 0.0, "last_keyword": "", "last_detail": "not_started"}
@@ -188,15 +189,20 @@ def _request_tts_stop(
     offset_hint: int | None = None,
     playback_ms: float | None = None,
 ) -> None:
+    interrupt_reason = str(reason or "").strip() or "reader_user_interrupt"
+    if interrupt_reason == "barge_in":
+        interrupt_reason = "barge_in_triggered"
     _bargein_mark(detail or "triggered", keyword=keyword)
     _tts_touch()
     stream_id = 0
     with _TTS_STREAM_LOCK:
         stream_id = int(_TTS_PLAYING_STREAM_ID or 0)
+        if stream_id > 0:
+            _TTS_STOP_REASON_BY_STREAM[int(stream_id)] = interrupt_reason
         _TTS_STOP_EVENT.set()
     _reader_mark_barge_in_from_stream(
         stream_id=stream_id,
-        reason=str(reason),
+        reason=interrupt_reason,
         keyword=keyword,
         detail=detail or "triggered",
         session_id=session_id,
@@ -204,7 +210,7 @@ def _request_tts_stop(
         playback_ms=playback_ms,
     )
     _stop_playback_process()
-    _set_voice_status(stream_id, False, str(reason))
+    _set_voice_status(stream_id, False, interrupt_reason)
 
 
 def _reader_autocommit_register(
@@ -242,12 +248,27 @@ def _reader_tts_end_max_wait_sec(text_len: int = 0) -> float:
     return min(300.0, max(base, dynamic))
 
 
-def _reader_should_commit_on_tts_failure(detail: str) -> bool:
+def _is_user_tts_interrupt_detail(detail: str) -> bool:
     d = str(detail or "").strip().lower()
     if not d:
-        return True
+        return False
+    return any(
+        k in d
+        for k in (
+            "reader_user_barge_in",
+            "reader_user_interrupt",
+            "typed_interrupt",
+            "voice_command",
+            "barge_in_triggered",
+            "barge_in",
+            "playback_interrupted",
+        )
+    )
+
+
+def _reader_should_commit_on_tts_failure(detail: str) -> bool:
     # User-initiated stops preserve pending chunk for explicit resume.
-    if any(k in d for k in ("reader_user_barge_in", "reader_user_interrupt", "playback_interrupted", "typed_interrupt")):
+    if _is_user_tts_interrupt_detail(detail):
         return False
     return True
 
@@ -571,10 +592,10 @@ def _int_env(name: str, default: int) -> int:
         return int(default)
 
 
-def _is_barge_in_phrase(text: str) -> bool:
+def _voice_command_kind(text: str) -> str:
     n = _normalize_text(text)
     if not n:
-        return False
+        return ""
     if n in (
         "detenete",
         "detente",
@@ -587,14 +608,30 @@ def _is_barge_in_phrase(text: str) -> bool:
         "stop",
         "stop lectura",
     ):
-        return True
-    return bool(
-        re.search(
-            r"^(detenete|detente|pausa|pausa lectura|pausar lectura|detener lectura|parar lectura|basta|stop)\b",
-            n,
-            flags=re.IGNORECASE,
-        )
-    )
+        return "pause"
+    if re.search(
+        r"^(detenete|detente|pausa|pausa lectura|pausar lectura|detener lectura|parar lectura|basta|stop)\b",
+        n,
+        flags=re.IGNORECASE,
+    ):
+        return "pause"
+    if n in ("continuar", "segui", "seguir", "seguir leyendo", "continue", "resume"):
+        return "continue"
+    if re.search(r"^(continuar|segui|seguir|seguir leyendo|continue|resume)\b", n, flags=re.IGNORECASE):
+        return "continue"
+    if n in ("repetir", "repeti", "repeat"):
+        return "repeat"
+    if re.search(r"^(repetir|repeti|repeat)\b", n, flags=re.IGNORECASE):
+        return "repeat"
+    return ""
+
+
+def _is_barge_in_phrase(text: str) -> bool:
+    return _voice_command_kind(text) == "pause"
+
+
+def _is_voice_control_phrase(text: str) -> bool:
+    return bool(_voice_command_kind(text))
 
 
 class STTManager:
@@ -777,7 +814,7 @@ class STTManager:
                 text = str(item.get("text", "")).strip()
                 if not text:
                     continue
-                if tts_playing and (not _is_barge_in_phrase(text)):
+                if tts_playing and (not _is_voice_control_phrase(text)):
                     continue
                 out.append({"text": text, "ts": float(item.get("ts", time.time()))})
         return out
@@ -1141,16 +1178,30 @@ def _stop_playback_process() -> None:
         return
 
 
+def _pop_tts_stop_reason(stream_id: int, default: str = "playback_interrupted") -> str:
+    if stream_id <= 0:
+        return str(default or "playback_interrupted")
+    with _TTS_STREAM_LOCK:
+        reason = str(_TTS_STOP_REASON_BY_STREAM.pop(int(stream_id), "")).strip()
+    return reason or str(default or "playback_interrupted")
+
+
 def _start_new_tts_stream() -> tuple[int, threading.Event]:
     global _TTS_STREAM_ID, _TTS_STOP_EVENT, _TTS_ACTIVE_QUEUE
+    prev_stream_id = 0
     with _TTS_STREAM_LOCK:
         prev_event = _TTS_STOP_EVENT
         prev_queue = _TTS_ACTIVE_QUEUE
+        prev_stream_id = int(_TTS_STREAM_ID or 0)
         _TTS_STREAM_ID += 1
         stream_id = _TTS_STREAM_ID
         stop_event = threading.Event()
         _TTS_STOP_EVENT = stop_event
         _TTS_ACTIVE_QUEUE = None
+
+    if prev_stream_id > 0:
+        with _TTS_STREAM_LOCK:
+            _TTS_STOP_REASON_BY_STREAM[int(prev_stream_id)] = "stream_replaced"
 
     prev_event.set()
     _stop_playback_process()
@@ -1393,7 +1444,7 @@ def _speak_reply_async(text: str) -> int:
                         _TTS_PLAYING_EVENT.clear()
                 _tts_touch()
             if interrupted:
-                _set_voice_status(stream_id, False, "playback_interrupted")
+                _set_voice_status(stream_id, False, _pop_tts_stop_reason(stream_id))
                 return
             _set_voice_status(stream_id, True, "ok_player_dry_run")
 
@@ -1505,7 +1556,7 @@ def _speak_reply_async(text: str) -> int:
             _tts_touch()
 
         if interrupted:
-            _set_voice_status(stream_id, False, "playback_interrupted")
+            _set_voice_status(stream_id, False, _pop_tts_stop_reason(stream_id))
             return
         if producer_error["detail"]:
             _set_voice_status(stream_id, False, producer_error["detail"])
@@ -4907,7 +4958,7 @@ def _reader_force_commit_pending_if_stalled(session_id: str, state: dict | None)
     detail_is_failure = bool(detail) and any(
         k in detail for k in ("timeout", "tts_", "alltalk_", "health_", "player_", "fallback_failed")
     )
-    if any(k in detail for k in ("reader_user_barge_in", "reader_user_interrupt", "playback_interrupted")):
+    if _is_user_tts_interrupt_detail(detail):
         return False, st
     should_force = False
     if age >= max_wait:

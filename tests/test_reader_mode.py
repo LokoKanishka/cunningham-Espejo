@@ -365,6 +365,24 @@ class TestReaderHttpEndpoints(unittest.TestCase):
         self.assertEqual(int(st.get("cursor", -1)), 0)
         self.assertTrue(bool(st.get("has_pending", False)))
 
+    def test_autocommit_barge_in_triggered_keeps_pending(self) -> None:
+        direct_chat._READER_STORE.start_session("interrupt_keep_barge", chunks=["uno", "dos"], reset=True)
+        out = direct_chat._READER_STORE.next_chunk("interrupt_keep_barge")
+        chunk = out.get("chunk", {})
+        stream_id = 99003
+        direct_chat._reader_autocommit_register(
+            stream_id=stream_id,
+            session_id="interrupt_keep_barge",
+            chunk_id=str(chunk.get("chunk_id", "")),
+            chunk_index=int(chunk.get("chunk_index", 0)),
+            text_len=len(str(chunk.get("text", ""))),
+            start_offset_chars=0,
+        )
+        direct_chat._reader_autocommit_finalize(stream_id, False, detail="barge_in_triggered", force_timeout_commit=False)
+        st = direct_chat._READER_STORE.get_session("interrupt_keep_barge", include_chunks=False)
+        self.assertEqual(int(st.get("cursor", -1)), 0)
+        self.assertTrue(bool(st.get("has_pending", False)))
+
     def test_continuar_unstucks_pending_after_tts_failure(self) -> None:
         code, started = self._request(
             "POST",
