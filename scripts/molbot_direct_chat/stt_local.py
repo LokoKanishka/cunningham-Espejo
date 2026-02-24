@@ -293,6 +293,7 @@ class STTWorker:
         last_audio_ts = 0.0
         in_speech_now = False
         last_segment_ms = 0
+        current_silence_ms = 0
         resample_state = None
         frame_buffer = bytearray()
         rms_consecutive = 0
@@ -310,17 +311,19 @@ class STTWorker:
                 "vad_true_frames": int(vad_true_frames),
                 "vad_true_ratio": float(vad_true_ratio),
                 "last_segment_ms": int(last_segment_ms),
+                "silence_ms": int(current_silence_ms),
             }
             if isinstance(extra, dict):
                 payload.update(extra)
             emit_diag(payload)
 
         def reset_segment():
-            nonlocal in_speech, buf, speech_start_mono, last_voice_mono
+            nonlocal in_speech, buf, speech_start_mono, last_voice_mono, current_silence_ms
             in_speech = False
             buf = bytearray()
             speech_start_mono = 0.0
             last_voice_mono = 0.0
+            current_silence_ms = 0
 
         def maybe_emit_segment(pcm16: bytes):
             nonlocal last_segment_ms
@@ -355,6 +358,7 @@ class STTWorker:
         def process_frame(frame_pcm16: bytes) -> None:
             nonlocal frames_seen, vad_frames, vad_true_frames, rms_current, last_audio_ts
             nonlocal in_speech_now, rms_consecutive, in_speech, speech_start_mono, last_voice_mono, buf
+            nonlocal current_silence_ms
             if not frame_pcm16:
                 return
             frames_seen += 1
@@ -382,6 +386,7 @@ class STTWorker:
             now = time.monotonic()
             if speech_like:
                 vad_frames += 1
+                current_silence_ms = 0
                 if not in_speech:
                     in_speech = True
                     speech_start_mono = now
@@ -394,9 +399,11 @@ class STTWorker:
                     reset_segment()
             else:
                 if not in_speech:
+                    current_silence_ms = int(min(60000, current_silence_ms + cfg.frame_ms))
                     emit_runtime_diag()
                     return
                 silence_ms = int((now - last_voice_mono) * 1000)
+                current_silence_ms = silence_ms
                 if silence_ms >= cfg.max_silence_ms:
                     maybe_emit_segment(bytes(buf))
                     reset_segment()

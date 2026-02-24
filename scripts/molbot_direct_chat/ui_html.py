@@ -269,12 +269,14 @@ HTML = r"""<!doctype html>
 	          const noAudio = !!sj?.no_audio_input;
 	          const noSpeech = !!sj?.no_speech_detected;
 	          const vadPct = Math.round(Number(sj?.vad_true_ratio || 0) * 100);
+	          const segMs = Math.round(Number(sj?.last_segment_ms || 0));
+	          const silMs = Math.round(Number(sj?.silence_ms || 0));
 	          if (noAudio) {
 	            sttLabel = `NO_AUDIO rms ${rms}/${thr}`;
 	          } else if (noSpeech) {
-	            sttLabel = `NO_SPEECH vad ${vadPct}% rms ${rms}/${thr}`;
+	            sttLabel = `NO_SPEECH vad ${vadPct}% seg ${segMs}ms sil ${silMs}ms`;
 	          } else {
-	            sttLabel = `${inSpeech ? "voz" : "sil"} vad ${vadPct}% ${rms}/${thr}`;
+	            sttLabel = `${inSpeech ? "voz" : "sil"} vad ${vadPct}% seg ${segMs}ms sil ${silMs}ms`;
 	          }
 	        }
 
@@ -486,6 +488,14 @@ HTML = r"""<!doctype html>
         const items = Array.isArray(j?.items) ? j.items : [];
 	        for (const item of items) {
 	          const text = String(item?.text || "").trim();
+	          const kind = String(item?.kind || "").trim().toLowerCase();
+	          if (kind === "stt_debug") {
+	            const raw = String(item?.text || "").trim();
+	            const normTxt = String(item?.norm || "").trim();
+	            const reason = String(item?.reason || "non_command");
+	            await push("assistant", `STT oyó: "${raw || "-"}" (norm="${normTxt || "-"}", ${reason}).`);
+	            continue;
+	          }
 	          if (!shouldAcceptSttText(text)) continue;
 	          const cmdRaw = String(item?.cmd || "").trim().toLowerCase();
 	          const command = cmdRaw || voiceCommandFromText(text);
