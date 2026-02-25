@@ -449,8 +449,9 @@ HTML = r"""<!doctype html>
 
 	    function pauseAckBySource(source) {
 	      const s = String(source || "").trim().toLowerCase();
-	      if (s === "voice_any") return "Pausado por voz (any).";
-	      if (s === "typed") return "Pausado (texto).";
+	      if (s === "voice_any" || s === "stt_any") return "Pausado por voz (any).";
+	      if (s === "typed" || s === "text") return "Pausado (texto).";
+	      if (s === "voice_cmd" || s === "stt_cmd") return "Pausado por voz (cmd).";
 	      return "Pausado por voz (cmd).";
 	    }
 

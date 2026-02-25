@@ -44,6 +44,61 @@ class TestSttLocalFilters(unittest.TestCase):
         self.assertEqual(reason, "")
         self.assertEqual(txt, "leer libro 1")
 
+    def test_segment_hysteresis_hangover_avoids_flicker_short_drop_in_chat_mode(self) -> None:
+        cfg = stt_local.STTConfig(
+            frame_ms=30,
+            min_speech_ms=220,
+            chat_min_speech_ms=180,
+            max_silence_ms=350,
+            rms_speech_threshold=0.016,
+            rms_min_frames=2,
+            segment_hysteresis_off_ratio=0.65,
+            segment_hangover_ms=250,
+            chat_mode=True,
+        )
+        speech_rms = [
+            0.020,
+            0.018,
+            0.008,
+            0.017,
+            0.019,
+            0.009,
+            0.018,
+            0.019,
+            0.008,
+            0.018,
+            0.019,
+            0.009,
+            0.018,
+            0.020,
+            0.017,
+            0.018,
+        ]
+        silence_rms = [0.003] * 14
+        rms_values = speech_rms + silence_rms
+        vad_values = [
+            True,
+            True,
+            False,
+            True,
+            True,
+            False,
+            True,
+            True,
+            False,
+            True,
+            True,
+            False,
+            True,
+            True,
+            True,
+            True,
+        ] + ([False] * 14)
+        emitted, dropped = stt_local._simulate_segments_for_test(rms_values, cfg=cfg, vad_values=vad_values)
+        self.assertTrue(emitted)
+        self.assertGreaterEqual(int(emitted[0]), 400)
+        self.assertNotIn("segment_too_short", dropped)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -827,6 +827,10 @@ class STTManager:
         self._vad_true_frames = 0
         self._last_segment_ms = 0
         self._silence_ms = 0
+        self._effective_seg_thr = 0.0
+        self._effective_seg_thr_off = 0.0
+        self._effective_min_segment_ms = 0
+        self._speech_hangover_ms = 0
         self._device_label = ""
         self._drop_reason = ""
         self._items_total = 0
@@ -999,6 +1003,31 @@ class STTManager:
                     self._silence_ms = max(0, int(event.get("silence_ms", 0) or 0))
                 except Exception:
                     pass
+            if "effective_seg_thr" in event:
+                try:
+                    self._effective_seg_thr = max(0.0, float(event.get("effective_seg_thr", 0.0) or 0.0))
+                except Exception:
+                    pass
+            elif "segment_threshold" in event:
+                try:
+                    self._effective_seg_thr = max(0.0, float(event.get("segment_threshold", 0.0) or 0.0))
+                except Exception:
+                    pass
+            if "segment_thr_off" in event:
+                try:
+                    self._effective_seg_thr_off = max(0.0, float(event.get("segment_thr_off", 0.0) or 0.0))
+                except Exception:
+                    pass
+            if "min_segment_ms" in event:
+                try:
+                    self._effective_min_segment_ms = max(0, int(event.get("min_segment_ms", 0) or 0))
+                except Exception:
+                    pass
+            if "speech_hangover_ms" in event:
+                try:
+                    self._speech_hangover_ms = max(0, int(event.get("speech_hangover_ms", 0) or 0))
+                except Exception:
+                    pass
             if "device" in event:
                 self._device_label = str(event.get("device", "")).strip()
             if kind == "stt_drop":
@@ -1034,6 +1063,10 @@ class STTManager:
         self._vad_true_frames = 0
         self._last_segment_ms = 0
         self._silence_ms = 0
+        self._effective_seg_thr = 0.0
+        self._effective_seg_thr_off = 0.0
+        self._effective_min_segment_ms = 0
+        self._speech_hangover_ms = 0
         self._device_label = ""
         self._drop_reason = ""
         self._items_total = 0
@@ -1063,6 +1096,7 @@ class STTManager:
             min_chars = max(1, int(min_chars_default))
         segment_rms_threshold = _stt_segment_rms_threshold_from_state(state)
         selected_device = self._selected_stt_device()
+        chat_mode_enabled = bool(self._chat_enabled())
         cfg = stt_local.STTConfig(
             sample_rate=max(8000, self._env_int("DIRECT_CHAT_STT_SAMPLE_RATE", 16000)),
             channels=max(1, self._env_int("DIRECT_CHAT_STT_CHANNELS", 1)),
@@ -1070,10 +1104,17 @@ class STTManager:
             frame_ms=max(10, min(30, self._env_int("DIRECT_CHAT_STT_FRAME_MS", 30))),
             vad_mode=max(0, min(3, self._env_int("DIRECT_CHAT_STT_VAD_MODE", 1))),
             min_speech_ms=max(120, self._env_int("DIRECT_CHAT_STT_MIN_SPEECH_MS", 220)),
+            chat_min_speech_ms=max(120, self._env_int("DIRECT_CHAT_STT_CHAT_MIN_SPEECH_MS", 180)),
             max_silence_ms=max(180, self._env_int("DIRECT_CHAT_STT_MAX_SILENCE_MS", 350)),
             max_segment_s=max(1.2, self._env_float("DIRECT_CHAT_STT_MAX_SEGMENT_SEC", 1.8)),
             rms_speech_threshold=max(0.0005, float(segment_rms_threshold)),
             rms_min_frames=max(1, self._env_int("DIRECT_CHAT_STT_RMS_MIN_FRAMES", 2)),
+            segment_hysteresis_off_ratio=max(
+                0.10,
+                min(0.95, self._env_float("DIRECT_CHAT_STT_SEGMENT_HYSTERESIS_OFF_RATIO", 0.65)),
+            ),
+            segment_hangover_ms=max(0, self._env_int("DIRECT_CHAT_STT_SEGMENT_HANGOVER_MS", 250)),
+            chat_mode=chat_mode_enabled,
             language=str(os.environ.get("DIRECT_CHAT_STT_LANGUAGE", "es")).strip() or "es",
             model=str(os.environ.get("DIRECT_CHAT_STT_MODEL", "small")).strip() or "small",
             fw_device=str(os.environ.get("DIRECT_CHAT_STT_FW_DEVICE", "cpu")).strip() or "cpu",
@@ -1418,6 +1459,20 @@ class STTManager:
             stt_segment_rms_threshold = _stt_segment_rms_threshold_from_state(state)
             stt_barge_rms_threshold = _stt_barge_rms_threshold_from_state(state)
             stt_legacy_rms_threshold = _stt_legacy_rms_threshold_from_state(state)
+            effective_seg_thr = float(self._effective_seg_thr or stt_segment_rms_threshold)
+            if effective_seg_thr <= 0.0:
+                effective_seg_thr = float(stt_segment_rms_threshold)
+            effective_seg_thr_off = float(self._effective_seg_thr_off or 0.0)
+            if effective_seg_thr_off <= 0.0:
+                effective_seg_thr_off = max(0.0003, effective_seg_thr * 0.65)
+            effective_min_seg_ms = int(self._effective_min_segment_ms or 0)
+            if effective_min_seg_ms <= 0:
+                effective_min_seg_ms = max(120, self._env_int("DIRECT_CHAT_STT_MIN_SPEECH_MS", 220))
+                if bool(self._chat_enabled()):
+                    effective_min_seg_ms = min(
+                        effective_min_seg_ms,
+                        max(120, self._env_int("DIRECT_CHAT_STT_CHAT_MIN_SPEECH_MS", 180)),
+                    )
             drop_reason_counts_sorted = dict(
                 sorted(self._drop_reason_counts.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))[:8]
             )
@@ -1459,6 +1514,10 @@ class STTManager:
                 "stt_rms_threshold": float(stt_legacy_rms_threshold),
                 "stt_segment_rms_threshold": float(stt_segment_rms_threshold),
                 "stt_barge_rms_threshold": float(stt_barge_rms_threshold),
+                "stt_effective_seg_thr": float(effective_seg_thr),
+                "stt_effective_seg_thr_off": float(effective_seg_thr_off),
+                "stt_effective_min_segment_ms": int(effective_min_seg_ms),
+                "stt_speech_hangover_ms": int(self._speech_hangover_ms),
                 "stt_command_only": bool(self._command_only_enabled()),
                 "stt_chat_enabled": bool(self._chat_enabled()),
                 "stt_debug": bool(self._debug_enabled()),
@@ -5860,7 +5919,11 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
                 f"chat={bool(st.get('stt_chat_enabled', False))}, "
                 f"barge_any={bool(st.get('stt_barge_any', False))}, "
                 f"thr_seg={float(st.get('stt_segment_rms_threshold', 0.0) or 0.0):.4f}, "
+                f"thr_eff={float(st.get('stt_effective_seg_thr', st.get('stt_segment_rms_threshold', 0.0)) or 0.0):.4f}, "
+                f"thr_off={float(st.get('stt_effective_seg_thr_off', 0.0) or 0.0):.4f}, "
                 f"thr_barge={float(st.get('stt_barge_rms_threshold', 0.0) or 0.0):.4f}, "
+                f"min_seg={int(st.get('stt_effective_min_segment_ms', 0) or 0)}, "
+                f"speech_state=in:{bool(st.get('stt_in_speech', False))}|hang:{int(st.get('stt_speech_hangover_ms', 0) or 0)}ms, "
                 f"emit={int(st.get('stt_emit_count', 0) or 0)}, "
                 f"voice_text={int(st.get('stt_chat_commit_total', st.get('voice_text_committed', 0)) or 0)}, "
                 f"drops={int(st.get('items_dropped', 0) or 0)}, "
@@ -7520,10 +7583,17 @@ class Handler(BaseHTTPRequestHandler):
                     "session_id": sid,
                     "rms": float(stt_status.get("stt_rms_current", 0.0) or 0.0),
                     "threshold": float(segment_threshold),
+                    "threshold_effective": float(
+                        stt_status.get("stt_effective_seg_thr", stt_status.get("stt_segment_rms_threshold", segment_threshold))
+                        or segment_threshold
+                    ),
+                    "threshold_off": float(stt_status.get("stt_effective_seg_thr_off", 0.0) or 0.0),
                     "barge_threshold": float(barge_threshold),
                     "in_speech": bool(stt_status.get("stt_vad_active", False)),
+                    "speech_hangover_ms": int(stt_status.get("stt_speech_hangover_ms", 0) or 0),
                     "vad_true_ratio": float(stt_status.get("stt_vad_true_ratio", 0.0) or 0.0),
                     "last_segment_ms": int(stt_status.get("stt_last_segment_ms", 0) or 0),
+                    "min_segment_ms": int(stt_status.get("stt_effective_min_segment_ms", 0) or 0),
                     "silence_ms": int(stt_status.get("stt_silence_ms", 0) or 0),
                     "frames_seen": int(stt_status.get("stt_frames_seen", 0) or 0),
                     "last_audio_ts": float(stt_status.get("stt_last_audio_ts", 0.0) or 0.0),

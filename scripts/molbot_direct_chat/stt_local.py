@@ -24,10 +24,14 @@ class STTConfig:
 
     # Segmentation
     min_speech_ms: int = 220
+    chat_min_speech_ms: int = 180
     max_silence_ms: int = 350
     max_segment_s: float = 2.0
     rms_speech_threshold: float = 0.002
     rms_min_frames: int = 2
+    segment_hysteresis_off_ratio: float = 0.65
+    segment_hangover_ms: int = 250
+    chat_mode: bool = False
 
     # Transcription
     language: str = "es"
@@ -174,6 +178,119 @@ def _effective_segment_threshold(config_threshold: float, noise_samples: list[fl
         noise_floor = 0.0
     # Guardrail: avoid near-zero thresholds that keep speech_like latched forever.
     return max(0.006, cfg_thr, noise_floor * 3.0)
+
+
+def _effective_min_segment_ms(cfg: STTConfig) -> int:
+    base_ms = max(80, int(cfg.min_speech_ms))
+    if not bool(cfg.chat_mode):
+        return base_ms
+    chat_ms = max(80, int(cfg.chat_min_speech_ms))
+    return min(base_ms, chat_ms)
+
+
+def _segment_speech_like_state(
+    *,
+    vad_true: bool,
+    rms_current: float,
+    threshold_on: float,
+    in_speech: bool,
+    rms_consecutive: int,
+    rms_min_frames: int,
+    hangover_left_ms: int,
+    hangover_ms: int,
+    frame_ms: int,
+    off_ratio: float,
+) -> tuple[bool, int, int, float]:
+    thr_on = max(0.0005, float(threshold_on or 0.0))
+    ratio = max(0.10, min(0.95, float(off_ratio or 0.65)))
+    thr_off = max(0.0003, thr_on * ratio)
+    if rms_current >= thr_on:
+        rms_consecutive = min(1000000, int(rms_consecutive) + 1)
+    else:
+        rms_consecutive = 0
+    raw_speech_like = bool((vad_true and rms_current >= thr_on) or (rms_consecutive >= max(1, int(rms_min_frames))))
+    if raw_speech_like:
+        return True, rms_consecutive, max(0, int(hangover_ms)), thr_off
+    if in_speech:
+        if rms_current >= thr_off:
+            return True, rms_consecutive, max(0, int(hangover_left_ms)), thr_off
+        if int(hangover_left_ms) > 0:
+            dec_ms = max(1, int(frame_ms))
+            return True, rms_consecutive, max(0, int(hangover_left_ms) - dec_ms), thr_off
+    return False, rms_consecutive, 0, thr_off
+
+
+def _simulate_segments_for_test(
+    rms_values: list[float],
+    *,
+    cfg: STTConfig,
+    vad_values: Optional[list[bool]] = None,
+) -> tuple[list[int], list[str]]:
+    if not isinstance(rms_values, list):
+        return [], []
+    vad_seq = list(vad_values) if isinstance(vad_values, list) else []
+    seg_threshold = _effective_segment_threshold(float(cfg.rms_speech_threshold), [])
+    seg_ms = 0
+    silence_ms = 0
+    in_speech = False
+    rms_consecutive = 0
+    hangover_left_ms = 0
+    emitted: list[int] = []
+    dropped: list[str] = []
+    min_segment_ms = _effective_min_segment_ms(cfg)
+    max_segment_ms = int(max(200, int(round(float(cfg.max_segment_s) * 1000.0))))
+    for idx, rms in enumerate(rms_values):
+        try:
+            rms_current = max(0.0, float(rms))
+        except Exception:
+            rms_current = 0.0
+        vad_true = bool(vad_seq[idx]) if idx < len(vad_seq) else bool(rms_current >= seg_threshold)
+        speech_like, rms_consecutive, hangover_left_ms, _thr_off = _segment_speech_like_state(
+            vad_true=vad_true,
+            rms_current=rms_current,
+            threshold_on=seg_threshold,
+            in_speech=in_speech,
+            rms_consecutive=rms_consecutive,
+            rms_min_frames=int(cfg.rms_min_frames),
+            hangover_left_ms=hangover_left_ms,
+            hangover_ms=int(cfg.segment_hangover_ms),
+            frame_ms=int(cfg.frame_ms),
+            off_ratio=float(cfg.segment_hysteresis_off_ratio),
+        )
+        if speech_like:
+            if not in_speech:
+                in_speech = True
+                seg_ms = 0
+                silence_ms = 0
+            seg_ms += int(cfg.frame_ms)
+            if seg_ms >= max_segment_ms:
+                if seg_ms < min_segment_ms:
+                    dropped.append("segment_too_short")
+                else:
+                    emitted.append(seg_ms)
+                in_speech = False
+                seg_ms = 0
+                silence_ms = 0
+                hangover_left_ms = 0
+            continue
+        if not in_speech:
+            continue
+        silence_ms += int(cfg.frame_ms)
+        if silence_ms >= int(cfg.max_silence_ms):
+            if seg_ms < min_segment_ms:
+                dropped.append("segment_too_short")
+            else:
+                emitted.append(seg_ms)
+            in_speech = False
+            seg_ms = 0
+            silence_ms = 0
+            hangover_left_ms = 0
+    if in_speech and seg_ms > 0:
+        if seg_ms < min_segment_ms:
+            dropped.append("segment_too_short")
+        else:
+            emitted.append(seg_ms)
+    return emitted, dropped
 
 
 def list_input_devices() -> list[dict]:
@@ -371,9 +488,13 @@ class STTWorker:
         noise_window_max = max(10, int(1200 / max(10, int(cfg.frame_ms))))
         noise_floor_current = 0.0
         effective_seg_thr_current = max(0.006, float(cfg.rms_speech_threshold))
+        segment_thr_off_current = max(0.0003, effective_seg_thr_current * max(0.10, min(0.95, float(cfg.segment_hysteresis_off_ratio))))
+        effective_min_segment_ms = _effective_min_segment_ms(cfg)
+        hangover_left_ms = 0
 
         def emit_runtime_diag(extra: Optional[dict] = None) -> None:
             vad_true_ratio = (float(vad_true_frames) / float(frames_seen)) if frames_seen > 0 else 0.0
+            speech_state = f"in_speech={1 if in_speech else 0},hangover_ms={int(max(0, hangover_left_ms))}"
             payload = {
                 "kind": "stt_diag",
                 "frames_seen": int(frames_seen),
@@ -387,6 +508,12 @@ class STTWorker:
                 "last_segment_ms": int(last_segment_ms),
                 "silence_ms": int(current_silence_ms),
                 "segment_threshold": float(effective_seg_thr_current),
+                "effective_seg_thr": float(effective_seg_thr_current),
+                "segment_thr_on": float(effective_seg_thr_current),
+                "segment_thr_off": float(segment_thr_off_current),
+                "min_segment_ms": int(effective_min_segment_ms),
+                "speech_hangover_ms": int(max(0, hangover_left_ms)),
+                "speech_state": speech_state,
                 "noise_floor": float(noise_floor_current),
             }
             if isinstance(extra, dict):
@@ -394,20 +521,28 @@ class STTWorker:
             emit_diag(payload)
 
         def reset_segment():
-            nonlocal in_speech, buf, speech_start_mono, last_voice_mono, current_silence_ms
+            nonlocal in_speech, buf, speech_start_mono, last_voice_mono, current_silence_ms, hangover_left_ms
             in_speech = False
             buf = bytearray()
             speech_start_mono = 0.0
             last_voice_mono = 0.0
             current_silence_ms = 0
+            hangover_left_ms = 0
 
         def maybe_emit_segment(pcm16: bytes):
             nonlocal last_segment_ms
             # Segment length check
             dur_ms = int(len(pcm16) / 2 / target_rate * 1000)  # 2 bytes per sample mono
             last_segment_ms = int(max(0, dur_ms))
-            if dur_ms < cfg.min_speech_ms:
-                emit_runtime_diag({"kind": "stt_drop", "reason": "segment_too_short", "dur_ms": int(dur_ms)})
+            if dur_ms < effective_min_segment_ms:
+                emit_runtime_diag(
+                    {
+                        "kind": "stt_drop",
+                        "reason": "segment_too_short",
+                        "dur_ms": int(dur_ms),
+                        "min_segment_ms": int(effective_min_segment_ms),
+                    }
+                )
                 return
             try:
                 engine = self._ensure_engine()
@@ -440,7 +575,8 @@ class STTWorker:
         def process_frame(frame_pcm16: bytes) -> None:
             nonlocal frames_seen, vad_frames, vad_true_frames, rms_current, last_audio_ts
             nonlocal in_speech_now, rms_consecutive, in_speech, speech_start_mono, last_voice_mono, buf
-            nonlocal current_silence_ms, noise_floor_current, effective_seg_thr_current
+            nonlocal current_silence_ms, noise_floor_current, effective_seg_thr_current, segment_thr_off_current
+            nonlocal hangover_left_ms
             if not frame_pcm16:
                 return
             frames_seen += 1
@@ -464,16 +600,22 @@ class STTWorker:
             else:
                 noise_floor_current = 0.0
             effective_seg_thr_current = _effective_segment_threshold(float(cfg.rms_speech_threshold), noise_rms_samples)
-            rms_above = bool(rms_current >= effective_seg_thr_current)
             if vad_true:
                 vad_true_frames += 1
-            if rms_above:
-                rms_consecutive += 1
-            else:
-                rms_consecutive = 0
 
-            # Treat VAD as advisory: low RMS must still allow silence to accumulate.
-            speech_like = bool((vad_true and rms_above) or (rms_consecutive >= max(1, int(cfg.rms_min_frames))))
+            # Treat VAD as advisory and avoid flicker by applying hysteresis + hangover.
+            speech_like, rms_consecutive, hangover_left_ms, segment_thr_off_current = _segment_speech_like_state(
+                vad_true=vad_true,
+                rms_current=rms_current,
+                threshold_on=effective_seg_thr_current,
+                in_speech=in_speech,
+                rms_consecutive=rms_consecutive,
+                rms_min_frames=int(cfg.rms_min_frames),
+                hangover_left_ms=hangover_left_ms,
+                hangover_ms=int(cfg.segment_hangover_ms),
+                frame_ms=int(cfg.frame_ms),
+                off_ratio=float(cfg.segment_hysteresis_off_ratio),
+            )
             in_speech_now = speech_like
 
             now = time.monotonic()
@@ -532,6 +674,7 @@ class STTWorker:
                         reset_segment()
                         frame_buffer = bytearray()
                         rms_consecutive = 0
+                        hangover_left_ms = 0
                         time.sleep(0.02)
                         continue
 
