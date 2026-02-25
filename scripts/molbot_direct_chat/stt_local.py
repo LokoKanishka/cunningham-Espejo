@@ -32,6 +32,12 @@ class STTConfig:
     segment_hysteresis_off_ratio: float = 0.65
     segment_hangover_ms: int = 250
     chat_mode: bool = False
+    preamp_gain: float = 1.0
+    agc_enabled: bool = False
+    agc_target_rms: float = 0.06
+    agc_max_gain: float = 6.0
+    agc_attack: float = 0.35
+    agc_release: float = 0.08
 
     # Transcription
     language: str = "es"
@@ -178,6 +184,47 @@ def _effective_segment_threshold(config_threshold: float, noise_samples: list[fl
         noise_floor = 0.0
     # Guardrail: avoid near-zero thresholds that keep speech_like latched forever.
     return max(0.006, cfg_thr, noise_floor * 3.0)
+
+
+def _apply_preamp_agc_frame(
+    pcm16: bytes,
+    *,
+    preamp_gain: float,
+    agc_enabled: bool,
+    agc_target_rms: float,
+    agc_max_gain: float,
+    agc_attack: float,
+    agc_release: float,
+    agc_gain_current: float,
+) -> tuple[bytes, float, float, float, float]:
+    if not pcm16:
+        return pcm16, float(max(0.05, preamp_gain)), float(max(0.1, agc_gain_current)), 0.0, 0.0
+    base_gain = max(0.05, float(preamp_gain or 1.0))
+    try:
+        raw_rms = float(audioop.rms(pcm16, 2) / 32768.0)
+    except Exception:
+        raw_rms = 0.0
+    agc_gain = max(0.1, float(agc_gain_current or 1.0))
+    if bool(agc_enabled):
+        target = max(0.01, min(0.30, float(agc_target_rms or 0.06)))
+        max_gain = max(1.0, min(24.0, float(agc_max_gain or 6.0)))
+        desired = target / max(0.0001, raw_rms)
+        desired = max(0.25, min(max_gain, float(desired)))
+        attack = max(0.01, min(1.0, float(agc_attack or 0.35)))
+        release = max(0.01, min(1.0, float(agc_release or 0.08)))
+        rate = attack if desired >= agc_gain else release
+        agc_gain = agc_gain + ((desired - agc_gain) * rate)
+        agc_gain = max(0.1, min(max_gain, float(agc_gain)))
+    total_gain = max(0.05, min(24.0, base_gain * (agc_gain if bool(agc_enabled) else 1.0)))
+    try:
+        out = audioop.mul(pcm16, 2, total_gain)
+    except Exception:
+        out = pcm16
+    try:
+        out_rms = float(audioop.rms(out, 2) / 32768.0)
+    except Exception:
+        out_rms = raw_rms
+    return out, float(base_gain), float(agc_gain), float(total_gain), float(out_rms)
 
 
 def _effective_min_segment_ms(cfg: STTConfig) -> int:
@@ -491,6 +538,10 @@ class STTWorker:
         segment_thr_off_current = max(0.0003, effective_seg_thr_current * max(0.10, min(0.95, float(cfg.segment_hysteresis_off_ratio))))
         effective_min_segment_ms = _effective_min_segment_ms(cfg)
         hangover_left_ms = 0
+        preamp_gain_current = max(0.05, float(cfg.preamp_gain or 1.0))
+        agc_gain_current = 1.0
+        input_gain_total_current = preamp_gain_current
+        raw_rms_current = 0.0
 
         def emit_runtime_diag(extra: Optional[dict] = None) -> None:
             vad_true_ratio = (float(vad_true_frames) / float(frames_seen)) if frames_seen > 0 else 0.0
@@ -499,6 +550,7 @@ class STTWorker:
                 "kind": "stt_diag",
                 "frames_seen": int(frames_seen),
                 "last_audio_ts": float(last_audio_ts or 0.0),
+                "raw_rms_current": float(raw_rms_current),
                 "rms_current": float(rms_current),
                 "vad_active": bool(in_speech_now),
                 "in_speech": bool(in_speech),
@@ -514,6 +566,10 @@ class STTWorker:
                 "min_segment_ms": int(effective_min_segment_ms),
                 "speech_hangover_ms": int(max(0, hangover_left_ms)),
                 "speech_state": speech_state,
+                "stt_preamp_gain": float(preamp_gain_current),
+                "stt_agc_enabled": bool(cfg.agc_enabled),
+                "stt_agc_gain_current": float(agc_gain_current),
+                "stt_input_gain_total": float(input_gain_total_current),
                 "noise_floor": float(noise_floor_current),
             }
             if isinstance(extra, dict):
@@ -577,12 +633,27 @@ class STTWorker:
             nonlocal in_speech_now, rms_consecutive, in_speech, speech_start_mono, last_voice_mono, buf
             nonlocal current_silence_ms, noise_floor_current, effective_seg_thr_current, segment_thr_off_current
             nonlocal hangover_left_ms
+            nonlocal preamp_gain_current, agc_gain_current, input_gain_total_current, raw_rms_current
             if not frame_pcm16:
                 return
             frames_seen += 1
             last_audio_ts = time.time()
+            frame_pcm16, preamp_gain_current, agc_gain_current, input_gain_total_current, rms_after_gain = _apply_preamp_agc_frame(
+                frame_pcm16,
+                preamp_gain=float(cfg.preamp_gain),
+                agc_enabled=bool(cfg.agc_enabled),
+                agc_target_rms=float(cfg.agc_target_rms),
+                agc_max_gain=float(cfg.agc_max_gain),
+                agc_attack=float(cfg.agc_attack),
+                agc_release=float(cfg.agc_release),
+                agc_gain_current=float(agc_gain_current),
+            )
             try:
-                rms_current = float(audioop.rms(frame_pcm16, 2) / 32768.0)
+                raw_rms_current = float(audioop.rms(frame_pcm16, 2) / 32768.0) / max(0.05, float(input_gain_total_current))
+            except Exception:
+                raw_rms_current = 0.0
+            try:
+                rms_current = float(rms_after_gain)
             except Exception:
                 rms_current = 0.0
 
