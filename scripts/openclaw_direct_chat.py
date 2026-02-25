@@ -134,12 +134,7 @@ _TTS_HEALTH_CACHE = {
 
 def _bargein_config() -> dict:
     state = _load_voice_state()
-    try:
-        rms_state = float(state.get("stt_rms_threshold", 0.0))
-    except Exception:
-        rms_state = 0.0
-    rms_env = float(os.environ.get("DIRECT_CHAT_BARGEIN_RMS_THRESHOLD", "0.012"))
-    rms_threshold = rms_state if rms_state > 0 else rms_env
+    rms_threshold = _stt_barge_rms_threshold_from_state(state)
     return {
         "enabled": _env_flag("DIRECT_CHAT_BARGEIN_ENABLED", True),
         "vad_interrupt_enabled": _env_flag("DIRECT_CHAT_BARGEIN_VAD_INTERRUPT_ENABLED", False),
@@ -552,7 +547,51 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw in ("1", "true", "yes", "on", "si", "sí")
 
 
+def _clamp_float(raw, *, default: float, min_value: float) -> float:
+    try:
+        return max(float(min_value), float(raw))
+    except Exception:
+        return max(float(min_value), float(default))
+
+
+def _stt_legacy_rms_threshold_from_state(state: dict | None = None) -> float:
+    src = state if isinstance(state, dict) else {}
+    env_default = _clamp_float(
+        os.environ.get("DIRECT_CHAT_BARGEIN_RMS_THRESHOLD", "0.012"),
+        default=0.012,
+        min_value=0.001,
+    )
+    return _clamp_float(src.get("stt_rms_threshold", env_default), default=env_default, min_value=0.001)
+
+
+def _stt_segment_rms_threshold_from_state(state: dict | None = None) -> float:
+    src = state if isinstance(state, dict) else {}
+    legacy = _stt_legacy_rms_threshold_from_state(src)
+    if "stt_segment_rms_threshold" not in src:
+        return max(0.0005, float(legacy))
+    env_default = _clamp_float(
+        os.environ.get("DIRECT_CHAT_STT_SEGMENT_RMS_THRESHOLD", "0.002"),
+        default=0.002,
+        min_value=0.0005,
+    )
+    return _clamp_float(src.get("stt_segment_rms_threshold", env_default), default=env_default, min_value=0.0005)
+
+
+def _stt_barge_rms_threshold_from_state(state: dict | None = None) -> float:
+    src = state if isinstance(state, dict) else {}
+    legacy = _stt_legacy_rms_threshold_from_state(src)
+    if "stt_barge_rms_threshold" not in src:
+        return max(0.001, float(legacy))
+    env_default = _clamp_float(
+        os.environ.get("DIRECT_CHAT_STT_BARGE_RMS_THRESHOLD", str(legacy)),
+        default=legacy,
+        min_value=0.001,
+    )
+    return _clamp_float(src.get("stt_barge_rms_threshold", env_default), default=env_default, min_value=0.001)
+
+
 def _default_voice_state() -> dict:
+    legacy_threshold = _stt_legacy_rms_threshold_from_state({})
     return {
         "enabled": _env_flag("DIRECT_CHAT_TTS_ENABLED_DEFAULT", True),
         "speaker": str(os.environ.get("DIRECT_CHAT_TTS_SPEAKER", "Ana Florence")).strip() or "Ana Florence",
@@ -563,7 +602,19 @@ def _default_voice_state() -> dict:
         "stt_chat_enabled": _env_flag("DIRECT_CHAT_STT_CHAT_ENABLED", False),
         "stt_debug": _env_flag("DIRECT_CHAT_STT_DEBUG", False),
         "stt_no_audio_timeout_sec": max(1.0, float(os.environ.get("DIRECT_CHAT_STT_NO_AUDIO_TIMEOUT_SEC", "3.0"))),
-        "stt_rms_threshold": max(0.001, float(os.environ.get("DIRECT_CHAT_BARGEIN_RMS_THRESHOLD", "0.012"))),
+        # Legacy single threshold (kept for backward compatibility).
+        "stt_rms_threshold": float(legacy_threshold),
+        # New split thresholds.
+        "stt_segment_rms_threshold": _clamp_float(
+            os.environ.get("DIRECT_CHAT_STT_SEGMENT_RMS_THRESHOLD", "0.002"),
+            default=0.002,
+            min_value=0.0005,
+        ),
+        "stt_barge_rms_threshold": _clamp_float(
+            os.environ.get("DIRECT_CHAT_STT_BARGE_RMS_THRESHOLD", str(legacy_threshold)),
+            default=legacy_threshold,
+            min_value=0.001,
+        ),
         "stt_barge_any": _env_flag("DIRECT_CHAT_STT_BARGE_ANY", False),
         "stt_barge_any_cooldown_ms": max(300, _int_env("DIRECT_CHAT_STT_BARGE_ANY_COOLDOWN_MS", 1200)),
     }
@@ -605,6 +656,26 @@ def _load_voice_state() -> dict:
                     )
                 except Exception:
                     state["stt_rms_threshold"] = max(0.001, float(state.get("stt_rms_threshold", 0.012)))
+                try:
+                    if "stt_segment_rms_threshold" in raw:
+                        state["stt_segment_rms_threshold"] = max(
+                            0.0005,
+                            float(raw.get("stt_segment_rms_threshold", state.get("stt_segment_rms_threshold", 0.002))),
+                        )
+                    else:
+                        state["stt_segment_rms_threshold"] = max(0.0005, float(state.get("stt_rms_threshold", 0.002)))
+                except Exception:
+                    state["stt_segment_rms_threshold"] = max(0.0005, float(state.get("stt_rms_threshold", 0.002)))
+                try:
+                    if "stt_barge_rms_threshold" in raw:
+                        state["stt_barge_rms_threshold"] = max(
+                            0.001,
+                            float(raw.get("stt_barge_rms_threshold", state.get("stt_barge_rms_threshold", 0.012))),
+                        )
+                    else:
+                        state["stt_barge_rms_threshold"] = max(0.001, float(state.get("stt_rms_threshold", 0.012)))
+                except Exception:
+                    state["stt_barge_rms_threshold"] = max(0.001, float(state.get("stt_rms_threshold", 0.012)))
                 if "stt_barge_any" in raw:
                     state["stt_barge_any"] = bool(raw.get("stt_barge_any"))
                 try:
@@ -615,6 +686,10 @@ def _load_voice_state() -> dict:
                     state["stt_barge_any_cooldown_ms"] = max(300, int(state.get("stt_barge_any_cooldown_ms", 1200)))
     except Exception:
         pass
+    # Safety pass for older persisted states.
+    state["stt_rms_threshold"] = _stt_legacy_rms_threshold_from_state(state)
+    state["stt_segment_rms_threshold"] = _stt_segment_rms_threshold_from_state(state)
+    state["stt_barge_rms_threshold"] = _stt_barge_rms_threshold_from_state(state)
     return state
 
 
@@ -758,6 +833,10 @@ class STTManager:
         self._items_dropped = 0
         self._items_dropped_audio = 0
         self._items_dropped_text = 0
+        self._drop_reason_counts: dict[str, int] = {}
+        self._stt_emit_count = 0
+        self._voice_text_committed = 0
+        self._stt_chat_commit_total = 0
         self._last_item_ts = 0.0
         self._last_raw_text = ""
         self._last_norm_text = ""
@@ -922,28 +1001,24 @@ class STTManager:
                     pass
             if "device" in event:
                 self._device_label = str(event.get("device", "")).strip()
-            if kind in ("stt_drop", "stt_error"):
-                self._items_dropped += 1
             if kind == "stt_drop":
                 reason = str(event.get("reason", "drop_unknown"))[:120]
-                self._drop_reason = reason
-                if any(k in reason for k in ("text_", "command_", "tts_guard_", "empty_text")):
-                    self._items_dropped_text += 1
-                else:
-                    self._items_dropped_audio += 1
+                self._register_drop_locked(reason)
             elif kind == "stt_error":
                 detail = str(event.get("detail", "")).strip()
+                self._register_drop_locked("stt_error")
                 if detail:
                     self._last_error = detail[:240]
                     self._drop_reason = self._last_error
-                self._items_dropped_audio += 1
             elif kind == "stt_emit":
                 self._drop_reason = ""
+                self._stt_emit_count += 1
 
     def _register_drop_locked(self, reason: str) -> None:
         self._items_dropped += 1
         r = str(reason or "drop_unknown")[:120]
         self._drop_reason = r
+        self._drop_reason_counts[r] = int(self._drop_reason_counts.get(r, 0) or 0) + 1
         if any(k in r for k in ("text_", "command_", "tts_guard_", "empty_text")):
             self._items_dropped_text += 1
         else:
@@ -965,6 +1040,10 @@ class STTManager:
         self._items_dropped = 0
         self._items_dropped_audio = 0
         self._items_dropped_text = 0
+        self._drop_reason_counts = {}
+        self._stt_emit_count = 0
+        self._voice_text_committed = 0
+        self._stt_chat_commit_total = 0
         self._last_item_ts = 0.0
         self._last_raw_text = ""
         self._last_norm_text = ""
@@ -982,6 +1061,7 @@ class STTManager:
             min_chars = max(1, int(state.get("stt_min_chars", min_chars_default)))
         except Exception:
             min_chars = max(1, int(min_chars_default))
+        segment_rms_threshold = _stt_segment_rms_threshold_from_state(state)
         selected_device = self._selected_stt_device()
         cfg = stt_local.STTConfig(
             sample_rate=max(8000, self._env_int("DIRECT_CHAT_STT_SAMPLE_RATE", 16000)),
@@ -990,9 +1070,9 @@ class STTManager:
             frame_ms=max(10, min(30, self._env_int("DIRECT_CHAT_STT_FRAME_MS", 30))),
             vad_mode=max(0, min(3, self._env_int("DIRECT_CHAT_STT_VAD_MODE", 1))),
             min_speech_ms=max(120, self._env_int("DIRECT_CHAT_STT_MIN_SPEECH_MS", 220)),
-            max_silence_ms=max(200, self._env_int("DIRECT_CHAT_STT_MAX_SILENCE_MS", 1000)),
-            max_segment_s=max(1.2, self._env_float("DIRECT_CHAT_STT_MAX_SEGMENT_SEC", 2.0)),
-            rms_speech_threshold=max(0.0005, float(state.get("stt_rms_threshold", 0.002) or 0.002)),
+            max_silence_ms=max(180, self._env_int("DIRECT_CHAT_STT_MAX_SILENCE_MS", 350)),
+            max_segment_s=max(1.2, self._env_float("DIRECT_CHAT_STT_MAX_SEGMENT_SEC", 1.8)),
+            rms_speech_threshold=max(0.0005, float(segment_rms_threshold)),
             rms_min_frames=max(1, self._env_int("DIRECT_CHAT_STT_RMS_MIN_FRAMES", 2)),
             language=str(os.environ.get("DIRECT_CHAT_STT_LANGUAGE", "es")).strip() or "es",
             model=str(os.environ.get("DIRECT_CHAT_STT_MODEL", "small")).strip() or "small",
@@ -1191,7 +1271,8 @@ class STTManager:
                     last_barge = 0.0
                     self._last_barge_any_mono = 0.0
                 elapsed_ms = int(max(0.0, (now_mono - last_barge) * 1000.0))
-                rms_threshold = self._voice_state().get("stt_rms_threshold", 0.012)
+                barge_state = self._voice_state()
+                rms_threshold = _stt_barge_rms_threshold_from_state(barge_state)
                 try:
                     rms_threshold_f = max(0.001, float(rms_threshold))
                 except Exception:
@@ -1205,7 +1286,15 @@ class STTManager:
                     self._last_match_reason = "voice_any_barge"
                     self._last_matched_cmd = "pause"
                     self._last_match_ts = now_ts
-                    out.append({"text": "voz detectada", "ts": now_ts, "kind": "voice_cmd", "cmd": "pause"})
+                    out.append(
+                        {
+                            "text": "voz detectada",
+                            "ts": now_ts,
+                            "kind": "voice_cmd",
+                            "cmd": "pause",
+                            "source": "voice_any",
+                        }
+                    )
                     self._items_total += 1
                     self._last_item_ts = max(self._last_item_ts, now_ts)
         for _ in range(limit):
@@ -1221,9 +1310,10 @@ class STTManager:
                     continue
                 cmd = _voice_command_kind(text)
                 ts = float(item.get("ts", time.time()))
+                norm_text = _normalize_text(text)
                 with self._lock:
                     self._last_raw_text = text[:240]
-                    self._last_norm_text = _normalize_text(text)[:240]
+                    self._last_norm_text = norm_text[:240]
                     self._last_matched_cmd = cmd
                     self._last_match_ts = ts
                 if _is_probable_stt_noise(text, cmd=cmd):
@@ -1234,7 +1324,7 @@ class STTManager:
                             {
                                 "kind": "stt_debug",
                                 "text": text,
-                                "norm": _normalize_text(text),
+                                "norm": norm_text,
                                 "reason": "text_noise_filtered",
                                 "ts": ts,
                             }
@@ -1247,7 +1337,7 @@ class STTManager:
                 if cmd:
                     with self._lock:
                         self._last_match_reason = "matched_command"
-                    event = {"text": text, "ts": ts, "kind": "voice_cmd", "cmd": cmd}
+                    event = {"text": text, "ts": ts, "kind": "voice_cmd", "cmd": cmd, "source": "voice_cmd"}
                     out.append(event)
                     with self._lock:
                         self._items_total += 1
@@ -1261,7 +1351,7 @@ class STTManager:
                             {
                                 "kind": "stt_debug",
                                 "text": text,
-                                "norm": _normalize_text(text),
+                                "norm": norm_text,
                                 "reason": "tts_guard_non_command",
                                 "ts": ts,
                             }
@@ -1269,17 +1359,19 @@ class STTManager:
                     with self._lock:
                         self._register_drop_locked("tts_guard_non_command")
                     continue
+                voice_chat_passthrough = bool(chat_enabled and (not tts_playing) and (not reader_active))
+                if voice_chat_passthrough and (not cmd):
+                    with self._lock:
+                        self._last_match_reason = "voice_chat_text"
+                    event = {"text": text, "norm": norm_text, "ts": ts, "kind": "chat_text", "source": "voice_chat"}
+                    out.append(event)
+                    with self._lock:
+                        self._items_total += 1
+                        self._voice_text_committed += 1
+                        self._stt_chat_commit_total += 1
+                        self._last_item_ts = max(self._last_item_ts, ts)
+                    continue
                 if command_only and (not cmd):
-                    voice_chat_passthrough = bool(chat_enabled and (not tts_playing) and (not reader_active))
-                    if voice_chat_passthrough:
-                        with self._lock:
-                            self._last_match_reason = "voice_chat_text"
-                        event = {"text": text, "ts": ts, "kind": "voice_text"}
-                        out.append(event)
-                        with self._lock:
-                            self._items_total += 1
-                            self._last_item_ts = max(self._last_item_ts, ts)
-                        continue
                     with self._lock:
                         self._last_match_reason = "command_only_non_command"
                     if debug_enabled:
@@ -1287,7 +1379,7 @@ class STTManager:
                             {
                                 "kind": "stt_debug",
                                 "text": text,
-                                "norm": _normalize_text(text),
+                                "norm": norm_text,
                                 "reason": "command_only_non_command",
                                 "ts": ts,
                             }
@@ -1322,6 +1414,13 @@ class STTManager:
                 and int(self._vad_true_frames) <= 0
             )
             vad_true_ratio = (float(self._vad_true_frames) / float(self._frames_seen)) if self._frames_seen > 0 else 0.0
+            state = self._voice_state()
+            stt_segment_rms_threshold = _stt_segment_rms_threshold_from_state(state)
+            stt_barge_rms_threshold = _stt_barge_rms_threshold_from_state(state)
+            stt_legacy_rms_threshold = _stt_legacy_rms_threshold_from_state(state)
+            drop_reason_counts_sorted = dict(
+                sorted(self._drop_reason_counts.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))[:8]
+            )
             return {
                 "stt_enabled": bool(self._enabled),
                 "stt_running": running,
@@ -1344,6 +1443,10 @@ class STTManager:
                 "items_dropped": int(self._items_dropped),
                 "items_dropped_audio": int(self._items_dropped_audio),
                 "items_dropped_text": int(self._items_dropped_text),
+                "stt_emit_count": int(self._stt_emit_count),
+                "voice_text_committed": int(self._voice_text_committed),
+                "stt_chat_commit_total": int(self._stt_chat_commit_total),
+                "drop_reason_counts": drop_reason_counts_sorted,
                 "last_item_ts": float(self._last_item_ts or 0.0),
                 "last_raw_text": str(self._last_raw_text),
                 "last_norm_text": str(self._last_norm_text),
@@ -1353,6 +1456,9 @@ class STTManager:
                 "stt_no_audio_input": bool(no_audio_input),
                 "stt_no_speech_detected": bool(no_speech_detected),
                 "stt_no_audio_timeout_sec": float(no_audio_timeout),
+                "stt_rms_threshold": float(stt_legacy_rms_threshold),
+                "stt_segment_rms_threshold": float(stt_segment_rms_threshold),
+                "stt_barge_rms_threshold": float(stt_barge_rms_threshold),
                 "stt_command_only": bool(self._command_only_enabled()),
                 "stt_chat_enabled": bool(self._chat_enabled()),
                 "stt_debug": bool(self._debug_enabled()),
@@ -1395,6 +1501,8 @@ def _set_stt_runtime_config(
     stt_min_chars: int | None = None,
     stt_no_audio_timeout_sec: float | None = None,
     stt_rms_threshold: float | None = None,
+    stt_segment_rms_threshold: float | None = None,
+    stt_barge_rms_threshold: float | None = None,
     stt_barge_any: bool | None = None,
     stt_barge_any_cooldown_ms: int | None = None,
 ) -> dict:
@@ -1413,11 +1521,25 @@ def _set_stt_runtime_config(
         if stt_no_audio_timeout_sec is not None:
             state["stt_no_audio_timeout_sec"] = max(1.0, float(stt_no_audio_timeout_sec))
         if stt_rms_threshold is not None:
-            state["stt_rms_threshold"] = max(0.001, float(stt_rms_threshold))
+            # Backward-compatible command: set both thresholds with the same value.
+            thr = max(0.001, float(stt_rms_threshold))
+            state["stt_rms_threshold"] = thr
+            state["stt_segment_rms_threshold"] = max(0.0005, thr)
+            state["stt_barge_rms_threshold"] = max(0.001, thr)
+        if stt_segment_rms_threshold is not None:
+            state["stt_segment_rms_threshold"] = max(0.0005, float(stt_segment_rms_threshold))
+        if stt_barge_rms_threshold is not None:
+            barge_thr = max(0.001, float(stt_barge_rms_threshold))
+            state["stt_barge_rms_threshold"] = barge_thr
+            # Keep legacy field aligned with barge threshold for older clients.
+            state["stt_rms_threshold"] = barge_thr
         if stt_barge_any is not None:
             state["stt_barge_any"] = bool(stt_barge_any)
         if stt_barge_any_cooldown_ms is not None:
             state["stt_barge_any_cooldown_ms"] = max(300, int(stt_barge_any_cooldown_ms))
+        state["stt_rms_threshold"] = _stt_legacy_rms_threshold_from_state(state)
+        state["stt_segment_rms_threshold"] = _stt_segment_rms_threshold_from_state(state)
+        state["stt_barge_rms_threshold"] = _stt_barge_rms_threshold_from_state(state)
         _save_voice_state(state)
     os.environ["DIRECT_CHAT_STT_DEVICE"] = str(state.get("stt_device", "")).strip()
     try:
@@ -5645,6 +5767,30 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         _set_stt_runtime_config(stt_device=str(idx))
         return {"reply": f"Listo: STT usará micrófono {idx}.", "no_auto_tts": True}
 
+    match_stt_threshold_segment = re.search(
+        r"\bstt\s+umbral\s+(?:segment|segmento|segmentacion)\s+([0-9]+(?:\.[0-9]+)?)",
+        normalized,
+    )
+    if match_stt_threshold_segment:
+        try:
+            thr = max(0.0005, float(match_stt_threshold_segment.group(1)))
+        except Exception:
+            thr = 0.002
+        _set_stt_runtime_config(stt_segment_rms_threshold=thr)
+        return {"reply": f"Listo: umbral STT de segmentación en {thr:.4f}.", "no_auto_tts": True}
+
+    match_stt_threshold_barge = re.search(
+        r"\bstt\s+umbral\s+(?:barge|barge-any|bargeany|bargein)\s+([0-9]+(?:\.[0-9]+)?)",
+        normalized,
+    )
+    if match_stt_threshold_barge:
+        try:
+            thr = max(0.001, float(match_stt_threshold_barge.group(1)))
+        except Exception:
+            thr = 0.012
+        _set_stt_runtime_config(stt_barge_rms_threshold=thr)
+        return {"reply": f"Listo: umbral STT de barge en {thr:.4f}.", "no_auto_tts": True}
+
     match_stt_threshold = re.search(r"\bstt\s+umbral\s+([0-9]+(?:\.[0-9]+)?)", normalized)
     if match_stt_threshold:
         try:
@@ -5652,7 +5798,7 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         except Exception:
             thr = 0.012
         _set_stt_runtime_config(stt_rms_threshold=thr)
-        return {"reply": f"Listo: umbral STT/Barge-In en {thr:.4f}.", "no_auto_tts": True}
+        return {"reply": f"Listo: umbral STT unificado en {thr:.4f} (segmentación + barge).", "no_auto_tts": True}
 
     if any(
         k in normalized
@@ -5713,6 +5859,11 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
                 f"cmd={str(st.get('matched_cmd', '') or '-')}, reason={str(st.get('match_reason', '') or '-')}, "
                 f"chat={bool(st.get('stt_chat_enabled', False))}, "
                 f"barge_any={bool(st.get('stt_barge_any', False))}, "
+                f"thr_seg={float(st.get('stt_segment_rms_threshold', 0.0) or 0.0):.4f}, "
+                f"thr_barge={float(st.get('stt_barge_rms_threshold', 0.0) or 0.0):.4f}, "
+                f"emit={int(st.get('stt_emit_count', 0) or 0)}, "
+                f"voice_text={int(st.get('stt_chat_commit_total', st.get('voice_text_committed', 0)) or 0)}, "
+                f"drops={int(st.get('items_dropped', 0) or 0)}, "
                 f"no_audio={no_audio}, no_speech={no_speech}."
             ),
             "no_auto_tts": True,
@@ -5934,7 +6085,7 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         _READER_STORE.set_reader_state(session_id, "paused", reason="reader_user_paused")
         st_after = _READER_STORE.get_session(session_id, include_chunks=False)
         return {
-            "reply": "Lectura en pausa. Para retomar, decí: continuar",
+            "reply": "Pausado (texto). Para retomar, decí: continuar",
             "no_auto_tts": True,
             "reader": _reader_meta(session_id, st_after, auto_continue=False),
         }
@@ -7107,6 +7258,14 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             stt_rms_threshold = 0.012
         try:
+            stt_segment_rms_threshold = max(0.0005, float(state.get("stt_segment_rms_threshold", stt_rms_threshold)))
+        except Exception:
+            stt_segment_rms_threshold = max(0.0005, float(stt_rms_threshold))
+        try:
+            stt_barge_rms_threshold = max(0.001, float(state.get("stt_barge_rms_threshold", stt_rms_threshold)))
+        except Exception:
+            stt_barge_rms_threshold = max(0.001, float(stt_rms_threshold))
+        try:
             stt_barge_any_cooldown = max(300, int(state.get("stt_barge_any_cooldown_ms", 1200)))
         except Exception:
             stt_barge_any_cooldown = 1200
@@ -7121,6 +7280,8 @@ class Handler(BaseHTTPRequestHandler):
             "stt_debug": bool(state.get("stt_debug", False)),
             "stt_no_audio_timeout_sec": float(stt_no_audio_timeout),
             "stt_rms_threshold": float(stt_rms_threshold),
+            "stt_segment_rms_threshold": float(stt_segment_rms_threshold),
+            "stt_barge_rms_threshold": float(stt_barge_rms_threshold),
             "stt_barge_any": bool(state.get("stt_barge_any", False)),
             "stt_barge_any_cooldown_ms": int(stt_barge_any_cooldown),
             "provider": "alltalk",
@@ -7326,14 +7487,40 @@ class Handler(BaseHTTPRequestHandler):
                     },
                 )
                 return
-            cfg = _bargein_config()
+            try:
+                segment_threshold = max(
+                    0.0005,
+                    float(
+                        stt_status.get(
+                            "stt_segment_rms_threshold",
+                            stt_status.get("stt_rms_threshold", 0.002),
+                        )
+                        or 0.002
+                    ),
+                )
+            except Exception:
+                segment_threshold = 0.002
+            try:
+                barge_threshold = max(
+                    0.001,
+                    float(
+                        stt_status.get(
+                            "stt_barge_rms_threshold",
+                            stt_status.get("stt_rms_threshold", 0.012),
+                        )
+                        or 0.012
+                    ),
+                )
+            except Exception:
+                barge_threshold = 0.012
             self._json(
                 200,
                 {
                     "ok": True,
                     "session_id": sid,
                     "rms": float(stt_status.get("stt_rms_current", 0.0) or 0.0),
-                    "threshold": float(cfg.get("rms_threshold", 0.012) or 0.012),
+                    "threshold": float(segment_threshold),
+                    "barge_threshold": float(barge_threshold),
                     "in_speech": bool(stt_status.get("stt_vad_active", False)),
                     "vad_true_ratio": float(stt_status.get("stt_vad_true_ratio", 0.0) or 0.0),
                     "last_segment_ms": int(stt_status.get("stt_last_segment_ms", 0) or 0),
@@ -7342,6 +7529,10 @@ class Handler(BaseHTTPRequestHandler):
                     "last_audio_ts": float(stt_status.get("stt_last_audio_ts", 0.0) or 0.0),
                     "no_audio_input": bool(stt_status.get("stt_no_audio_input", False)),
                     "no_speech_detected": bool(stt_status.get("stt_no_speech_detected", False)),
+                    "emit_count": int(stt_status.get("stt_emit_count", 0) or 0),
+                    "voice_text_committed": int(stt_status.get("voice_text_committed", 0) or 0),
+                    "stt_chat_commit_total": int(stt_status.get("stt_chat_commit_total", 0) or 0),
+                    "drop_count": int(stt_status.get("items_dropped", 0) or 0),
                     "drop_reason": str(stt_status.get("stt_drop_reason", "")),
                 },
             )
@@ -7629,9 +7820,29 @@ class Handler(BaseHTTPRequestHandler):
                         pass
                 if "stt_rms_threshold" in payload:
                     try:
-                        state["stt_rms_threshold"] = max(
-                            0.001, float(payload.get("stt_rms_threshold", state.get("stt_rms_threshold", 0.012)))
+                        thr = max(0.001, float(payload.get("stt_rms_threshold", state.get("stt_rms_threshold", 0.012))))
+                        # Backward-compatible payload: keep both thresholds aligned.
+                        state["stt_rms_threshold"] = thr
+                        state["stt_segment_rms_threshold"] = max(0.0005, thr)
+                        state["stt_barge_rms_threshold"] = max(0.001, thr)
+                    except Exception:
+                        pass
+                if "stt_segment_rms_threshold" in payload:
+                    try:
+                        state["stt_segment_rms_threshold"] = max(
+                            0.0005,
+                            float(payload.get("stt_segment_rms_threshold", state.get("stt_segment_rms_threshold", 0.002))),
                         )
+                    except Exception:
+                        pass
+                if "stt_barge_rms_threshold" in payload:
+                    try:
+                        barge_thr = max(
+                            0.001,
+                            float(payload.get("stt_barge_rms_threshold", state.get("stt_barge_rms_threshold", 0.012))),
+                        )
+                        state["stt_barge_rms_threshold"] = barge_thr
+                        state["stt_rms_threshold"] = barge_thr
                     except Exception:
                         pass
                 if "stt_barge_any" in payload:
@@ -7643,6 +7854,9 @@ class Handler(BaseHTTPRequestHandler):
                         )
                     except Exception:
                         pass
+                state["stt_rms_threshold"] = _stt_legacy_rms_threshold_from_state(state)
+                state["stt_segment_rms_threshold"] = _stt_segment_rms_threshold_from_state(state)
+                state["stt_barge_rms_threshold"] = _stt_barge_rms_threshold_from_state(state)
                 _save_voice_state(state)
                 os.environ["DIRECT_CHAT_STT_DEVICE"] = str(state.get("stt_device", "")).strip()
                 if (
@@ -7651,6 +7865,9 @@ class Handler(BaseHTTPRequestHandler):
                     or "stt_chat_enabled" in payload
                     or "stt_debug" in payload
                     or "stt_min_chars" in payload
+                    or "stt_rms_threshold" in payload
+                    or "stt_segment_rms_threshold" in payload
+                    or "stt_barge_rms_threshold" in payload
                     or "stt_barge_any" in payload
                     or "stt_barge_any_cooldown_ms" in payload
                 ):

@@ -11,6 +11,14 @@ from molbot_direct_chat import stt_local  # noqa: E402
 
 
 class TestSttLocalFilters(unittest.TestCase):
+    def test_effective_segment_threshold_clamps_low_values(self) -> None:
+        thr = stt_local._effective_segment_threshold(0.001, [])
+        self.assertGreaterEqual(thr, 0.006)
+
+    def test_effective_segment_threshold_uses_noise_floor(self) -> None:
+        thr = stt_local._effective_segment_threshold(0.002, [0.004, 0.005, 0.006, 0.005])
+        self.assertGreaterEqual(thr, 0.015)
+
     def test_filter_transcript_allows_short_whitelisted_words(self) -> None:
         txt, reason = stt_local._filter_transcript_text("¡hola!", min_chars=8)
         self.assertEqual(reason, "")

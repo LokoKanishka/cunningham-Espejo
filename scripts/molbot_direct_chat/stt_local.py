@@ -24,8 +24,8 @@ class STTConfig:
 
     # Segmentation
     min_speech_ms: int = 220
-    max_silence_ms: int = 1000
-    max_segment_s: float = 20.0
+    max_silence_ms: int = 350
+    max_segment_s: float = 2.0
     rms_speech_threshold: float = 0.002
     rms_min_frames: int = 2
 
@@ -162,6 +162,18 @@ def _filter_transcript_text(text: str, min_chars: int = 3) -> tuple[str, str]:
         return "", "text_noise_symbols"
 
     return normalized, ""
+
+
+def _effective_segment_threshold(config_threshold: float, noise_samples: list[float]) -> float:
+    cfg_thr = max(0.0005, float(config_threshold or 0.0))
+    clean_samples = [max(0.0, float(v)) for v in noise_samples if isinstance(v, (int, float))]
+    if clean_samples:
+        ordered = sorted(clean_samples)
+        noise_floor = float(ordered[len(ordered) // 2])
+    else:
+        noise_floor = 0.0
+    # Guardrail: avoid near-zero thresholds that keep speech_like latched forever.
+    return max(0.006, cfg_thr, noise_floor * 3.0)
 
 
 def list_input_devices() -> list[dict]:
@@ -355,6 +367,10 @@ class STTWorker:
         resample_state = None
         frame_buffer = bytearray()
         rms_consecutive = 0
+        noise_rms_samples: list[float] = []
+        noise_window_max = max(10, int(1200 / max(10, int(cfg.frame_ms))))
+        noise_floor_current = 0.0
+        effective_seg_thr_current = max(0.006, float(cfg.rms_speech_threshold))
 
         def emit_runtime_diag(extra: Optional[dict] = None) -> None:
             vad_true_ratio = (float(vad_true_frames) / float(frames_seen)) if frames_seen > 0 else 0.0
@@ -370,6 +386,8 @@ class STTWorker:
                 "vad_true_ratio": float(vad_true_ratio),
                 "last_segment_ms": int(last_segment_ms),
                 "silence_ms": int(current_silence_ms),
+                "segment_threshold": float(effective_seg_thr_current),
+                "noise_floor": float(noise_floor_current),
             }
             if isinstance(extra, dict):
                 payload.update(extra)
@@ -422,7 +440,7 @@ class STTWorker:
         def process_frame(frame_pcm16: bytes) -> None:
             nonlocal frames_seen, vad_frames, vad_true_frames, rms_current, last_audio_ts
             nonlocal in_speech_now, rms_consecutive, in_speech, speech_start_mono, last_voice_mono, buf
-            nonlocal current_silence_ms
+            nonlocal current_silence_ms, noise_floor_current, effective_seg_thr_current
             if not frame_pcm16:
                 return
             frames_seen += 1
@@ -436,15 +454,26 @@ class STTWorker:
                 vad_true = bool(vad.is_speech(frame_pcm16, target_rate))
             except Exception:
                 vad_true = False
+            if not vad_true:
+                noise_rms_samples.append(rms_current)
+                if len(noise_rms_samples) > noise_window_max:
+                    del noise_rms_samples[: len(noise_rms_samples) - noise_window_max]
+            if noise_rms_samples:
+                ordered = sorted(noise_rms_samples)
+                noise_floor_current = float(ordered[len(ordered) // 2])
+            else:
+                noise_floor_current = 0.0
+            effective_seg_thr_current = _effective_segment_threshold(float(cfg.rms_speech_threshold), noise_rms_samples)
+            rms_above = bool(rms_current >= effective_seg_thr_current)
             if vad_true:
                 vad_true_frames += 1
-                rms_consecutive = 0
-            elif rms_current >= max(0.0005, float(cfg.rms_speech_threshold)):
+            if rms_above:
                 rms_consecutive += 1
             else:
                 rms_consecutive = 0
 
-            speech_like = bool(vad_true or (rms_consecutive >= max(1, int(cfg.rms_min_frames))))
+            # Treat VAD as advisory: low RMS must still allow silence to accumulate.
+            speech_like = bool((vad_true and rms_above) or (rms_consecutive >= max(1, int(cfg.rms_min_frames))))
             in_speech_now = speech_like
 
             now = time.monotonic()

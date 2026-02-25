@@ -93,6 +93,7 @@ class TestVoiceSttManager(unittest.TestCase):
         commands = [str(i.get("cmd", "")).strip().lower() for i in items]
         self.assertEqual(commands, ["pause", "pause", "continue"])
         self.assertTrue(all(str(i.get("kind", "")).strip().lower() == "voice_cmd" for i in items))
+        self.assertTrue(all(str(i.get("source", "")).strip().lower() == "voice_cmd" for i in items))
         mgr.disable()
 
     def test_stt_manager_barge_any_pauses_on_speech_with_cooldown(self) -> None:
@@ -123,8 +124,10 @@ class TestVoiceSttManager(unittest.TestCase):
             direct_chat._tts_is_playing = prev_tts_is_playing  # type: ignore
             direct_chat._reader_voice_any_barge_target_active = prev_reader_target  # type: ignore
         self.assertEqual([str(i.get("cmd", "")).strip().lower() for i in items1], ["pause"])
+        self.assertEqual([str(i.get("source", "")).strip().lower() for i in items1], ["voice_any"])
         self.assertEqual(items2, [])
         self.assertEqual([str(i.get("cmd", "")).strip().lower() for i in items3], ["pause"])
+        self.assertEqual([str(i.get("source", "")).strip().lower() for i in items3], ["voice_any"])
         mgr.disable()
 
     def test_stt_manager_barge_any_cooldown_is_silent(self) -> None:
@@ -193,7 +196,8 @@ class TestVoiceSttManager(unittest.TestCase):
             direct_chat._tts_is_playing = prev_tts_is_playing  # type: ignore
             direct_chat._reader_voice_any_barge_target_active = prev_reader_target  # type: ignore
         self.assertEqual(len(items), 1)
-        self.assertEqual(str(items[0].get("kind", "")).strip().lower(), "voice_text")
+        self.assertEqual(str(items[0].get("kind", "")).strip().lower(), "chat_text")
+        self.assertEqual(str(items[0].get("source", "")).strip().lower(), "voice_chat")
         self.assertEqual(str(items[0].get("text", "")).strip().lower(), "hola")
         mgr.disable()
 
@@ -258,6 +262,68 @@ class TestVoiceSttManager(unittest.TestCase):
             else:
                 direct_chat._TTS_PLAYING_EVENT.clear()
 
+    def test_stt_manager_status_exposes_emit_and_chat_commit_counters(self) -> None:
+        mgr = direct_chat.STTManager()
+        with mgr._lock:
+            mgr._enabled = True
+            mgr._owner_session_id = "sess_a"
+            mgr._worker = _DummyWorker(running=True)
+        mgr._command_only_enabled = lambda: True  # type: ignore
+        mgr._chat_enabled = lambda: True  # type: ignore
+        mgr._debug_enabled = lambda: False  # type: ignore
+        mgr._on_worker_telemetry({"kind": "stt_emit", "chars": 4})
+        mgr._queue.put({"text": "hola", "ts": 1.0})
+        prev_tts_is_playing = direct_chat._tts_is_playing
+        prev_reader_target = direct_chat._reader_voice_any_barge_target_active
+        try:
+            direct_chat._tts_is_playing = lambda: False  # type: ignore
+            direct_chat._reader_voice_any_barge_target_active = lambda _sid: False  # type: ignore
+            items = mgr.poll("sess_a", limit=4)
+        finally:
+            direct_chat._tts_is_playing = prev_tts_is_playing  # type: ignore
+            direct_chat._reader_voice_any_barge_target_active = prev_reader_target  # type: ignore
+        self.assertEqual(len(items), 1)
+        self.assertEqual(str(items[0].get("kind", "")).strip().lower(), "chat_text")
+        st = mgr.status()
+        self.assertEqual(int(st.get("stt_emit_count", 0) or 0), 1)
+        self.assertEqual(int(st.get("stt_chat_commit_total", 0) or 0), 1)
+        mgr.disable()
+
+    def test_stt_manager_barge_uses_barge_threshold_not_segment_threshold(self) -> None:
+        mgr = direct_chat.STTManager()
+        with mgr._lock:
+            mgr._enabled = True
+            mgr._owner_session_id = "sess_a"
+            mgr._worker = _DummyWorker(running=True)
+            mgr._vad_active = False
+            mgr._in_speech = False
+            mgr._rms_current = 0.010
+            mgr._silence_ms = 0
+        mgr._barge_any_enabled = lambda: True  # type: ignore
+        mgr._barge_any_cooldown_ms = lambda: 1200  # type: ignore
+        mgr._debug_enabled = lambda: False  # type: ignore
+        mgr._voice_state = lambda: {  # type: ignore
+            "stt_rms_threshold": 0.020,
+            "stt_segment_rms_threshold": 0.006,
+            "stt_barge_rms_threshold": 0.020,
+        }
+        prev_tts_is_playing = direct_chat._tts_is_playing
+        prev_reader_target = direct_chat._reader_voice_any_barge_target_active
+        try:
+            direct_chat._tts_is_playing = lambda: True  # type: ignore
+            direct_chat._reader_voice_any_barge_target_active = lambda _sid: True  # type: ignore
+            items_low = mgr.poll("sess_a", limit=2)
+            with mgr._lock:
+                mgr._rms_current = 0.030
+            items_high = mgr.poll("sess_a", limit=2)
+        finally:
+            direct_chat._tts_is_playing = prev_tts_is_playing  # type: ignore
+            direct_chat._reader_voice_any_barge_target_active = prev_reader_target  # type: ignore
+        self.assertEqual(items_low, [])
+        self.assertEqual([str(i.get("cmd", "")).strip().lower() for i in items_high], ["pause"])
+        self.assertEqual([str(i.get("source", "")).strip().lower() for i in items_high], ["voice_any"])
+        mgr.disable()
+
     def test_stt_manager_status_reports_runtime(self) -> None:
         mgr = direct_chat.STTManager()
         with mgr._lock:
@@ -270,6 +336,54 @@ class TestVoiceSttManager(unittest.TestCase):
         self.assertTrue(status.get("stt_running"))
         self.assertEqual(status.get("stt_owner_session_id"), "sess_a")
         mgr.disable()
+
+    @patch.object(direct_chat, "_STT_MANAGER")
+    @patch("openclaw_direct_chat._save_voice_state")
+    @patch(
+        "openclaw_direct_chat._load_voice_state",
+        return_value={
+            "enabled": True,
+            "speaker": "Ana Florence",
+            "speaker_wav": "",
+            "stt_rms_threshold": 0.012,
+            "stt_segment_rms_threshold": 0.006,
+            "stt_barge_rms_threshold": 0.020,
+        },
+    )
+    def test_set_stt_runtime_config_legacy_threshold_sets_segment_and_barge(
+        self, _mock_load, _mock_save, mock_manager
+    ) -> None:
+        out = direct_chat._set_stt_runtime_config(stt_rms_threshold=0.009)
+        self.assertAlmostEqual(float(out.get("stt_segment_rms_threshold", 0.0) or 0.0), 0.009, places=4)
+        self.assertAlmostEqual(float(out.get("stt_barge_rms_threshold", 0.0) or 0.0), 0.009, places=4)
+        self.assertAlmostEqual(float(out.get("stt_rms_threshold", 0.0) or 0.0), 0.009, places=4)
+        mock_manager.restart.assert_called_once()
+
+    @patch.object(direct_chat, "_STT_MANAGER")
+    @patch("openclaw_direct_chat._save_voice_state")
+    @patch(
+        "openclaw_direct_chat._load_voice_state",
+        return_value={
+            "enabled": True,
+            "speaker": "Ana Florence",
+            "speaker_wav": "",
+            "stt_rms_threshold": 0.012,
+            "stt_segment_rms_threshold": 0.006,
+            "stt_barge_rms_threshold": 0.020,
+        },
+    )
+    def test_set_stt_runtime_config_split_thresholds_are_independent(
+        self, _mock_load, _mock_save, mock_manager
+    ) -> None:
+        out_segment = direct_chat._set_stt_runtime_config(stt_segment_rms_threshold=0.007)
+        self.assertAlmostEqual(float(out_segment.get("stt_segment_rms_threshold", 0.0) or 0.0), 0.007, places=4)
+        self.assertAlmostEqual(float(out_segment.get("stt_barge_rms_threshold", 0.0) or 0.0), 0.020, places=4)
+        self.assertAlmostEqual(float(out_segment.get("stt_rms_threshold", 0.0) or 0.0), 0.012, places=4)
+        out_barge = direct_chat._set_stt_runtime_config(stt_barge_rms_threshold=0.018)
+        self.assertAlmostEqual(float(out_barge.get("stt_segment_rms_threshold", 0.0) or 0.0), 0.007, places=4)
+        self.assertAlmostEqual(float(out_barge.get("stt_barge_rms_threshold", 0.0) or 0.0), 0.018, places=4)
+        self.assertAlmostEqual(float(out_barge.get("stt_rms_threshold", 0.0) or 0.0), 0.018, places=4)
+        self.assertEqual(mock_manager.restart.call_count, 2)
 
     @patch("openclaw_direct_chat._set_voice_status")
     @patch("openclaw_direct_chat._stop_playback_process")

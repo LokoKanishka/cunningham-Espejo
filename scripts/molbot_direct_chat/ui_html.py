@@ -243,6 +243,7 @@ HTML = r"""<!doctype html>
 	      let sttSending = false;
 	      let sttLastText = "";
 	      let sttLastTextAtMs = 0;
+	      let sttSeenEvents = new Map();
 
 	    function fmtMb(mb) {
 	      if (mb == null || Number.isNaN(mb)) return "?";
@@ -267,8 +268,14 @@ HTML = r"""<!doctype html>
 	          const rmsVal = Number.isFinite(rmsRaw) ? rmsRaw : 0;
 	          const thrRaw = Number(sj?.threshold ?? sj?.stt_threshold ?? sj?.stt_rms_threshold);
 	          const hasThr = Number.isFinite(thrRaw) && thrRaw > 0;
+	          const bargeThrRaw = Number(sj?.barge_threshold ?? sj?.stt_barge_rms_threshold);
+	          const hasBargeThr = Number.isFinite(bargeThrRaw) && bargeThrRaw > 0;
 	          let rmsPart = `rms ${rmsVal.toFixed(4)}`;
 	          if (hasThr) rmsPart += `/${thrRaw.toFixed(4)}`;
+	          if (hasBargeThr) rmsPart += `/${bargeThrRaw.toFixed(4)}`;
+	          const emitCount = Math.max(0, Math.round(Number(sj?.emit_count ?? sj?.stt_emit_count ?? 0)));
+	          const voiceTextCount = Math.max(0, Math.round(Number(sj?.stt_chat_commit_total ?? sj?.voice_text_committed ?? 0)));
+	          const dropCount = Math.max(0, Math.round(Number(sj?.drop_count ?? sj?.items_dropped ?? 0)));
 	          const inSpeech = !!sj?.in_speech;
 	          const noAudio = !!sj?.no_audio_input;
 	          const noSpeech = !!sj?.no_speech_detected;
@@ -289,6 +296,7 @@ HTML = r"""<!doctype html>
 	          } else {
 	            sttLabel = `${rmsPart} ${inSpeech ? "voz" : "sil"} vad ${vadPct}% seg ${segMs}ms sil ${silMs}ms`;
 	          }
+	          sttLabel += ` emit ${emitCount} text ${voiceTextCount} drop ${dropCount}`;
 	        }
 
 	        const ram = `${fmtMb(sys.ram_used_mb)}/${fmtMb(sys.ram_total_mb)}`;
@@ -439,19 +447,29 @@ HTML = r"""<!doctype html>
 	      return "";
 	    }
 
-	    async function runVoiceReaderCommand(kind, text) {
+	    function pauseAckBySource(source) {
+	      const s = String(source || "").trim().toLowerCase();
+	      if (s === "voice_any") return "Pausado por voz (any).";
+	      if (s === "typed") return "Pausado (texto).";
+	      return "Pausado por voz (cmd).";
+	    }
+
+	    async function runVoiceReaderCommand(kind, text, source = "voice_cmd") {
 	      const now = Date.now();
 	      if ((now - sttLastBargeAtMs) < STT_BARGE_COOLDOWN_MS) return;
 	      sttLastBargeAtMs = now;
 	      const message = voiceCommandMessage(kind);
 	      if (!message) return;
 	      const spoken = norm(text).toLowerCase() || message;
-	      await push("assistant", `Comando por voz: "${spoken}".`);
+	      const sourceNorm = String(source || "").trim().toLowerCase();
+	      if (sourceNorm !== "voice_any") {
+	        await push("assistant", `Comando por voz: "${spoken}".`);
+	      }
 	      stopReaderAuto();
 	      abortCurrentStream();
 	      if (kind === "pause") {
 	        await pauseReaderContinuousSilently();
-	        await push("assistant", "Pausado por voz.");
+	        await push("assistant", pauseAckBySource(sourceNorm));
 	        await saveServerHistory();
 	        return;
 	      }
@@ -477,11 +495,25 @@ HTML = r"""<!doctype html>
 	      await saveServerHistory();
 	    }
 
-    function shouldAcceptSttText(text) {
+    function shouldAcceptSttText(text, ts = 0) {
       const t = (text || "").trim();
       if (t.length < 3) return false;
       const now = Date.now();
+      for (const [key, seenAt] of sttSeenEvents.entries()) {
+        if ((now - Number(seenAt || 0)) > 9000) sttSeenEvents.delete(key);
+      }
+      const tsNum = Number(ts);
+      const eventKey = (Number.isFinite(tsNum) && tsNum > 0)
+        ? `${Math.round(tsNum * 1000)}|${t}`
+        : `txt|${t}`;
+      if (sttSeenEvents.has(eventKey)) return false;
       if (t === sttLastText && (now - sttLastTextAtMs) < 4000) return false;
+      sttSeenEvents.set(eventKey, now);
+      while (sttSeenEvents.size > 180) {
+        const oldest = sttSeenEvents.keys().next().value;
+        if (!oldest) break;
+        sttSeenEvents.delete(oldest);
+      }
       sttLastText = t;
       sttLastTextAtMs = now;
       return true;
@@ -500,10 +532,12 @@ HTML = r"""<!doctype html>
 		        if (!r.ok) return;
 		        const j = await r.json();
 	        const chatEnabled = !!j?.stt_chat_enabled;
+	        const sttDebug = !!j?.stt_debug;
         const items = Array.isArray(j?.items) ? j.items : [];
 		        for (const item of items) {
 		          const text = String(item?.text || "").trim();
 		          const kind = String(item?.kind || "").trim().toLowerCase();
+		          const ts = Number(item?.ts || 0);
 		          if (kind === "stt_debug") {
 		            const raw = String(item?.text || "").trim();
 		            const normTxt = String(item?.norm || "").trim();
@@ -519,18 +553,34 @@ HTML = r"""<!doctype html>
 		            continue;
 		          }
 		          const cmdRaw = String(item?.cmd || "").trim().toLowerCase();
+		          const source = String(item?.source || "").trim().toLowerCase();
 		          const command = cmdRaw || voiceCommandFromText(text);
 		          if (command) {
 		            sttSending = true;
 		            try {
-		              await runVoiceReaderCommand(command, text);
+		              await runVoiceReaderCommand(command, text, source || "voice_cmd");
+	            } finally {
+	              sttSending = false;
+		            }
+		            break;
+	          }
+		          if (kind === "chat_text") {
+		            if (!shouldAcceptSttText(text, ts)) continue;
+	            if (sendEl.disabled) continue;
+	            sttSending = true;
+	            try {
+	              await sendMessage(text);
+	              if (sttDebug) {
+	                const shown = text.length > 48 ? `${text.slice(0, 48)}…` : text;
+	                await push("assistant", `voice→chat sent: "${shown}"`);
+	              }
 	            } finally {
 	              sttSending = false;
 	            }
 	            break;
-	          }
+		          }
 		          if (!chatEnabled) continue;
-		          if (!shouldAcceptSttText(text)) continue;
+		          if (!shouldAcceptSttText(text, ts)) continue;
 	          if (sendEl.disabled) continue;
 	          sttSending = true;
 	          try {
@@ -908,7 +958,11 @@ HTML = r"""<!doctype html>
 		          stopReaderAuto();
 		          await pauseReaderContinuousSilently();
 		          if (gate?.pausedByVoice) {
-		            await push("assistant", "Pausado por voz.");
+		            const gateDetail = String(gate?.detail || "").toLowerCase();
+		            const source = /typed_interrupt/.test(gateDetail)
+		              ? "typed"
+		              : (/barge_in|voice_any/.test(gateDetail) ? "voice_any" : "voice_cmd");
+		            await push("assistant", pauseAckBySource(source));
 		          } else {
 		            const detail = String(gate?.detail || "tts_unavailable");
 		            await push("assistant", `voz no disponible (${detail}), usá 'modo manual on' o 'continuar' manual`);
