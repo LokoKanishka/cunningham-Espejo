@@ -244,6 +244,7 @@ HTML = r"""<!doctype html>
 	      let sttLastText = "";
 	      let sttLastTextAtMs = 0;
 	      let sttSeenEvents = new Map();
+	      let sttPendingChatTexts = [];
 
 	    function fmtMb(mb) {
 	      if (mb == null || Number.isNaN(mb)) return "?";
@@ -496,7 +497,7 @@ HTML = r"""<!doctype html>
 	      await saveServerHistory();
 	    }
 
-    function shouldAcceptSttText(text, ts = 0) {
+	    function shouldAcceptSttText(text, ts = 0) {
       const t = (text || "").trim();
       if (t.length < 3) return false;
       const now = Date.now();
@@ -517,8 +518,40 @@ HTML = r"""<!doctype html>
       }
       sttLastText = t;
       sttLastTextAtMs = now;
-      return true;
-    }
+	      return true;
+	    }
+
+	    function enqueuePendingSttChatText(text, ts = 0) {
+	      const t = String(text || "").trim();
+	      if (!t) return;
+	      const tsNum = Number(ts);
+	      const key = (Number.isFinite(tsNum) && tsNum > 0)
+	        ? `${Math.round(tsNum * 1000)}|${t}`
+	        : `txt|${t}`;
+	      if (sttPendingChatTexts.some(item => String(item?.key || "") === key)) return;
+	      sttPendingChatTexts.push({ text: t, ts: tsNum, key, enqueuedAt: Date.now() });
+	      if (sttPendingChatTexts.length > 24) {
+	        sttPendingChatTexts = sttPendingChatTexts.slice(-24);
+	      }
+	    }
+
+	    async function flushPendingSttChatText(sttDebug = false) {
+	      if (sttSending || sendEl.disabled) return false;
+	      if (!sttPendingChatTexts.length) return false;
+	      const item = sttPendingChatTexts.shift();
+	      if (!item || !item.text) return false;
+	      sttSending = true;
+	      try {
+	        await sendMessage(item.text);
+	        if (sttDebug) {
+	          const shown = item.text.length > 48 ? `${item.text.slice(0, 48)}…` : item.text;
+	          await push("assistant", `voice->chat sent (queued): "${shown}"`);
+	        }
+	      } finally {
+	        sttSending = false;
+	      }
+	      return true;
+	    }
 
 	    async function pollSttOnce() {
 	      if (!voiceEnabled) return;
@@ -532,8 +565,9 @@ HTML = r"""<!doctype html>
 	        }
 		        if (!r.ok) return;
 		        const j = await r.json();
-	        const chatEnabled = !!j?.stt_chat_enabled;
-	        const sttDebug = !!j?.stt_debug;
+		        const chatEnabled = !!j?.stt_chat_enabled;
+		        const sttDebug = !!j?.stt_debug;
+	        if (await flushPendingSttChatText(sttDebug)) return;
         const items = Array.isArray(j?.items) ? j.items : [];
 		        for (const item of items) {
 		          const text = String(item?.text || "").trim();
@@ -567,7 +601,10 @@ HTML = r"""<!doctype html>
 	          }
 		          if (kind === "chat_text") {
 		            if (!shouldAcceptSttText(text, ts)) continue;
-	            if (sendEl.disabled) continue;
+	            if (sendEl.disabled) {
+	              enqueuePendingSttChatText(text, ts);
+	              continue;
+	            }
 	            sttSending = true;
 	            try {
 	              await sendMessage(text);
@@ -582,7 +619,10 @@ HTML = r"""<!doctype html>
 		          }
 		          if (!chatEnabled) continue;
 		          if (!shouldAcceptSttText(text, ts)) continue;
-	          if (sendEl.disabled) continue;
+	          if (sendEl.disabled) {
+	            enqueuePendingSttChatText(text, ts);
+	            continue;
+	          }
 	          sttSending = true;
 	          try {
 	            await sendMessage(text);
@@ -1066,15 +1106,16 @@ HTML = r"""<!doctype html>
       if (!text && pendingAttachments.length === 0) return;
 
       const slash = parseSlash(text);
-      if (slash?.kind === "new") {
-        stopReaderAuto();
-        sessionId = crypto.randomUUID();
-        localStorage.setItem(SESSION_KEY, sessionId);
-        history = [];
-        draw();
-        await saveServerHistory();
-        if (voiceEnabled) {
-          await claimVoiceOwner();
+	      if (slash?.kind === "new") {
+	        stopReaderAuto();
+	        sessionId = crypto.randomUUID();
+	        localStorage.setItem(SESSION_KEY, sessionId);
+	        history = [];
+	        sttPendingChatTexts = [];
+	        draw();
+	        await saveServerHistory();
+	        if (voiceEnabled) {
+	          await claimVoiceOwner();
         }
         inputEl.value = "";
         return;
