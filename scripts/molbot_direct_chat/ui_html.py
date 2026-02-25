@@ -245,6 +245,10 @@ HTML = r"""<!doctype html>
 	      let sttLastTextAtMs = 0;
 	      let sttSeenEvents = new Map();
 	      let sttPendingChatTexts = [];
+	      let chatFeedTimer = null;
+	      let chatFeedBusy = false;
+	      let chatFeedEnabled = false;
+	      let lastChatSeq = 0;
 
 	    function fmtMb(mb) {
 	      if (mb == null || Number.isNaN(mb)) return "?";
@@ -553,6 +557,53 @@ HTML = r"""<!doctype html>
 	      return true;
 	    }
 
+	    function setChatFeedEnabled(enabled) {
+	      const on = !!enabled;
+	      chatFeedEnabled = on;
+	      if (!on) {
+	        if (chatFeedTimer) {
+	          clearInterval(chatFeedTimer);
+	          chatFeedTimer = null;
+	        }
+	        return;
+	      }
+	      if (chatFeedTimer) return;
+	      chatFeedTimer = setInterval(() => {
+	        pollChatFeedOnce();
+	      }, 450);
+	      pollChatFeedOnce();
+	    }
+
+	    async function pollChatFeedOnce() {
+	      if (!chatFeedEnabled || chatFeedBusy) return;
+	      chatFeedBusy = true;
+	      try {
+	        const q = new URLSearchParams({
+	          session_id: sessionId,
+	          after: String(Math.max(0, Number(lastChatSeq || 0))),
+	          limit: "120",
+	        });
+	        const r = await fetch(`/api/chat/poll?${q.toString()}`);
+	        if (!r.ok) return;
+	        const j = await r.json();
+	        const items = Array.isArray(j?.items) ? j.items : [];
+	        for (const item of items) {
+	          const seq = Number(item?.seq || 0);
+	          if (Number.isFinite(seq) && seq > lastChatSeq) lastChatSeq = seq;
+	          const role = String(item?.role || "").trim().toLowerCase();
+	          const content = String(item?.content || "").trim();
+	          if (!content) continue;
+	          if (role !== "user" && role !== "assistant") continue;
+	          const last = history.length ? history[history.length - 1] : null;
+	          if (last && String(last.role || "") === role && String(last.content || "") === content) continue;
+	          await push(role, content, false);
+	        }
+	        const seqNow = Number(j?.seq || 0);
+	        if (Number.isFinite(seqNow) && seqNow > lastChatSeq) lastChatSeq = seqNow;
+	      } catch {}
+	      chatFeedBusy = false;
+	    }
+
 	    async function pollSttOnce() {
 	      if (!voiceEnabled) return;
 	      if (sttSending) return;
@@ -565,9 +616,10 @@ HTML = r"""<!doctype html>
 	        }
 		        if (!r.ok) return;
 		        const j = await r.json();
-		        const chatEnabled = !!j?.stt_chat_enabled;
-		        const sttDebug = !!j?.stt_debug;
+	        const chatEnabled = !!j?.stt_chat_enabled;
+	        const sttDebug = !!j?.stt_debug;
 	        const serverBridgeEnabled = !!j?.stt_server_chat_bridge_enabled;
+	        setChatFeedEnabled(voiceEnabled && serverBridgeEnabled);
 	        if (await flushPendingSttChatText(sttDebug)) return;
         const items = Array.isArray(j?.items) ? j.items : [];
 		        for (const item of items) {
@@ -662,17 +714,20 @@ HTML = r"""<!doctype html>
       } catch {}
     }
 
-    function setVoiceVisual(enabled) {
-      voiceEnabled = !!enabled;
+	    function setVoiceVisual(enabled) {
+	      voiceEnabled = !!enabled;
       voiceToggleEl.dataset.on = voiceEnabled ? "1" : "0";
       voiceToggleTextEl.textContent = voiceEnabled ? "VOZ ON" : "VOZ OFF";
       localStorage.setItem("molbot_voice_enabled", voiceEnabled ? "1" : "0");
-      if (voiceEnabled) {
-        startSttPolling();
-      } else {
-        stopSttPolling();
-      }
-    }
+	      if (voiceEnabled) {
+	        startSttPolling();
+	      } else {
+	        stopSttPolling();
+	      }
+	      if (!voiceEnabled) {
+	        setChatFeedEnabled(false);
+	      }
+	    }
 
     function markSpeaking(active) {
       if (active) {
@@ -682,14 +737,15 @@ HTML = r"""<!doctype html>
       voiceToggleEl.classList.remove("speaking");
     }
 
-    async function syncVoiceState() {
-      try {
-        const r = await fetch("/api/voice");
-        const j = await r.json();
-        setVoiceVisual(!!j.enabled);
-        if (j.enabled && String(j.stt_owner_session_id || "").trim() === "" && sessionId !== "default") {
-          await claimVoiceOwner();
-        }
+	    async function syncVoiceState() {
+	      try {
+	        const r = await fetch("/api/voice");
+	        const j = await r.json();
+	        setVoiceVisual(!!j.enabled);
+	        setChatFeedEnabled(!!j.enabled && !!j.stt_server_chat_bridge_enabled);
+	        if (j.enabled && String(j.stt_owner_session_id || "").trim() === "" && sessionId !== "default") {
+	          await claimVoiceOwner();
+	        }
         return;
       } catch {}
       const ls = localStorage.getItem("molbot_voice_enabled");
@@ -723,13 +779,15 @@ HTML = r"""<!doctype html>
       chatEl.scrollTop = chatEl.scrollHeight;
     }
 
-    async function push(role, content) {
-      if (shouldHideNoiseLine(content)) return;
-      history.push({ role, content });
-      history = history.slice(-200);
-      draw();
-      await saveServerHistory();
-    }
+	    async function push(role, content, persist = true) {
+	      if (shouldHideNoiseLine(content)) return;
+	      history.push({ role, content });
+	      history = history.slice(-200);
+	      draw();
+	      if (persist) {
+	        await saveServerHistory();
+	      }
+	    }
 
     function startAssistantMessage() {
       history.push({ role: "assistant", content: "" });
@@ -1081,7 +1139,7 @@ HTML = r"""<!doctype html>
       } catch {}
     }
 
-    async function loadServerHistory() {
+	    async function loadServerHistory() {
       const sel = selectedModel();
       const q = new URLSearchParams({
         session: sessionId,
@@ -1092,11 +1150,22 @@ HTML = r"""<!doctype html>
         const r = await fetch(`/api/history?${q.toString()}`);
         const j = await r.json();
         history = Array.isArray(j.history) ? j.history : [];
-      } catch {
-        history = [];
-      }
-      draw();
-    }
+	      } catch {
+	        history = [];
+	      }
+	      draw();
+	      try {
+	        const q = new URLSearchParams({ session_id: sessionId, after: "999999999", limit: "1" });
+	        const r = await fetch(`/api/chat/poll?${q.toString()}`);
+	        if (r.ok) {
+	          const j = await r.json();
+	          const seqNow = Number(j?.seq || 0);
+	          if (Number.isFinite(seqNow) && seqNow >= 0) {
+	            lastChatSeq = seqNow;
+	          }
+	        }
+	      } catch {}
+	    }
 
     async function recoverModelSelection(errorCode) {
       const msg = errorCode === "MISSING_MODEL"
@@ -1114,14 +1183,15 @@ HTML = r"""<!doctype html>
       if (!text && pendingAttachments.length === 0) return;
 
       const slash = parseSlash(text);
-	      if (slash?.kind === "new") {
-	        stopReaderAuto();
-	        sessionId = crypto.randomUUID();
-	        localStorage.setItem(SESSION_KEY, sessionId);
-	        history = [];
-	        sttPendingChatTexts = [];
-	        draw();
-	        await saveServerHistory();
+		      if (slash?.kind === "new") {
+		        stopReaderAuto();
+		        sessionId = crypto.randomUUID();
+		        localStorage.setItem(SESSION_KEY, sessionId);
+		        history = [];
+		        sttPendingChatTexts = [];
+		        lastChatSeq = 0;
+		        draw();
+		        await saveServerHistory();
 	        if (voiceEnabled) {
 	          await claimVoiceOwner();
         }

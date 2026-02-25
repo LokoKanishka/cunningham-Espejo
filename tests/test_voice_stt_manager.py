@@ -2,7 +2,9 @@ import os
 import io
 import sys
 import time
+import tempfile
 import unittest
+from pathlib import Path
 from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
 
@@ -353,6 +355,27 @@ class TestVoiceSttManager(unittest.TestCase):
         self.assertFalse(direct_chat._voice_chat_should_process("sess_a", "hola", ts=10.1))
         self.assertTrue(direct_chat._voice_chat_should_process("sess_a", "hola", ts=10.2))
         self.assertTrue(direct_chat._voice_chat_should_process("sess_b", "hola", ts=10.1))
+
+    def test_chat_events_poll_returns_incremental_items(self) -> None:
+        prev_history_dir = direct_chat.HISTORY_DIR
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                direct_chat.HISTORY_DIR = Path(td)
+                direct_chat.HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+                direct_chat._chat_events_reset("sess_poll")
+                first = direct_chat._chat_events_append("sess_poll", role="user", content="hola", source="stt_voice", ts=1.0)
+                second = direct_chat._chat_events_append("sess_poll", role="assistant", content="ok", source="model", ts=1.1)
+                all_items = direct_chat._chat_events_poll("sess_poll", after_seq=0, limit=20)
+                self.assertEqual(int(all_items.get("seq", 0) or 0), int(second.get("seq", 0) or 0))
+                self.assertEqual(len(all_items.get("items", [])), 2)
+                inc = direct_chat._chat_events_poll("sess_poll", after_seq=int(first.get("seq", 0) or 0), limit=20)
+                self.assertEqual(len(inc.get("items", [])), 1)
+                item = inc.get("items", [])[0]
+                self.assertEqual(str(item.get("role", "")), "assistant")
+                self.assertEqual(str(item.get("content", "")), "ok")
+                self.assertEqual(str(item.get("source", "")), "model")
+        finally:
+            direct_chat.HISTORY_DIR = prev_history_dir
 
     def test_stt_manager_status_reports_runtime(self) -> None:
         mgr = direct_chat.STTManager()

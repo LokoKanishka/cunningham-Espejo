@@ -137,6 +137,7 @@ _VOICE_CHAT_BRIDGE_THREAD: threading.Thread | None = None
 _VOICE_CHAT_BRIDGE_STOP = threading.Event()
 _VOICE_CHAT_DEDUPE_LOCK = threading.Lock()
 _VOICE_CHAT_DEDUPE_BY_SESSION: dict[str, dict[str, float]] = {}
+_CHAT_EVENTS_LOCK = threading.Lock()
 
 
 def _bargein_config() -> dict:
@@ -624,6 +625,9 @@ def _default_voice_state() -> dict:
         ),
         "stt_barge_any": _env_flag("DIRECT_CHAT_STT_BARGE_ANY", False),
         "stt_barge_any_cooldown_ms": max(300, _int_env("DIRECT_CHAT_STT_BARGE_ANY_COOLDOWN_MS", 1200)),
+        "stt_preamp_gain": max(0.05, float(os.environ.get("DIRECT_CHAT_STT_PREAMP_GAIN", "1.0") or 1.0)),
+        "stt_agc_enabled": _env_flag("DIRECT_CHAT_STT_AGC_ENABLED", False),
+        "stt_agc_target_rms": max(0.01, min(0.30, float(os.environ.get("DIRECT_CHAT_STT_AGC_TARGET_RMS", "0.06") or 0.06))),
     }
 
 
@@ -691,6 +695,19 @@ def _load_voice_state() -> dict:
                     )
                 except Exception:
                     state["stt_barge_any_cooldown_ms"] = max(300, int(state.get("stt_barge_any_cooldown_ms", 1200)))
+                try:
+                    state["stt_preamp_gain"] = max(0.05, float(raw.get("stt_preamp_gain", state.get("stt_preamp_gain", 1.0))))
+                except Exception:
+                    state["stt_preamp_gain"] = max(0.05, float(state.get("stt_preamp_gain", 1.0)))
+                if "stt_agc_enabled" in raw:
+                    state["stt_agc_enabled"] = bool(raw.get("stt_agc_enabled"))
+                try:
+                    state["stt_agc_target_rms"] = max(
+                        0.01,
+                        min(0.30, float(raw.get("stt_agc_target_rms", state.get("stt_agc_target_rms", 0.06)))),
+                    )
+                except Exception:
+                    state["stt_agc_target_rms"] = max(0.01, min(0.30, float(state.get("stt_agc_target_rms", 0.06))))
     except Exception:
         pass
     # Safety pass for older persisted states.
@@ -1104,6 +1121,15 @@ class STTManager:
         segment_rms_threshold = _stt_segment_rms_threshold_from_state(state)
         selected_device = self._selected_stt_device()
         chat_mode_enabled = bool(self._chat_enabled())
+        try:
+            preamp_gain = max(0.05, float(state.get("stt_preamp_gain", os.environ.get("DIRECT_CHAT_STT_PREAMP_GAIN", "1.0"))))
+        except Exception:
+            preamp_gain = 1.0
+        agc_enabled = bool(state.get("stt_agc_enabled", _env_flag("DIRECT_CHAT_STT_AGC_ENABLED", False)))
+        try:
+            agc_target_rms = max(0.01, min(0.30, float(state.get("stt_agc_target_rms", os.environ.get("DIRECT_CHAT_STT_AGC_TARGET_RMS", "0.06")))))
+        except Exception:
+            agc_target_rms = 0.06
         cfg = stt_local.STTConfig(
             sample_rate=max(8000, self._env_int("DIRECT_CHAT_STT_SAMPLE_RATE", 16000)),
             channels=max(1, self._env_int("DIRECT_CHAT_STT_CHANNELS", 1)),
@@ -1122,6 +1148,12 @@ class STTManager:
             ),
             segment_hangover_ms=max(0, self._env_int("DIRECT_CHAT_STT_SEGMENT_HANGOVER_MS", 250)),
             chat_mode=chat_mode_enabled,
+            preamp_gain=float(preamp_gain),
+            agc_enabled=bool(agc_enabled),
+            agc_target_rms=float(agc_target_rms),
+            agc_max_gain=max(1.0, self._env_float("DIRECT_CHAT_STT_AGC_MAX_GAIN", 6.0)),
+            agc_attack=max(0.01, min(1.0, self._env_float("DIRECT_CHAT_STT_AGC_ATTACK", 0.35))),
+            agc_release=max(0.01, min(1.0, self._env_float("DIRECT_CHAT_STT_AGC_RELEASE", 0.08))),
             language=str(os.environ.get("DIRECT_CHAT_STT_LANGUAGE", "es")).strip() or "es",
             model=str(os.environ.get("DIRECT_CHAT_STT_MODEL", "small")).strip() or "small",
             fw_device=str(os.environ.get("DIRECT_CHAT_STT_FW_DEVICE", "cpu")).strip() or "cpu",
@@ -1466,6 +1498,15 @@ class STTManager:
             stt_segment_rms_threshold = _stt_segment_rms_threshold_from_state(state)
             stt_barge_rms_threshold = _stt_barge_rms_threshold_from_state(state)
             stt_legacy_rms_threshold = _stt_legacy_rms_threshold_from_state(state)
+            try:
+                stt_preamp_gain = max(0.05, float(state.get("stt_preamp_gain", 1.0)))
+            except Exception:
+                stt_preamp_gain = 1.0
+            stt_agc_enabled = bool(state.get("stt_agc_enabled", False))
+            try:
+                stt_agc_target_rms = max(0.01, min(0.30, float(state.get("stt_agc_target_rms", 0.06))))
+            except Exception:
+                stt_agc_target_rms = 0.06
             effective_seg_thr = float(self._effective_seg_thr or stt_segment_rms_threshold)
             if effective_seg_thr <= 0.0:
                 effective_seg_thr = float(stt_segment_rms_threshold)
@@ -1530,6 +1571,9 @@ class STTManager:
                 "stt_debug": bool(self._debug_enabled()),
                 "stt_barge_any": bool(self._barge_any_enabled()),
                 "stt_barge_any_cooldown_ms": int(self._barge_any_cooldown_ms()),
+                "stt_preamp_gain": float(stt_preamp_gain),
+                "stt_agc_enabled": bool(stt_agc_enabled),
+                "stt_agc_target_rms": float(stt_agc_target_rms),
                 "stt_server_chat_bridge_enabled": bool(_voice_server_chat_bridge_enabled() and _DIRECT_CHAT_HTTP_PORT > 0),
             }
 
@@ -1732,6 +1776,9 @@ def _set_stt_runtime_config(
     stt_barge_rms_threshold: float | None = None,
     stt_barge_any: bool | None = None,
     stt_barge_any_cooldown_ms: int | None = None,
+    stt_preamp_gain: float | None = None,
+    stt_agc_enabled: bool | None = None,
+    stt_agc_target_rms: float | None = None,
 ) -> dict:
     with _VOICE_LOCK:
         state = _load_voice_state()
@@ -1764,6 +1811,12 @@ def _set_stt_runtime_config(
             state["stt_barge_any"] = bool(stt_barge_any)
         if stt_barge_any_cooldown_ms is not None:
             state["stt_barge_any_cooldown_ms"] = max(300, int(stt_barge_any_cooldown_ms))
+        if stt_preamp_gain is not None:
+            state["stt_preamp_gain"] = max(0.05, float(stt_preamp_gain))
+        if stt_agc_enabled is not None:
+            state["stt_agc_enabled"] = bool(stt_agc_enabled)
+        if stt_agc_target_rms is not None:
+            state["stt_agc_target_rms"] = max(0.01, min(0.30, float(stt_agc_target_rms)))
         state["stt_rms_threshold"] = _stt_legacy_rms_threshold_from_state(state)
         state["stt_segment_rms_threshold"] = _stt_segment_rms_threshold_from_state(state)
         state["stt_barge_rms_threshold"] = _stt_barge_rms_threshold_from_state(state)
@@ -4475,6 +4528,141 @@ def _history_path(session_id: str, model: str | None = None, backend: str | None
     return HISTORY_DIR / f"{_history_scope_key(session_id, model=model, backend=backend)}.json"
 
 
+def _chat_events_path(session_id: str) -> Path:
+    sid = _safe_session_id(session_id or "default")
+    return HISTORY_DIR / f"{sid}__chat_events.json"
+
+
+def _load_chat_events_state(session_id: str) -> dict:
+    p = _chat_events_path(session_id)
+    state = {"seq": 0, "items": []}
+    if not p.exists():
+        return state
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8") or "{}")
+    except Exception:
+        return state
+    if not isinstance(raw, dict):
+        return state
+    try:
+        seq = max(0, int(raw.get("seq", 0) or 0))
+    except Exception:
+        seq = 0
+    items_raw = raw.get("items", [])
+    items: list[dict] = []
+    if isinstance(items_raw, list):
+        for item in items_raw[-500:]:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role", "")).strip().lower()
+            content = item.get("content")
+            if role not in ("user", "assistant", "system") or not isinstance(content, str):
+                continue
+            try:
+                item_seq = max(0, int(item.get("seq", 0) or 0))
+            except Exception:
+                item_seq = 0
+            if item_seq <= 0:
+                continue
+            items.append(
+                {
+                    "seq": int(item_seq),
+                    "role": role,
+                    "content": str(content),
+                    "source": str(item.get("source", "")).strip(),
+                    "ts": float(item.get("ts", 0.0) or 0.0),
+                }
+            )
+    if items:
+        seq = max(seq, int(items[-1].get("seq", 0) or 0))
+    return {"seq": int(seq), "items": items[-500:]}
+
+
+def _save_chat_events_state(session_id: str, state: dict) -> None:
+    p = _chat_events_path(session_id)
+    seq = 0
+    items: list[dict] = []
+    if isinstance(state, dict):
+        try:
+            seq = max(0, int(state.get("seq", 0) or 0))
+        except Exception:
+            seq = 0
+        src_items = state.get("items", [])
+        if isinstance(src_items, list):
+            for item in src_items[-500:]:
+                if not isinstance(item, dict):
+                    continue
+                role = str(item.get("role", "")).strip().lower()
+                content = item.get("content")
+                if role not in ("user", "assistant", "system") or not isinstance(content, str):
+                    continue
+                try:
+                    item_seq = max(0, int(item.get("seq", 0) or 0))
+                except Exception:
+                    continue
+                items.append(
+                    {
+                        "seq": int(item_seq),
+                        "role": role,
+                        "content": str(content),
+                        "source": str(item.get("source", "")).strip(),
+                        "ts": float(item.get("ts", 0.0) or 0.0),
+                    }
+                )
+    payload = {"seq": int(seq), "items": items[-500:]}
+    p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _chat_events_append(session_id: str, role: str, content: str, source: str = "", ts: float | None = None) -> dict:
+    sid = _safe_session_id(session_id or "default")
+    role_norm = str(role or "").strip().lower()
+    if role_norm not in ("user", "assistant", "system"):
+        role_norm = "assistant"
+    text = str(content or "").strip()
+    if not text:
+        return {}
+    now_ts = float(ts) if isinstance(ts, (int, float)) and float(ts) > 0.0 else time.time()
+    with _CHAT_EVENTS_LOCK:
+        state = _load_chat_events_state(sid)
+        seq = int(state.get("seq", 0) or 0) + 1
+        item = {
+            "seq": int(seq),
+            "role": role_norm,
+            "content": text,
+            "source": str(source or "").strip(),
+            "ts": float(now_ts),
+        }
+        items = state.get("items", [])
+        if not isinstance(items, list):
+            items = []
+        items.append(item)
+        state["seq"] = int(seq)
+        state["items"] = items[-500:]
+        _save_chat_events_state(sid, state)
+    return item
+
+
+def _chat_events_poll(session_id: str, after_seq: int = 0, limit: int = 120) -> dict:
+    sid = _safe_session_id(session_id or "default")
+    lim = max(1, min(400, int(limit or 120)))
+    after = max(0, int(after_seq or 0))
+    with _CHAT_EVENTS_LOCK:
+        state = _load_chat_events_state(sid)
+    items = state.get("items", [])
+    if not isinstance(items, list):
+        items = []
+    fresh = [it for it in items if isinstance(it, dict) and int(it.get("seq", 0) or 0) > after]
+    if len(fresh) > lim:
+        fresh = fresh[-lim:]
+    return {"session_id": sid, "seq": int(state.get("seq", 0) or 0), "after": int(after), "items": fresh}
+
+
+def _chat_events_reset(session_id: str) -> None:
+    sid = _safe_session_id(session_id or "default")
+    with _CHAT_EVENTS_LOCK:
+        _save_chat_events_state(sid, {"seq": 0, "items": []})
+
+
 def _load_history(session_id: str, model: str | None = None, backend: str | None = None) -> list:
     p = _history_path(session_id, model=model, backend=backend)
     if not p.exists():
@@ -6027,6 +6215,31 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         _set_stt_runtime_config(stt_rms_threshold=thr)
         return {"reply": f"Listo: umbral STT unificado en {thr:.4f} (segmentación + barge).", "no_auto_tts": True}
 
+    match_stt_gain = re.search(r"\bstt\s+(?:ganancia|gain)\s+([0-9]+(?:\.[0-9]+)?)", normalized)
+    if match_stt_gain:
+        try:
+            gain = max(0.05, float(match_stt_gain.group(1)))
+        except Exception:
+            gain = 1.0
+        _set_stt_runtime_config(stt_preamp_gain=gain)
+        return {"reply": f"Listo: ganancia STT en {gain:.2f}.", "no_auto_tts": True}
+
+    if any(k in normalized for k in ("stt agc on", "agc stt on", "stt auto ganancia on")):
+        _set_stt_runtime_config(stt_agc_enabled=True)
+        return {"reply": "Listo: STT AGC activado.", "no_auto_tts": True}
+    if any(k in normalized for k in ("stt agc off", "agc stt off", "stt auto ganancia off")):
+        _set_stt_runtime_config(stt_agc_enabled=False)
+        return {"reply": "Listo: STT AGC desactivado.", "no_auto_tts": True}
+
+    match_stt_agc_target = re.search(r"\bstt\s+agc\s+(?:target|objetivo)\s+([0-9]+(?:\.[0-9]+)?)", normalized)
+    if match_stt_agc_target:
+        try:
+            target = max(0.01, min(0.30, float(match_stt_agc_target.group(1))))
+        except Exception:
+            target = 0.06
+        _set_stt_runtime_config(stt_agc_target_rms=target)
+        return {"reply": f"Listo: objetivo AGC STT en {target:.3f}.", "no_auto_tts": True}
+
     if any(
         k in normalized
         for k in (
@@ -6090,6 +6303,9 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
                 f"thr_eff={float(st.get('stt_effective_seg_thr', st.get('stt_segment_rms_threshold', 0.0)) or 0.0):.4f}, "
                 f"thr_off={float(st.get('stt_effective_seg_thr_off', 0.0) or 0.0):.4f}, "
                 f"thr_barge={float(st.get('stt_barge_rms_threshold', 0.0) or 0.0):.4f}, "
+                f"gain={float(st.get('stt_preamp_gain', 1.0) or 1.0):.2f}, "
+                f"agc={bool(st.get('stt_agc_enabled', False))}, "
+                f"agc_target={float(st.get('stt_agc_target_rms', 0.06) or 0.06):.3f}, "
                 f"min_seg={int(st.get('stt_effective_min_segment_ms', 0) or 0)}, "
                 f"speech_state=in:{bool(st.get('stt_in_speech', False))}|hang:{int(st.get('stt_speech_hangover_ms', 0) or 0)}ms, "
                 f"emit={int(st.get('stt_emit_count', 0) or 0)}, "
@@ -7500,6 +7716,15 @@ class Handler(BaseHTTPRequestHandler):
             stt_barge_any_cooldown = max(300, int(state.get("stt_barge_any_cooldown_ms", 1200)))
         except Exception:
             stt_barge_any_cooldown = 1200
+        try:
+            stt_preamp_gain = max(0.05, float(state.get("stt_preamp_gain", 1.0)))
+        except Exception:
+            stt_preamp_gain = 1.0
+        stt_agc_enabled = bool(state.get("stt_agc_enabled", False))
+        try:
+            stt_agc_target_rms = max(0.01, min(0.30, float(state.get("stt_agc_target_rms", 0.06))))
+        except Exception:
+            stt_agc_target_rms = 0.06
         return {
             "enabled": enabled,
             "speaker": str(state.get("speaker", "")),
@@ -7515,6 +7740,9 @@ class Handler(BaseHTTPRequestHandler):
             "stt_barge_rms_threshold": float(stt_barge_rms_threshold),
             "stt_barge_any": bool(state.get("stt_barge_any", False)),
             "stt_barge_any_cooldown_ms": int(stt_barge_any_cooldown),
+            "stt_preamp_gain": float(stt_preamp_gain),
+            "stt_agc_enabled": bool(stt_agc_enabled),
+            "stt_agc_target_rms": float(stt_agc_target_rms),
             "stt_server_chat_bridge_enabled": bool(_voice_server_chat_bridge_enabled() and _DIRECT_CHAT_HTTP_PORT > 0),
             "provider": "alltalk",
             "tts_backend": "alltalk",
@@ -7622,6 +7850,21 @@ class Handler(BaseHTTPRequestHandler):
                     "history": hist,
                 },
             )
+            return
+
+        if path == "/api/chat/poll":
+            query = parse_qs(parsed.query)
+            sid = _safe_session_id(str(query.get("session_id", query.get("session", ["default"]))[0]))
+            try:
+                after = int(str(query.get("after", ["0"])[0]).strip() or "0")
+            except Exception:
+                after = 0
+            try:
+                limit = int(str(query.get("limit", ["120"])[0]).strip() or "120")
+            except Exception:
+                limit = 120
+            out = _chat_events_poll(sid, after_seq=after, limit=limit)
+            self._json(200, {"ok": True, **out})
             return
 
         if path == "/api/metrics":
@@ -7771,6 +8014,9 @@ class Handler(BaseHTTPRequestHandler):
                     "emit_count": int(stt_status.get("stt_emit_count", 0) or 0),
                     "voice_text_committed": int(stt_status.get("voice_text_committed", 0) or 0),
                     "stt_chat_commit_total": int(stt_status.get("stt_chat_commit_total", 0) or 0),
+                    "stt_preamp_gain": float(stt_status.get("stt_preamp_gain", 1.0) or 1.0),
+                    "stt_agc_enabled": bool(stt_status.get("stt_agc_enabled", False)),
+                    "stt_agc_target_rms": float(stt_status.get("stt_agc_target_rms", 0.06) or 0.06),
                     "drop_count": int(stt_status.get("items_dropped", 0) or 0),
                     "drop_reason": str(stt_status.get("stt_drop_reason", "")),
                 },
@@ -8093,6 +8339,21 @@ class Handler(BaseHTTPRequestHandler):
                         )
                     except Exception:
                         pass
+                if "stt_preamp_gain" in payload:
+                    try:
+                        state["stt_preamp_gain"] = max(0.05, float(payload.get("stt_preamp_gain", state.get("stt_preamp_gain", 1.0))))
+                    except Exception:
+                        pass
+                if "stt_agc_enabled" in payload:
+                    state["stt_agc_enabled"] = bool(payload.get("stt_agc_enabled"))
+                if "stt_agc_target_rms" in payload:
+                    try:
+                        state["stt_agc_target_rms"] = max(
+                            0.01,
+                            min(0.30, float(payload.get("stt_agc_target_rms", state.get("stt_agc_target_rms", 0.06)))),
+                        )
+                    except Exception:
+                        pass
                 state["stt_rms_threshold"] = _stt_legacy_rms_threshold_from_state(state)
                 state["stt_segment_rms_threshold"] = _stt_segment_rms_threshold_from_state(state)
                 state["stt_barge_rms_threshold"] = _stt_barge_rms_threshold_from_state(state)
@@ -8109,6 +8370,9 @@ class Handler(BaseHTTPRequestHandler):
                     or "stt_barge_rms_threshold" in payload
                     or "stt_barge_any" in payload
                     or "stt_barge_any_cooldown_ms" in payload
+                    or "stt_preamp_gain" in payload
+                    or "stt_agc_enabled" in payload
+                    or "stt_agc_target_rms" in payload
                 ):
                     _STT_MANAGER.restart()
                 self._json(
@@ -8138,6 +8402,8 @@ class Handler(BaseHTTPRequestHandler):
                     if isinstance(item, dict) and item.get("role") in ("user", "assistant") and isinstance(item.get("content"), str):
                         safe.append({"role": item["role"], "content": item["content"]})
                 _save_history(sid, safe, model=model, backend=model_backend)
+                if not safe:
+                    _chat_events_reset(sid)
                 self._json(200, {"ok": True, "session_id": sid, "model": model, "model_backend": model_backend})
             except Exception as e:
                 self._json(500, {"error": str(e)})
@@ -8161,6 +8427,7 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     voice_item_ts = 0.0
             is_voice_origin = bool(source_tag.startswith("voice_") or voice_item_ts > 0.0)
+            user_msg_source = "stt_voice" if is_voice_origin else "ui_text"
             if is_voice_origin and message and (not _voice_chat_should_process(session_id, message, ts=voice_item_ts)):
                 if self.path == "/api/chat/stream":
                     self.send_response(200)
@@ -8354,6 +8621,22 @@ class Handler(BaseHTTPRequestHandler):
                         "Reformulá en un paso más concreto (por ejemplo: "
                         "'buscá X en YouTube' o 'abrí Y')."
                     )
+                merged = []
+                if isinstance(history, list):
+                    for item in history[-80:]:
+                        if isinstance(item, dict) and item.get("role") in ("user", "assistant") and isinstance(item.get("content"), str):
+                            merged.append({"role": item["role"], "content": item["content"]})
+                merged.append({"role": "user", "content": message})
+                merged.append({"role": "assistant", "content": full})
+                _save_history(session_id, merged, model=model, backend=resolved_backend)
+                _chat_events_append(
+                    session_id,
+                    role="user",
+                    content=message,
+                    source=user_msg_source,
+                    ts=voice_item_ts if is_voice_origin else time.time(),
+                )
+                _chat_events_append(session_id, role="assistant", content=full, source="model", ts=time.time())
                 _maybe_speak_reply(full, allowed_tools)
                 step = 18
                 for i in range(0, len(full), step):
@@ -8397,6 +8680,14 @@ class Handler(BaseHTTPRequestHandler):
             merged.append({"role": "user", "content": message})
             merged.append({"role": "assistant", "content": reply})
             _save_history(session_id, merged, model=model, backend=resolved_backend)
+            _chat_events_append(
+                session_id,
+                role="user",
+                content=message,
+                source=user_msg_source,
+                ts=voice_item_ts if is_voice_origin else time.time(),
+            )
+            _chat_events_append(session_id, role="assistant", content=reply, source="model", ts=time.time())
 
             self._json(
                 200,
@@ -8405,6 +8696,7 @@ class Handler(BaseHTTPRequestHandler):
                     "raw": response_data,
                     "model": model,
                     "model_backend": resolved_backend,
+                    "chat_seq": int(_chat_events_poll(session_id, after_seq=0, limit=1).get("seq", 0) or 0),
                 },
             )
         except HTTPError as e:
