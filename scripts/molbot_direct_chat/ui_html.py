@@ -263,20 +263,31 @@ HTML = r"""<!doctype html>
 	        let sttLabel = "off";
 	        if (sttRes.ok) {
 	          const sj = await sttRes.json();
-	          const rms = Number(sj?.rms || 0).toFixed(3);
-	          const thr = Number(sj?.threshold || 0).toFixed(3);
+	          const rmsRaw = Number(sj?.rms ?? sj?.stt_rms_current ?? sj?.stt_rms ?? 0);
+	          const rmsVal = Number.isFinite(rmsRaw) ? rmsRaw : 0;
+	          const thrRaw = Number(sj?.threshold ?? sj?.stt_threshold ?? sj?.stt_rms_threshold);
+	          const hasThr = Number.isFinite(thrRaw) && thrRaw > 0;
+	          let rmsPart = `rms ${rmsVal.toFixed(4)}`;
+	          if (hasThr) rmsPart += `/${thrRaw.toFixed(4)}`;
 	          const inSpeech = !!sj?.in_speech;
 	          const noAudio = !!sj?.no_audio_input;
 	          const noSpeech = !!sj?.no_speech_detected;
-	          const vadPct = Math.round(Number(sj?.vad_true_ratio || 0) * 100);
+	          let vadPctRaw = 0;
+	          if (sj?.vad_true != null) {
+	            vadPctRaw = Number(sj?.vad_true);
+	          } else if (sj?.vad_true_ratio != null) {
+	            vadPctRaw = Number(sj?.vad_true_ratio) * 100;
+	          }
+	          if (!Number.isFinite(vadPctRaw)) vadPctRaw = 0;
+	          const vadPct = Math.round(vadPctRaw);
 	          const segMs = Math.round(Number(sj?.last_segment_ms || 0));
 	          const silMs = Math.round(Number(sj?.silence_ms || 0));
 	          if (noAudio) {
-	            sttLabel = `NO_AUDIO rms ${rms}/${thr}`;
+	            sttLabel = `NO_AUDIO ${rmsPart}`;
 	          } else if (noSpeech) {
-	            sttLabel = `NO_SPEECH vad ${vadPct}% seg ${segMs}ms sil ${silMs}ms`;
+	            sttLabel = `${rmsPart} NO_SPEECH vad ${vadPct}% seg ${segMs}ms sil ${silMs}ms`;
 	          } else {
-	            sttLabel = `${inSpeech ? "voz" : "sil"} vad ${vadPct}% seg ${segMs}ms sil ${silMs}ms`;
+	            sttLabel = `${rmsPart} ${inSpeech ? "voz" : "sil"} vad ${vadPct}% seg ${segMs}ms sil ${silMs}ms`;
 	          }
 	        }
 
@@ -393,6 +404,9 @@ HTML = r"""<!doctype html>
 	        t === "detenete" ||
 	        t === "detente" ||
 	        t === "pausa" ||
+	        t === "pauza" ||
+	        t === "posa" ||
+	        t === "poza" ||
 	        t === "pausa lectura" ||
 	        t === "pausar lectura" ||
 	        t === "detener lectura" ||
@@ -401,7 +415,7 @@ HTML = r"""<!doctype html>
 	        t === "stop" ||
 	        t === "stop lectura"
 	      ) return "pause";
-	      if (/^(detenete|detente|pausa|pausa lectura|pausar lectura|detener lectura|parar lectura|basta|stop)\b/i.test(t)) {
+	      if (/^(detenete|detente|pausa|pauza|posa|poza|pausa lectura|pausar lectura|detener lectura|parar lectura|basta|stop)\b/i.test(t)) {
 	        return "pause";
 	      }
 	      if (
@@ -483,31 +497,48 @@ HTML = r"""<!doctype html>
 	          await claimVoiceOwner();
 	          return;
 	        }
-	        if (!r.ok) return;
-	        const j = await r.json();
+		        if (!r.ok) return;
+		        const j = await r.json();
+	        const chatEnabled = !!j?.stt_chat_enabled;
         const items = Array.isArray(j?.items) ? j.items : [];
-	        for (const item of items) {
-	          const text = String(item?.text || "").trim();
-	          const kind = String(item?.kind || "").trim().toLowerCase();
-	          if (kind === "stt_debug") {
-	            const raw = String(item?.text || "").trim();
-	            const normTxt = String(item?.norm || "").trim();
-	            const reason = String(item?.reason || "non_command");
-	            await push("assistant", `STT oyó: "${raw || "-"}" (norm="${normTxt || "-"}", ${reason}).`);
-	            continue;
-	          }
-	          if (!shouldAcceptSttText(text)) continue;
-	          const cmdRaw = String(item?.cmd || "").trim().toLowerCase();
-	          const command = cmdRaw || voiceCommandFromText(text);
-	          if (command) {
-	            sttSending = true;
-	            try {
-	              await runVoiceReaderCommand(command, text);
+		        for (const item of items) {
+		          const text = String(item?.text || "").trim();
+		          const kind = String(item?.kind || "").trim().toLowerCase();
+		          if (kind === "stt_debug") {
+		            const raw = String(item?.text || "").trim();
+		            const normTxt = String(item?.norm || "").trim();
+		            const reason = String(item?.reason || "non_command");
+		            const noisyReasons = new Set([
+		              "voice_any_barge_cooldown",
+		              "tts_guard_non_command",
+		              "command_only_non_command",
+		              "text_noise_filtered",
+		            ]);
+		            if (noisyReasons.has(reason)) continue;
+		            await push("assistant", `STT oyó: "${raw || "-"}" (norm="${normTxt || "-"}", ${reason}).`);
+		            continue;
+		          }
+		          const cmdRaw = String(item?.cmd || "").trim().toLowerCase();
+		          const command = cmdRaw || voiceCommandFromText(text);
+		          if (command) {
+		            sttSending = true;
+		            try {
+		              await runVoiceReaderCommand(command, text);
 	            } finally {
 	              sttSending = false;
 	            }
 	            break;
 	          }
+		          if (!chatEnabled) continue;
+		          if (!shouldAcceptSttText(text)) continue;
+	          if (sendEl.disabled) continue;
+	          sttSending = true;
+	          try {
+	            await sendMessage(text);
+	          } finally {
+	            sttSending = false;
+	          }
+	          break;
         }
       } catch {}
     }

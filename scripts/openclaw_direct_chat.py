@@ -560,9 +560,12 @@ def _default_voice_state() -> dict:
         "stt_device": str(os.environ.get("DIRECT_CHAT_STT_DEVICE", "")).strip(),
         "stt_min_chars": max(1, _int_env("DIRECT_CHAT_STT_MIN_CHARS", 3)),
         "stt_command_only": _env_flag("DIRECT_CHAT_STT_COMMAND_ONLY", True),
+        "stt_chat_enabled": _env_flag("DIRECT_CHAT_STT_CHAT_ENABLED", False),
         "stt_debug": _env_flag("DIRECT_CHAT_STT_DEBUG", False),
         "stt_no_audio_timeout_sec": max(1.0, float(os.environ.get("DIRECT_CHAT_STT_NO_AUDIO_TIMEOUT_SEC", "3.0"))),
         "stt_rms_threshold": max(0.001, float(os.environ.get("DIRECT_CHAT_BARGEIN_RMS_THRESHOLD", "0.012"))),
+        "stt_barge_any": _env_flag("DIRECT_CHAT_STT_BARGE_ANY", False),
+        "stt_barge_any_cooldown_ms": max(300, _int_env("DIRECT_CHAT_STT_BARGE_ANY_COOLDOWN_MS", 1200)),
     }
 
 
@@ -586,6 +589,8 @@ def _load_voice_state() -> dict:
                     state["stt_min_chars"] = max(1, int(state.get("stt_min_chars", 3)))
                 if "stt_command_only" in raw:
                     state["stt_command_only"] = bool(raw.get("stt_command_only"))
+                if "stt_chat_enabled" in raw:
+                    state["stt_chat_enabled"] = bool(raw.get("stt_chat_enabled"))
                 if "stt_debug" in raw:
                     state["stt_debug"] = bool(raw.get("stt_debug"))
                 try:
@@ -600,6 +605,14 @@ def _load_voice_state() -> dict:
                     )
                 except Exception:
                     state["stt_rms_threshold"] = max(0.001, float(state.get("stt_rms_threshold", 0.012)))
+                if "stt_barge_any" in raw:
+                    state["stt_barge_any"] = bool(raw.get("stt_barge_any"))
+                try:
+                    state["stt_barge_any_cooldown_ms"] = max(
+                        300, int(raw.get("stt_barge_any_cooldown_ms", state.get("stt_barge_any_cooldown_ms", 1200)))
+                    )
+                except Exception:
+                    state["stt_barge_any_cooldown_ms"] = max(300, int(state.get("stt_barge_any_cooldown_ms", 1200)))
     except Exception:
         pass
     return state
@@ -642,10 +655,14 @@ def _voice_command_kind(text: str) -> str:
     compact = re.sub(r"\s+", " ", n).strip()
     if compact:
         compact = re.sub(r"(.)\1{2,}", r"\1\1", compact)
+    compact_tokens = re.findall(r"[a-z0-9]+", compact)
     if n in (
         "detenete",
         "detente",
         "pausa",
+        "pauza",
+        "posa",
+        "poza",
         "pausa lectura",
         "pausar lectura",
         "detener lectura",
@@ -655,10 +672,12 @@ def _voice_command_kind(text: str) -> str:
         "stop lectura",
     ):
         return "pause"
-    if any(k in compact for k in ("paus", "deten", "parar", "para ", "alto", "basta", "stop")):
+    if any(tok in ("pauza", "posa", "poza") for tok in compact_tokens):
+        return "pause"
+    if any(k in compact for k in ("paus", "pauz", "deten", "parar", "para ", "alto", "basta", "stop")):
         return "pause"
     if re.search(
-        r"^(detenete|detente|pausa|pausa lectura|pausar lectura|detener lectura|parar lectura|basta|stop)\b",
+        r"^(detenete|detente|pausa|pauza|posa|poza|pausa lectura|pausar lectura|detener lectura|parar lectura|basta|stop)\b",
         n,
         flags=re.IGNORECASE,
     ):
@@ -676,6 +695,31 @@ def _voice_command_kind(text: str) -> str:
     if re.search(r"^(repetir|repeti|repeat)\b", n, flags=re.IGNORECASE):
         return "repeat"
     return ""
+
+
+def _is_probable_stt_noise(text: str, cmd: str = "") -> bool:
+    if str(cmd or "").strip():
+        return False
+    n = _normalize_text(text)
+    if not n:
+        return True
+    letters = sum(1 for ch in n if ch.isalpha())
+    digits = sum(1 for ch in n if ch.isdigit())
+    symbols = sum(1 for ch in n if (not ch.isalnum()) and (not ch.isspace()))
+    if letters <= 0:
+        return True
+    if letters <= 2 and (digits + symbols) >= (letters + 2):
+        return True
+    compact_tokens = [re.sub(r"[^a-z0-9]+", "", tok.lower()) for tok in n.split()]
+    compact_tokens = [tok for tok in compact_tokens if tok]
+    if not compact_tokens:
+        return True
+    one_char_tokens = sum(1 for tok in compact_tokens if len(tok) <= 1)
+    if len(compact_tokens) >= 3 and one_char_tokens >= len(compact_tokens):
+        return True
+    if symbols >= 4 and symbols > letters:
+        return True
+    return False
 
 
 def _is_barge_in_phrase(text: str) -> bool:
@@ -720,6 +764,7 @@ class STTManager:
         self._last_matched_cmd = ""
         self._last_match_reason = ""
         self._last_match_ts = 0.0
+        self._last_barge_any_mono = 0.0
 
     @staticmethod
     def _env_int(name: str, default: int) -> int:
@@ -797,11 +842,30 @@ class STTManager:
             return bool(state.get("stt_command_only"))
         return _env_flag("DIRECT_CHAT_STT_COMMAND_ONLY", True)
 
+    def _chat_enabled(self) -> bool:
+        state = self._voice_state()
+        if "stt_chat_enabled" in state:
+            return bool(state.get("stt_chat_enabled"))
+        return _env_flag("DIRECT_CHAT_STT_CHAT_ENABLED", False)
+
     def _debug_enabled(self) -> bool:
         state = self._voice_state()
         if "stt_debug" in state:
             return bool(state.get("stt_debug"))
         return _env_flag("DIRECT_CHAT_STT_DEBUG", False)
+
+    def _barge_any_enabled(self) -> bool:
+        state = self._voice_state()
+        if "stt_barge_any" in state:
+            return bool(state.get("stt_barge_any"))
+        return _env_flag("DIRECT_CHAT_STT_BARGE_ANY", False)
+
+    def _barge_any_cooldown_ms(self) -> int:
+        state = self._voice_state()
+        try:
+            return max(300, int(state.get("stt_barge_any_cooldown_ms", 1200)))
+        except Exception:
+            return 1200
 
     def _no_audio_timeout_sec(self) -> float:
         state = self._voice_state()
@@ -907,6 +971,7 @@ class STTManager:
         self._last_matched_cmd = ""
         self._last_match_reason = ""
         self._last_match_ts = 0.0
+        self._last_barge_any_mono = 0.0
 
     def _build_worker_locked(self):
         from molbot_direct_chat import stt_local
@@ -1107,7 +1172,42 @@ class STTManager:
         out: list[dict] = []
         tts_playing = _tts_is_playing()
         command_only = self._command_only_enabled()
+        chat_enabled = self._chat_enabled()
         debug_enabled = self._debug_enabled()
+        reader_active = bool(_reader_voice_any_barge_target_active(sid))
+        barge_any_enabled = self._barge_any_enabled()
+        barge_target_active = bool(barge_any_enabled and tts_playing and reader_active)
+        if not barge_target_active:
+            with self._lock:
+                self._last_barge_any_mono = 0.0
+        if barge_target_active:
+            now_mono = time.monotonic()
+            now_ts = time.time()
+            with self._lock:
+                cooldown_ms = self._barge_any_cooldown_ms()
+                last_barge = float(self._last_barge_any_mono)
+                if last_barge > (now_mono + 0.250):
+                    # Defensive reset in case of mixed clocks or stale state.
+                    last_barge = 0.0
+                    self._last_barge_any_mono = 0.0
+                elapsed_ms = int(max(0.0, (now_mono - last_barge) * 1000.0))
+                rms_threshold = self._voice_state().get("stt_rms_threshold", 0.012)
+                try:
+                    rms_threshold_f = max(0.001, float(rms_threshold))
+                except Exception:
+                    rms_threshold_f = 0.012
+                speech_detected = bool(self._vad_active or self._in_speech)
+                if (not speech_detected) and (float(self._rms_current) >= max(0.001, rms_threshold_f * 0.85)):
+                    speech_detected = bool(int(self._silence_ms) <= 450)
+                cooldown_ready = bool(last_barge <= 0.0 or elapsed_ms >= cooldown_ms)
+                if speech_detected and cooldown_ready:
+                    self._last_barge_any_mono = now_mono
+                    self._last_match_reason = "voice_any_barge"
+                    self._last_matched_cmd = "pause"
+                    self._last_match_ts = now_ts
+                    out.append({"text": "voz detectada", "ts": now_ts, "kind": "voice_cmd", "cmd": "pause"})
+                    self._items_total += 1
+                    self._last_item_ts = max(self._last_item_ts, now_ts)
         for _ in range(limit):
             try:
                 item = self._queue.get_nowait()
@@ -1126,6 +1226,33 @@ class STTManager:
                     self._last_norm_text = _normalize_text(text)[:240]
                     self._last_matched_cmd = cmd
                     self._last_match_ts = ts
+                if _is_probable_stt_noise(text, cmd=cmd):
+                    with self._lock:
+                        self._last_match_reason = "text_noise_filtered"
+                    if debug_enabled:
+                        out.append(
+                            {
+                                "kind": "stt_debug",
+                                "text": text,
+                                "norm": _normalize_text(text),
+                                "reason": "text_noise_filtered",
+                                "ts": ts,
+                            }
+                        )
+                    with self._lock:
+                        self._register_drop_locked("text_noise_filtered")
+                    continue
+                # Voice commands must bypass TTS/non-command guards so barge-in
+                # works while the reader is speaking.
+                if cmd:
+                    with self._lock:
+                        self._last_match_reason = "matched_command"
+                    event = {"text": text, "ts": ts, "kind": "voice_cmd", "cmd": cmd}
+                    out.append(event)
+                    with self._lock:
+                        self._items_total += 1
+                        self._last_item_ts = max(self._last_item_ts, ts)
+                    continue
                 if tts_playing and (not cmd):
                     with self._lock:
                         self._last_match_reason = "tts_guard_non_command"
@@ -1143,6 +1270,16 @@ class STTManager:
                         self._register_drop_locked("tts_guard_non_command")
                     continue
                 if command_only and (not cmd):
+                    voice_chat_passthrough = bool(chat_enabled and (not tts_playing) and (not reader_active))
+                    if voice_chat_passthrough:
+                        with self._lock:
+                            self._last_match_reason = "voice_chat_text"
+                        event = {"text": text, "ts": ts, "kind": "voice_text"}
+                        out.append(event)
+                        with self._lock:
+                            self._items_total += 1
+                            self._last_item_ts = max(self._last_item_ts, ts)
+                        continue
                     with self._lock:
                         self._last_match_reason = "command_only_non_command"
                     if debug_enabled:
@@ -1159,11 +1296,8 @@ class STTManager:
                         self._register_drop_locked("command_only_non_command")
                     continue
                 with self._lock:
-                    self._last_match_reason = "matched_command" if cmd else "accepted_text"
+                    self._last_match_reason = "accepted_text"
                 event = {"text": text, "ts": ts}
-                if cmd:
-                    event["kind"] = "voice_cmd"
-                    event["cmd"] = cmd
                 out.append(event)
                 with self._lock:
                     self._items_total += 1
@@ -1220,7 +1354,10 @@ class STTManager:
                 "stt_no_speech_detected": bool(no_speech_detected),
                 "stt_no_audio_timeout_sec": float(no_audio_timeout),
                 "stt_command_only": bool(self._command_only_enabled()),
+                "stt_chat_enabled": bool(self._chat_enabled()),
                 "stt_debug": bool(self._debug_enabled()),
+                "stt_barge_any": bool(self._barge_any_enabled()),
+                "stt_barge_any_cooldown_ms": int(self._barge_any_cooldown_ms()),
             }
 
     def shutdown(self) -> None:
@@ -1253,10 +1390,13 @@ def _set_stt_runtime_config(
     *,
     stt_device: str | None = None,
     stt_command_only: bool | None = None,
+    stt_chat_enabled: bool | None = None,
     stt_debug: bool | None = None,
     stt_min_chars: int | None = None,
     stt_no_audio_timeout_sec: float | None = None,
     stt_rms_threshold: float | None = None,
+    stt_barge_any: bool | None = None,
+    stt_barge_any_cooldown_ms: int | None = None,
 ) -> dict:
     with _VOICE_LOCK:
         state = _load_voice_state()
@@ -1264,6 +1404,8 @@ def _set_stt_runtime_config(
             state["stt_device"] = str(stt_device).strip()
         if stt_command_only is not None:
             state["stt_command_only"] = bool(stt_command_only)
+        if stt_chat_enabled is not None:
+            state["stt_chat_enabled"] = bool(stt_chat_enabled)
         if stt_debug is not None:
             state["stt_debug"] = bool(stt_debug)
         if stt_min_chars is not None:
@@ -1272,6 +1414,10 @@ def _set_stt_runtime_config(
             state["stt_no_audio_timeout_sec"] = max(1.0, float(stt_no_audio_timeout_sec))
         if stt_rms_threshold is not None:
             state["stt_rms_threshold"] = max(0.001, float(stt_rms_threshold))
+        if stt_barge_any is not None:
+            state["stt_barge_any"] = bool(stt_barge_any)
+        if stt_barge_any_cooldown_ms is not None:
+            state["stt_barge_any_cooldown_ms"] = max(300, int(stt_barge_any_cooldown_ms))
         _save_voice_state(state)
     os.environ["DIRECT_CHAT_STT_DEVICE"] = str(state.get("stt_device", "")).strip()
     try:
@@ -1279,6 +1425,24 @@ def _set_stt_runtime_config(
     except Exception:
         pass
     return state
+
+
+def _reader_voice_any_barge_target_active(session_id: str) -> bool:
+    sid = _safe_session_id(session_id)
+    if not sid:
+        return False
+    try:
+        st = _READER_STORE.get_session(sid, include_chunks=False)
+    except Exception:
+        return False
+    if not bool(st.get("ok", False)):
+        return False
+    reader_state = str(st.get("reader_state", "") or "").strip().lower()
+    try:
+        continuous = bool(_READER_STORE.is_continuous(sid))
+    except Exception:
+        continuous = False
+    return bool(continuous or reader_state == "reading")
 
 
 def _alltalk_base_url() -> str:
@@ -5490,6 +5654,41 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         _set_stt_runtime_config(stt_rms_threshold=thr)
         return {"reply": f"Listo: umbral STT/Barge-In en {thr:.4f}.", "no_auto_tts": True}
 
+    if any(
+        k in normalized
+        for k in (
+            "stt barge any on",
+            "stt barge-any on",
+            "stt bargein any on",
+            "barge any on",
+        )
+    ):
+        _set_stt_runtime_config(stt_barge_any=True)
+        return {"reply": "Listo: STT barge-any activado (pausa por cualquier voz durante TTS).", "no_auto_tts": True}
+
+    if any(
+        k in normalized
+        for k in (
+            "stt barge any off",
+            "stt barge-any off",
+            "stt bargein any off",
+            "barge any off",
+        )
+    ):
+        _set_stt_runtime_config(stt_barge_any=False)
+        return {"reply": "Listo: STT barge-any desactivado (solo comandos de voz).", "no_auto_tts": True}
+
+    if any(k in normalized for k in ("stt chat on", "chat stt on", "voice chat on", "voz chat on")):
+        _set_stt_runtime_config(stt_chat_enabled=True)
+        return {
+            "reply": "Listo: STT chat activado (fuera de Reader/TTS, la voz entra como mensaje al chat).",
+            "no_auto_tts": True,
+        }
+
+    if any(k in normalized for k in ("stt chat off", "chat stt off", "voice chat off", "voz chat off")):
+        _set_stt_runtime_config(stt_chat_enabled=False)
+        return {"reply": "Listo: STT chat desactivado (solo comandos por voz).", "no_auto_tts": True}
+
     if any(k in normalized for k in ("stt debug on", "debug stt on", "stt depuracion on")):
         _set_stt_runtime_config(stt_debug=True)
         return {"reply": "STT debug activado.", "no_auto_tts": True}
@@ -5512,6 +5711,8 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
                 f"dropped_text={int(st.get('items_dropped_text', 0) or 0)}, last_drop={str(st.get('stt_drop_reason', '') or '-')}, "
                 f"raw='{str(st.get('last_raw_text', '') or '-')[:48]}', norm='{str(st.get('last_norm_text', '') or '-')[:48]}', "
                 f"cmd={str(st.get('matched_cmd', '') or '-')}, reason={str(st.get('match_reason', '') or '-')}, "
+                f"chat={bool(st.get('stt_chat_enabled', False))}, "
+                f"barge_any={bool(st.get('stt_barge_any', False))}, "
                 f"no_audio={no_audio}, no_speech={no_speech}."
             ),
             "no_auto_tts": True,
@@ -6905,6 +7106,10 @@ class Handler(BaseHTTPRequestHandler):
             stt_rms_threshold = max(0.001, float(state.get("stt_rms_threshold", 0.012)))
         except Exception:
             stt_rms_threshold = 0.012
+        try:
+            stt_barge_any_cooldown = max(300, int(state.get("stt_barge_any_cooldown_ms", 1200)))
+        except Exception:
+            stt_barge_any_cooldown = 1200
         return {
             "enabled": enabled,
             "speaker": str(state.get("speaker", "")),
@@ -6912,9 +7117,12 @@ class Handler(BaseHTTPRequestHandler):
             "stt_device": str(state.get("stt_device", "")),
             "stt_min_chars": int(stt_min_chars),
             "stt_command_only": bool(state.get("stt_command_only", True)),
+            "stt_chat_enabled": bool(state.get("stt_chat_enabled", False)),
             "stt_debug": bool(state.get("stt_debug", False)),
             "stt_no_audio_timeout_sec": float(stt_no_audio_timeout),
             "stt_rms_threshold": float(stt_rms_threshold),
+            "stt_barge_any": bool(state.get("stt_barge_any", False)),
+            "stt_barge_any_cooldown_ms": int(stt_barge_any_cooldown),
             "provider": "alltalk",
             "tts_backend": "alltalk",
             "server_url": base_url,
@@ -7403,6 +7611,8 @@ class Handler(BaseHTTPRequestHandler):
                     state["stt_device"] = str(payload.get("stt_device", "")).strip()
                 if "stt_command_only" in payload:
                     state["stt_command_only"] = bool(payload.get("stt_command_only"))
+                if "stt_chat_enabled" in payload:
+                    state["stt_chat_enabled"] = bool(payload.get("stt_chat_enabled"))
                 if "stt_debug" in payload:
                     state["stt_debug"] = bool(payload.get("stt_debug"))
                 if "stt_min_chars" in payload:
@@ -7424,13 +7634,25 @@ class Handler(BaseHTTPRequestHandler):
                         )
                     except Exception:
                         pass
+                if "stt_barge_any" in payload:
+                    state["stt_barge_any"] = bool(payload.get("stt_barge_any"))
+                if "stt_barge_any_cooldown_ms" in payload:
+                    try:
+                        state["stt_barge_any_cooldown_ms"] = max(
+                            300, int(payload.get("stt_barge_any_cooldown_ms", state.get("stt_barge_any_cooldown_ms", 1200)))
+                        )
+                    except Exception:
+                        pass
                 _save_voice_state(state)
                 os.environ["DIRECT_CHAT_STT_DEVICE"] = str(state.get("stt_device", "")).strip()
                 if (
                     "stt_device" in payload
                     or "stt_command_only" in payload
+                    or "stt_chat_enabled" in payload
                     or "stt_debug" in payload
                     or "stt_min_chars" in payload
+                    or "stt_barge_any" in payload
+                    or "stt_barge_any_cooldown_ms" in payload
                 ):
                     _STT_MANAGER.restart()
                 self._json(

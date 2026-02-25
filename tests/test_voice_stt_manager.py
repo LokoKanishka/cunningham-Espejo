@@ -72,7 +72,7 @@ class TestVoiceSttManager(unittest.TestCase):
         self.assertEqual(mgr.poll("sess_a", limit=5), [])
         mgr.disable()
 
-    def test_stt_manager_poll_filters_non_voice_commands_while_tts_playing(self) -> None:
+    def test_stt_manager_poll_bypasses_tts_guard_for_voice_commands(self) -> None:
         mgr = direct_chat.STTManager()
         with mgr._lock:
             mgr._enabled = True
@@ -80,24 +80,153 @@ class TestVoiceSttManager(unittest.TestCase):
             mgr._worker = _DummyWorker(running=True)
         mgr._command_only_enabled = lambda: True  # type: ignore
         mgr._debug_enabled = lambda: False  # type: ignore
-        mgr._queue.put({"text": "comentario normal", "ts": 1.0})
-        mgr._queue.put({"text": "detenete", "ts": 2.0})
-        mgr._queue.put({"text": "continuar", "ts": 3.0})
-        mgr._queue.put({"text": "repetir", "ts": 4.0})
+        mgr._queue.put({"text": "hola", "ts": 1.0})
+        mgr._queue.put({"text": "pausa", "ts": 2.0})
+        mgr._queue.put({"text": "pauza", "ts": 3.0})
+        mgr._queue.put({"text": "continuar", "ts": 4.0})
         prev_tts_is_playing = direct_chat._tts_is_playing
         try:
             direct_chat._tts_is_playing = lambda: True  # type: ignore
             items = mgr.poll("sess_a", limit=5)
         finally:
             direct_chat._tts_is_playing = prev_tts_is_playing  # type: ignore
-        texts = [str(i.get("text", "")).strip().lower() for i in items]
-        self.assertEqual(texts, ["detenete", "continuar", "repetir"])
+        commands = [str(i.get("cmd", "")).strip().lower() for i in items]
+        self.assertEqual(commands, ["pause", "pause", "continue"])
+        self.assertTrue(all(str(i.get("kind", "")).strip().lower() == "voice_cmd" for i in items))
+        mgr.disable()
+
+    def test_stt_manager_barge_any_pauses_on_speech_with_cooldown(self) -> None:
+        mgr = direct_chat.STTManager()
+        with mgr._lock:
+            mgr._enabled = True
+            mgr._owner_session_id = "sess_a"
+            mgr._worker = _DummyWorker(running=True)
+            mgr._vad_active = True
+            mgr._in_speech = True
+            mgr._rms_current = 0.08
+            mgr._silence_ms = 0
+        mgr._barge_any_enabled = lambda: True  # type: ignore
+        mgr._barge_any_cooldown_ms = lambda: 1200  # type: ignore
+        mgr._debug_enabled = lambda: False  # type: ignore
+        prev_tts_is_playing = direct_chat._tts_is_playing
+        prev_reader_target = direct_chat._reader_voice_any_barge_target_active
+        try:
+            direct_chat._tts_is_playing = lambda: True  # type: ignore
+            direct_chat._reader_voice_any_barge_target_active = lambda _sid: True  # type: ignore
+
+            items1 = mgr.poll("sess_a", limit=2)
+            items2 = mgr.poll("sess_a", limit=2)
+            with mgr._lock:
+                mgr._last_barge_any_mono = time.monotonic() - 2.0
+            items3 = mgr.poll("sess_a", limit=2)
+        finally:
+            direct_chat._tts_is_playing = prev_tts_is_playing  # type: ignore
+            direct_chat._reader_voice_any_barge_target_active = prev_reader_target  # type: ignore
+        self.assertEqual([str(i.get("cmd", "")).strip().lower() for i in items1], ["pause"])
+        self.assertEqual(items2, [])
+        self.assertEqual([str(i.get("cmd", "")).strip().lower() for i in items3], ["pause"])
+        mgr.disable()
+
+    def test_stt_manager_barge_any_cooldown_is_silent(self) -> None:
+        mgr = direct_chat.STTManager()
+        with mgr._lock:
+            mgr._enabled = True
+            mgr._owner_session_id = "sess_a"
+            mgr._worker = _DummyWorker(running=True)
+            mgr._vad_active = True
+            mgr._in_speech = True
+            mgr._rms_current = 0.08
+            mgr._silence_ms = 0
+            mgr._last_barge_any_mono = time.monotonic()
+        mgr._barge_any_enabled = lambda: True  # type: ignore
+        mgr._barge_any_cooldown_ms = lambda: 1200  # type: ignore
+        mgr._debug_enabled = lambda: True  # type: ignore
+        prev_tts_is_playing = direct_chat._tts_is_playing
+        prev_reader_target = direct_chat._reader_voice_any_barge_target_active
+        try:
+            direct_chat._tts_is_playing = lambda: True  # type: ignore
+            direct_chat._reader_voice_any_barge_target_active = lambda _sid: True  # type: ignore
+            items = mgr.poll("sess_a", limit=3)
+        finally:
+            direct_chat._tts_is_playing = prev_tts_is_playing  # type: ignore
+            direct_chat._reader_voice_any_barge_target_active = prev_reader_target  # type: ignore
+        self.assertEqual(items, [])
+        mgr.disable()
+
+    def test_stt_manager_filters_noise_text(self) -> None:
+        mgr = direct_chat.STTManager()
+        with mgr._lock:
+            mgr._enabled = True
+            mgr._owner_session_id = "sess_a"
+            mgr._worker = _DummyWorker(running=True)
+        mgr._command_only_enabled = lambda: False  # type: ignore
+        mgr._debug_enabled = lambda: False  # type: ignore
+        mgr._queue.put({"text": "### 1234 ???", "ts": 1.0})
+        mgr._queue.put({"text": "hola cunningham", "ts": 2.0})
+        prev_tts_is_playing = direct_chat._tts_is_playing
+        try:
+            direct_chat._tts_is_playing = lambda: False  # type: ignore
+            items = mgr.poll("sess_a", limit=6)
+        finally:
+            direct_chat._tts_is_playing = prev_tts_is_playing  # type: ignore
+        self.assertEqual(len(items), 1)
+        self.assertEqual(str(items[0].get("text", "")).strip().lower(), "hola cunningham")
+        mgr.disable()
+
+    def test_stt_manager_chat_mode_allows_non_command_outside_reader(self) -> None:
+        mgr = direct_chat.STTManager()
+        with mgr._lock:
+            mgr._enabled = True
+            mgr._owner_session_id = "sess_a"
+            mgr._worker = _DummyWorker(running=True)
+        mgr._command_only_enabled = lambda: True  # type: ignore
+        mgr._chat_enabled = lambda: True  # type: ignore
+        mgr._debug_enabled = lambda: False  # type: ignore
+        mgr._queue.put({"text": "hola", "ts": 1.0})
+        prev_tts_is_playing = direct_chat._tts_is_playing
+        prev_reader_target = direct_chat._reader_voice_any_barge_target_active
+        try:
+            direct_chat._tts_is_playing = lambda: False  # type: ignore
+            direct_chat._reader_voice_any_barge_target_active = lambda _sid: False  # type: ignore
+            items = mgr.poll("sess_a", limit=4)
+        finally:
+            direct_chat._tts_is_playing = prev_tts_is_playing  # type: ignore
+            direct_chat._reader_voice_any_barge_target_active = prev_reader_target  # type: ignore
+        self.assertEqual(len(items), 1)
+        self.assertEqual(str(items[0].get("kind", "")).strip().lower(), "voice_text")
+        self.assertEqual(str(items[0].get("text", "")).strip().lower(), "hola")
+        mgr.disable()
+
+    def test_stt_manager_chat_mode_does_not_bypass_reader_tts_guard(self) -> None:
+        mgr = direct_chat.STTManager()
+        with mgr._lock:
+            mgr._enabled = True
+            mgr._owner_session_id = "sess_a"
+            mgr._worker = _DummyWorker(running=True)
+        mgr._command_only_enabled = lambda: True  # type: ignore
+        mgr._chat_enabled = lambda: True  # type: ignore
+        mgr._debug_enabled = lambda: False  # type: ignore
+        mgr._queue.put({"text": "hola", "ts": 1.0})
+        prev_tts_is_playing = direct_chat._tts_is_playing
+        prev_reader_target = direct_chat._reader_voice_any_barge_target_active
+        try:
+            direct_chat._tts_is_playing = lambda: True  # type: ignore
+            direct_chat._reader_voice_any_barge_target_active = lambda _sid: True  # type: ignore
+            items = mgr.poll("sess_a", limit=4)
+        finally:
+            direct_chat._tts_is_playing = prev_tts_is_playing  # type: ignore
+            direct_chat._reader_voice_any_barge_target_active = prev_reader_target  # type: ignore
+        self.assertEqual(items, [])
         mgr.disable()
 
     def test_voice_command_kind(self) -> None:
         self.assertEqual(direct_chat._voice_command_kind("pausa lectura"), "pause")
+        self.assertEqual(direct_chat._voice_command_kind("pauza lectura"), "pause")
+        self.assertEqual(direct_chat._voice_command_kind("posa"), "pause")
+        self.assertEqual(direct_chat._voice_command_kind("poza"), "pause")
         self.assertEqual(direct_chat._voice_command_kind("continuar"), "continue")
         self.assertEqual(direct_chat._voice_command_kind("repetir"), "repeat")
+        self.assertEqual(direct_chat._voice_command_kind("esposa"), "")
         self.assertEqual(direct_chat._voice_command_kind("frase libre"), "")
 
     def test_tts_is_playing_uses_event_proc_and_guard_window(self) -> None:
