@@ -572,7 +572,7 @@ HTML = r"""<!doctype html>
 	              await sendMessage(text);
 	              if (sttDebug) {
 	                const shown = text.length > 48 ? `${text.slice(0, 48)}…` : text;
-	                await push("assistant", `voice→chat sent: "${shown}"`);
+	                await push("assistant", `voice->chat sent: "${shown}"`);
 	              }
 	            } finally {
 	              sttSending = false;
