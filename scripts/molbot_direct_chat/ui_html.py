@@ -567,6 +567,7 @@ HTML = r"""<!doctype html>
 		        const j = await r.json();
 		        const chatEnabled = !!j?.stt_chat_enabled;
 		        const sttDebug = !!j?.stt_debug;
+	        const serverBridgeEnabled = !!j?.stt_server_chat_bridge_enabled;
 	        if (await flushPendingSttChatText(sttDebug)) return;
         const items = Array.isArray(j?.items) ? j.items : [];
 		        for (const item of items) {
@@ -601,6 +602,13 @@ HTML = r"""<!doctype html>
 	          }
 		          if (kind === "chat_text") {
 		            if (!shouldAcceptSttText(text, ts)) continue;
+	            if (serverBridgeEnabled) {
+	              if (sttDebug) {
+	                const shown = text.length > 48 ? `${text.slice(0, 48)}…` : text;
+	                await push("assistant", `voice->chat bridge (server): "${shown}"`);
+	              }
+	              continue;
+	            }
 	            if (sendEl.disabled) {
 	              enqueuePendingSttChatText(text, ts);
 	              continue;

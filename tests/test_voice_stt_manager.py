@@ -31,6 +31,10 @@ class _DummyWorker:
 
 
 class TestVoiceSttManager(unittest.TestCase):
+    def setUp(self) -> None:
+        with direct_chat._VOICE_CHAT_DEDUPE_LOCK:
+            direct_chat._VOICE_CHAT_DEDUPE_BY_SESSION = {}
+
     @patch("openclaw_direct_chat._save_voice_state")
     @patch("openclaw_direct_chat._load_voice_state", return_value={"enabled": False, "speaker": "Ana Florence", "speaker_wav": ""})
     @patch.object(direct_chat, "_STT_MANAGER")
@@ -323,6 +327,32 @@ class TestVoiceSttManager(unittest.TestCase):
         self.assertEqual([str(i.get("cmd", "")).strip().lower() for i in items_high], ["pause"])
         self.assertEqual([str(i.get("source", "")).strip().lower() for i in items_high], ["voice_any"])
         mgr.disable()
+
+    def test_voice_chat_bridge_process_items_calls_submit_once_for_chat_text(self) -> None:
+        seen = []
+        prev_submit = direct_chat._voice_chat_submit_backend
+        def _fake_submit(sid, text, ts=0.0):
+            seen.append((sid, text, ts))
+            return True
+        try:
+            direct_chat._voice_chat_submit_backend = _fake_submit  # type: ignore
+            out = direct_chat._voice_chat_bridge_process_items(
+                "sess_a",
+                [
+                    {"kind": "chat_text", "text": "hola", "ts": 12.5},
+                    {"kind": "voice_cmd", "cmd": "pause", "text": "pausa", "ts": 12.6},
+                ],
+            )
+        finally:
+            direct_chat._voice_chat_submit_backend = prev_submit  # type: ignore
+        self.assertEqual(out, 1)
+        self.assertEqual(seen, [("sess_a", "hola", 12.5)])
+
+    def test_voice_chat_dedupe_uses_session_ts_text(self) -> None:
+        self.assertTrue(direct_chat._voice_chat_should_process("sess_a", "hola", ts=10.1))
+        self.assertFalse(direct_chat._voice_chat_should_process("sess_a", "hola", ts=10.1))
+        self.assertTrue(direct_chat._voice_chat_should_process("sess_a", "hola", ts=10.2))
+        self.assertTrue(direct_chat._voice_chat_should_process("sess_b", "hola", ts=10.1))
 
     def test_stt_manager_status_reports_runtime(self) -> None:
         mgr = direct_chat.STTManager()

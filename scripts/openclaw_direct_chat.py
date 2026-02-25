@@ -130,6 +130,13 @@ _TTS_HEALTH_CACHE = {
     "health_path": "",
     "timeout_s": 0.0,
 }
+_DIRECT_CHAT_HTTP_HOST = "127.0.0.1"
+_DIRECT_CHAT_HTTP_PORT = 0
+_VOICE_CHAT_BRIDGE_LOCK = threading.Lock()
+_VOICE_CHAT_BRIDGE_THREAD: threading.Thread | None = None
+_VOICE_CHAT_BRIDGE_STOP = threading.Event()
+_VOICE_CHAT_DEDUPE_LOCK = threading.Lock()
+_VOICE_CHAT_DEDUPE_BY_SESSION: dict[str, dict[str, float]] = {}
 
 
 def _bargein_config() -> dict:
@@ -1523,6 +1530,7 @@ class STTManager:
                 "stt_debug": bool(self._debug_enabled()),
                 "stt_barge_any": bool(self._barge_any_enabled()),
                 "stt_barge_any_cooldown_ms": int(self._barge_any_cooldown_ms()),
+                "stt_server_chat_bridge_enabled": bool(_voice_server_chat_bridge_enabled() and _DIRECT_CHAT_HTTP_PORT > 0),
             }
 
     def shutdown(self) -> None:
@@ -1533,12 +1541,172 @@ _STT_MANAGER = STTManager()
 atexit.register(_STT_MANAGER.shutdown)
 
 
+def _voice_server_chat_bridge_enabled() -> bool:
+    return _env_flag("DIRECT_CHAT_STT_SERVER_CHAT_BRIDGE", True)
+
+
+def _voice_chat_dedupe_key(text: str, ts: float = 0.0) -> str:
+    norm = _normalize_text(text)
+    if not norm:
+        norm = str(text or "").strip().lower()
+    ts_ms = int(round(float(ts or 0.0) * 1000.0)) if float(ts or 0.0) > 0.0 else 0
+    base = f"{ts_ms}|{norm}" if ts_ms > 0 else norm
+    digest = hashlib.sha1(base.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    return f"{ts_ms}:{digest}" if ts_ms > 0 else digest
+
+
+def _voice_chat_should_process(session_id: str, text: str, ts: float = 0.0) -> bool:
+    sid = _safe_session_id(session_id or "default")
+    key = _voice_chat_dedupe_key(text, ts)
+    now_mono = time.monotonic()
+    ttl_sec = max(20.0, float(_int_env("DIRECT_CHAT_STT_SERVER_CHAT_DEDUPE_TTL_SEC", 90)))
+    with _VOICE_CHAT_DEDUPE_LOCK:
+        bucket = _VOICE_CHAT_DEDUPE_BY_SESSION.get(sid, {})
+        if not isinstance(bucket, dict):
+            bucket = {}
+        fresh = {k: float(v) for k, v in bucket.items() if (now_mono - float(v)) <= ttl_sec}
+        if key in fresh:
+            _VOICE_CHAT_DEDUPE_BY_SESSION[sid] = fresh
+            return False
+        fresh[key] = now_mono
+        if len(fresh) > 96:
+            ordered = sorted(fresh.items(), key=lambda kv: kv[1], reverse=True)[:96]
+            fresh = dict(ordered)
+        _VOICE_CHAT_DEDUPE_BY_SESSION[sid] = fresh
+    return True
+
+
+def _voice_chat_model_payload(session_id: str) -> dict:
+    sid = _safe_session_id(session_id or "default")
+    catalog = _model_catalog()
+    model_id = str(catalog.get("default_model", "openai-codex/gpt-5.1-codex-mini")).strip() or "openai-codex/gpt-5.1-codex-mini"
+    backend = "cloud"
+    by_id = catalog.get("by_id", {})
+    if isinstance(by_id, dict):
+        meta = by_id.get(model_id)
+        if isinstance(meta, dict):
+            b = str(meta.get("backend", "cloud")).strip().lower()
+            if b in ("cloud", "local"):
+                backend = b
+    history = _load_history(sid, model=model_id, backend=backend)
+    return {
+        "session_id": sid,
+        "model": model_id,
+        "model_backend": backend,
+        "history": history if isinstance(history, list) else [],
+    }
+
+
+def _voice_chat_submit_backend(session_id: str, text: str, ts: float = 0.0) -> bool:
+    sid = _safe_session_id(session_id or "default")
+    clean = str(text or "").strip()
+    if not clean:
+        return False
+    if (not _voice_enabled()) or (not _voice_server_chat_bridge_enabled()):
+        return False
+    if _DIRECT_CHAT_HTTP_PORT <= 0:
+        return False
+    model_payload = _voice_chat_model_payload(sid)
+    payload = {
+        "message": clean,
+        "session_id": sid,
+        "model": str(model_payload.get("model", "openai-codex/gpt-5.1-codex-mini")),
+        "model_backend": str(model_payload.get("model_backend", "cloud")),
+        "history": model_payload.get("history", []),
+        "mode": "operativo",
+        "allowed_tools": ["firefox", "tts"],
+        "attachments": [],
+        "source": "voice_server_bridge",
+        "voice_item_ts": float(ts or 0.0),
+    }
+    url = f"http://{_DIRECT_CHAT_HTTP_HOST}:{int(_DIRECT_CHAT_HTTP_PORT)}/api/chat"
+    try:
+        resp = requests.post(url, json=payload, timeout=max(8.0, float(_int_env("DIRECT_CHAT_STT_SERVER_CHAT_TIMEOUT_SEC", 120))))
+    except Exception:
+        return False
+    return bool(resp.status_code < 400)
+
+
+def _voice_chat_bridge_process_items(session_id: str, items: list[dict]) -> int:
+    sid = _safe_session_id(session_id or "default")
+    if not isinstance(items, list):
+        return 0
+    processed = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("kind", "")).strip().lower() != "chat_text":
+            continue
+        text = str(item.get("text", "")).strip()
+        if not text:
+            continue
+        try:
+            ts = float(item.get("ts", 0.0) or 0.0)
+        except Exception:
+            ts = 0.0
+        if _voice_chat_submit_backend(sid, text, ts=ts):
+            processed += 1
+    return processed
+
+
+def _voice_chat_bridge_loop() -> None:
+    while not _VOICE_CHAT_BRIDGE_STOP.is_set():
+        try:
+            if (not _voice_enabled()) or (not _voice_server_chat_bridge_enabled()) or _DIRECT_CHAT_HTTP_PORT <= 0:
+                _VOICE_CHAT_BRIDGE_STOP.wait(0.35)
+                continue
+            st = _STT_MANAGER.status()
+            sid = _safe_session_id(str(st.get("stt_owner_session_id", "default") or "default"))
+            if not sid:
+                sid = "default"
+            if not bool(st.get("stt_enabled", False)) or not bool(st.get("stt_chat_enabled", False)):
+                _VOICE_CHAT_BRIDGE_STOP.wait(0.35)
+                continue
+            items = _STT_MANAGER.poll(session_id=sid, limit=4)
+            if items:
+                _voice_chat_bridge_process_items(sid, items)
+        except Exception:
+            pass
+        _VOICE_CHAT_BRIDGE_STOP.wait(0.22)
+
+
+def _start_voice_chat_bridge() -> None:
+    if (not _voice_server_chat_bridge_enabled()) or _DIRECT_CHAT_HTTP_PORT <= 0:
+        return
+    with _VOICE_CHAT_BRIDGE_LOCK:
+        global _VOICE_CHAT_BRIDGE_THREAD
+        th = _VOICE_CHAT_BRIDGE_THREAD
+        if th is not None and th.is_alive():
+            return
+        _VOICE_CHAT_BRIDGE_STOP.clear()
+        _VOICE_CHAT_BRIDGE_THREAD = threading.Thread(target=_voice_chat_bridge_loop, daemon=True, name="voice-chat-bridge")
+        _VOICE_CHAT_BRIDGE_THREAD.start()
+
+
+def _stop_voice_chat_bridge() -> None:
+    global _VOICE_CHAT_BRIDGE_THREAD
+    with _VOICE_CHAT_BRIDGE_LOCK:
+        _VOICE_CHAT_BRIDGE_STOP.set()
+        th = _VOICE_CHAT_BRIDGE_THREAD
+        _VOICE_CHAT_BRIDGE_THREAD = None
+    if th is not None:
+        try:
+            th.join(timeout=1.5)
+        except Exception:
+            pass
+
+
+atexit.register(_stop_voice_chat_bridge)
+
+
 def _sync_stt_with_voice(enabled: bool, session_id: str = "") -> None:
     try:
         if enabled:
             _STT_MANAGER.enable(session_id=session_id)
+            _start_voice_chat_bridge()
             return
         _stop_bargein_monitor()
+        _stop_voice_chat_bridge()
         _STT_MANAGER.disable()
     except Exception as e:
         print(f"[stt] sync_failed:{e}", file=sys.stderr)
@@ -7347,6 +7515,7 @@ class Handler(BaseHTTPRequestHandler):
             "stt_barge_rms_threshold": float(stt_barge_rms_threshold),
             "stt_barge_any": bool(state.get("stt_barge_any", False)),
             "stt_barge_any_cooldown_ms": int(stt_barge_any_cooldown),
+            "stt_server_chat_bridge_enabled": bool(_voice_server_chat_bridge_enabled() and _DIRECT_CHAT_HTTP_PORT > 0),
             "provider": "alltalk",
             "tts_backend": "alltalk",
             "server_url": base_url,
@@ -7984,6 +8153,30 @@ class Handler(BaseHTTPRequestHandler):
             message = str(payload.get("message", "")).strip()
             session_id = _safe_session_id(str(payload.get("session_id", "default")))
             allowed_tools = _extract_allowed_tools(payload)
+            source_tag = str(payload.get("source", "")).strip().lower()
+            voice_item_ts = 0.0
+            if "voice_item_ts" in payload:
+                try:
+                    voice_item_ts = float(payload.get("voice_item_ts", 0.0) or 0.0)
+                except Exception:
+                    voice_item_ts = 0.0
+            is_voice_origin = bool(source_tag.startswith("voice_") or voice_item_ts > 0.0)
+            if is_voice_origin and message and (not _voice_chat_should_process(session_id, message, ts=voice_item_ts)):
+                if self.path == "/api/chat/stream":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    try:
+                        self.wfile.write(b"data: [DONE]\n\n")
+                        self.wfile.flush()
+                    except BrokenPipeError:
+                        return
+                    self.close_connection = True
+                    return
+                self._json(200, {"reply": "", "deduped": True, "source": source_tag or "voice"})
+                return
             # allow_local_action_on_unknown_model
             if message and (not _is_reader_control_command(message)):
                 st_reader = _READER_STORE.get_session(session_id, include_chunks=False)
@@ -8227,16 +8420,21 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    global _DIRECT_CHAT_HTTP_HOST, _DIRECT_CHAT_HTTP_PORT
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8787)
     parser.add_argument("--gateway-port", type=int, default=18789)
     args = parser.parse_args()
 
+    _DIRECT_CHAT_HTTP_HOST = str(args.host or "127.0.0.1")
+    _DIRECT_CHAT_HTTP_PORT = int(args.port or 0)
     token = load_gateway_token()
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     httpd.gateway_token = token
     httpd.gateway_port = args.gateway_port
+    if _voice_enabled():
+        _start_voice_chat_bridge()
     print(f"Direct chat ready: http://{args.host}:{args.port}")
     print(f"Target gateway: http://127.0.0.1:{args.gateway_port}/v1/chat/completions")
     httpd.serve_forever()
