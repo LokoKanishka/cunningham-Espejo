@@ -3,6 +3,7 @@ from __future__ import annotations
 import audioop
 import dataclasses
 import queue
+import re
 import threading
 import time
 from typing import Callable, Optional
@@ -37,6 +38,23 @@ class STTConfig:
 
     # Filtering
     min_chars: int = 3
+
+
+ALLOW_SHORT = {
+    "hola",
+    "ok",
+    "si",
+    "sí",
+    "no",
+    "para",
+    "pará",
+    "pausa",
+    "pauza",
+    "posa",
+    "poza",
+    "detenete",
+    "continuar",
+}
 
 
 def _lazy_import_sounddevice():
@@ -104,6 +122,46 @@ class FasterWhisperEngine:
             if t:
                 parts.append(t)
         return " ".join(parts).strip()
+
+
+def _normalize_transcript_text(text: str) -> str:
+    raw = str(text or "").replace("\r", " ").replace("\n", " ")
+    raw = re.sub(r"\s+", " ", raw).strip()
+    # Strip edge punctuation/noise but preserve inner punctuation naturally spoken.
+    return raw.strip(" \t,.;:!?-_#|/\\`~^")
+
+
+def _filter_transcript_text(text: str, min_chars: int = 3) -> tuple[str, str]:
+    normalized = _normalize_transcript_text(text)
+    clean = normalized.strip(" .,!¿?¡").lower()
+    if clean in ALLOW_SHORT:
+        return normalized, ""
+
+    if len(normalized) < max(1, int(min_chars)):
+        return "", "text_too_short"
+
+    lowered = normalized.lower()
+    letters = sum(1 for ch in lowered if ch.isalpha())
+    digits = sum(1 for ch in lowered if ch.isdigit())
+    symbols = sum(1 for ch in lowered if (not ch.isalnum()) and (not ch.isspace()))
+    if letters <= 0:
+        return "", "text_no_letters"
+    if letters <= 2 and (digits + symbols) >= (letters + 2):
+        return "", "text_noise_mostly_non_letters"
+
+    tokens = [re.sub(r"[^a-z0-9]+", "", tok) for tok in lowered.split()]
+    tokens = [tok for tok in tokens if tok]
+    if not tokens:
+        return "", "text_no_tokens"
+
+    one_char_tokens = sum(1 for tok in tokens if len(tok) <= 1)
+    if len(tokens) >= 3 and one_char_tokens >= len(tokens):
+        return "", "text_noise_single_chars"
+
+    if symbols >= 4 and symbols > letters:
+        return "", "text_noise_symbols"
+
+    return normalized, ""
 
 
 def list_input_devices() -> list[dict]:
@@ -335,16 +393,22 @@ class STTWorker:
                 return
             try:
                 engine = self._ensure_engine()
-                text = engine.transcribe(pcm16)
+                raw_text = engine.transcribe(pcm16)
             except Exception as e:
                 self.last_error = f"transcribe_failed:{e}"
                 self.log(f"[stt] {self.last_error}")
                 emit_runtime_diag({"kind": "stt_error", "detail": self.last_error})
                 return
 
-            text = (text or "").strip()
-            if len(text) < cfg.min_chars:
-                emit_runtime_diag({"kind": "stt_drop", "reason": "text_too_short", "chars": int(len(text))})
+            text, drop_reason = _filter_transcript_text(raw_text, min_chars=int(cfg.min_chars))
+            if drop_reason:
+                emit_runtime_diag(
+                    {
+                        "kind": "stt_drop",
+                        "reason": str(drop_reason),
+                        "chars": int(len(str(raw_text or ""))),
+                    }
+                )
                 return
 
             try:
