@@ -1497,6 +1497,14 @@ class STTManager:
                 except Exception:
                     rms_threshold_f = 0.012
                 speech_detected = bool(self._vad_active or self._in_speech)
+                if speech_detected:
+                    if reader_active:
+                        min_rms = max(0.001, rms_threshold_f)
+                    else:
+                        # Outside Reader mode, require stronger signal to avoid
+                        # self-interruptions from room noise / speaker bleed.
+                        min_rms = max(0.03, rms_threshold_f * 1.6)
+                    speech_detected = bool(float(self._rms_current) >= min_rms)
                 if (not speech_detected) and (float(self._rms_current) >= max(0.001, rms_threshold_f * 0.85)):
                     speech_detected = bool(int(self._silence_ms) <= 450)
                 cooldown_ready = bool(last_barge <= 0.0 or elapsed_ms >= cooldown_ms)
@@ -2776,6 +2784,8 @@ def _speak_reply_async(text: str) -> int:
                     continue
 
                 if item is None:
+                    if stop_event.is_set():
+                        interrupted = True
                     break
 
                 ok, detail = _play_audio_blocking(item, stop_event)
@@ -2804,6 +2814,9 @@ def _speak_reply_async(text: str) -> int:
             _tts_touch()
 
         if interrupted:
+            _set_voice_status(stream_id, False, _pop_tts_stop_reason(stream_id))
+            return
+        if stop_event.is_set():
             _set_voice_status(stream_id, False, _pop_tts_stop_reason(stream_id))
             return
         if producer_error["detail"]:

@@ -202,6 +202,31 @@ class TestVoiceSttManager(unittest.TestCase):
         self.assertEqual([str(i.get("source", "")).strip().lower() for i in items], ["voice_any"])
         mgr.disable()
 
+    def test_stt_manager_barge_any_ignores_low_rms_outside_reader(self) -> None:
+        mgr = direct_chat.STTManager()
+        with mgr._lock:
+            mgr._enabled = True
+            mgr._owner_session_id = "sess_a"
+            mgr._worker = _DummyWorker(running=True)
+            mgr._vad_active = True
+            mgr._in_speech = True
+            mgr._rms_current = 0.01
+            mgr._silence_ms = 0
+        mgr._barge_any_enabled = lambda: True  # type: ignore
+        mgr._barge_any_cooldown_ms = lambda: 1200  # type: ignore
+        mgr._debug_enabled = lambda: False  # type: ignore
+        prev_tts_is_playing = direct_chat._tts_is_playing
+        prev_reader_target = direct_chat._reader_voice_any_barge_target_active
+        try:
+            direct_chat._tts_is_playing = lambda: True  # type: ignore
+            direct_chat._reader_voice_any_barge_target_active = lambda _sid: False  # type: ignore
+            items = mgr.poll("sess_a", limit=2)
+        finally:
+            direct_chat._tts_is_playing = prev_tts_is_playing  # type: ignore
+            direct_chat._reader_voice_any_barge_target_active = prev_reader_target  # type: ignore
+        self.assertEqual(items, [])
+        mgr.disable()
+
     def test_stt_manager_barge_any_cooldown_is_silent(self) -> None:
         mgr = direct_chat.STTManager()
         with mgr._lock:
