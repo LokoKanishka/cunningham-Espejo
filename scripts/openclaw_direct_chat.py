@@ -850,14 +850,27 @@ def _stt_chat_drop_reason(text: str, min_words_chat: int = 2) -> str:
     return "chat_too_few_words"
 
 
+def _stt_voice_text_normalize(text: str) -> str:
+    out = str(text or "").strip()
+    if not out:
+        return ""
+    # Common near-miss for "Gemini" in noisy STT outputs.
+    out = re.sub(r"\b(?:hemini|jemini|gemni|geminy|gemin)\b", "gemini", out, flags=re.IGNORECASE)
+    # Contextual near-miss: "de que obra son ..." -> "de que hora son ..."
+    out = re.sub(r"\bde\s+que\s+obra\s+(son|es)\b", r"de que hora \1", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bque\s+obra\s+(son|es)\b", r"que hora \1", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bobra\s+(son|es)\b", r"hora \1", out, flags=re.IGNORECASE)
+    return out.strip()
+
+
 def _stt_segmentation_profile(chat_enabled: bool) -> dict:
     if bool(chat_enabled):
         min_ms = max(150, _int_env("DIRECT_CHAT_STT_CHAT_MIN_SEGMENT_MS", 180))
         return {
             "min_speech_ms": int(min_ms),
             "chat_min_speech_ms": int(min_ms),
-            "max_silence_ms": int(max(250, _int_env("DIRECT_CHAT_STT_CHAT_MAX_SILENCE_MS", 450))),
-            "max_segment_s": float(max(1.8, _float_env("DIRECT_CHAT_STT_CHAT_MAX_SEGMENT_SEC", 2.6))),
+            "max_silence_ms": int(max(300, _int_env("DIRECT_CHAT_STT_CHAT_MAX_SILENCE_MS", 700))),
+            "max_segment_s": float(max(2.6, _float_env("DIRECT_CHAT_STT_CHAT_MAX_SEGMENT_SEC", 4.8))),
         }
     return {
         "min_speech_ms": int(max(120, _int_env("DIRECT_CHAT_STT_MIN_SPEECH_MS", 220))),
@@ -1993,20 +2006,37 @@ def _voice_chat_pending_clear(session_id: str) -> None:
         _VOICE_CHAT_PENDING_BY_SESSION.pop(sid, None)
 
 
+def _voice_chat_text_looks_incomplete(text: str) -> bool:
+    n = _normalize_text(text)
+    if not n:
+        return True
+    if n.endswith((" de", " del", " en", " y", " o", " que", " la", " el", " los", " las", " un", " una", " para", " por", " con", " entre", " sobre", " a")):
+        return True
+    if re.search(r"\bpregunt\w*\s+(?:a\s+)?gemini\b", n, flags=re.IGNORECASE) and not re.search(
+        r"\b(que|qué|sobre|acerca|si|cu[aá]l|cu[aá]ndo|donde|dónde|hora|noticias)\b",
+        n,
+        flags=re.IGNORECASE,
+    ):
+        return True
+    return False
+
+
 def _voice_chat_pending_ready(session_id: str, pending: dict) -> bool:
     sid = _safe_session_id(session_id or "default")
     if not isinstance(pending, dict):
         return False
     now_mono = time.monotonic()
-    settle_ms = max(120, _int_env("DIRECT_CHAT_STT_BRIDGE_COMMIT_SETTLE_MS", 850))
-    min_silence_ms = max(220, _int_env("DIRECT_CHAT_STT_BRIDGE_MIN_SILENCE_MS", 520))
-    max_wait_ms = max(settle_ms, _int_env("DIRECT_CHAT_STT_BRIDGE_MAX_WAIT_MS", 3200))
+    settle_ms = max(120, _int_env("DIRECT_CHAT_STT_BRIDGE_COMMIT_SETTLE_MS", 1200))
+    min_silence_ms = max(220, _int_env("DIRECT_CHAT_STT_BRIDGE_MIN_SILENCE_MS", 700))
+    max_wait_ms = max(settle_ms, _int_env("DIRECT_CHAT_STT_BRIDGE_MAX_WAIT_MS", 5200))
     updated_mono = float(pending.get("updated_mono", now_mono) or now_mono)
     elapsed_ms = int(max(0.0, (now_mono - updated_mono) * 1000.0))
+    pending_text = str(pending.get("text", "")).strip()
+    incomplete = _voice_chat_text_looks_incomplete(pending_text)
     st = _STT_MANAGER.status()
     if not bool(st.get("stt_running", False)):
         return True
-    if elapsed_ms >= max_wait_ms:
+    if elapsed_ms >= max_wait_ms + (1600 if incomplete else 0):
         return True
     if elapsed_ms < settle_ms:
         return False
@@ -2076,7 +2106,7 @@ def _voice_chat_bridge_process_items(session_id: str, items: list[dict]) -> int:
             continue
         if kind != "chat_text":
             continue
-        text = str(item.get("text", "")).strip()
+        text = _stt_voice_text_normalize(str(item.get("text", "")).strip())
         if not text:
             continue
         drop_reason = _stt_chat_drop_reason(text, min_words_chat=chat_min_words)
@@ -2121,7 +2151,7 @@ def _voice_chat_bridge_process_items(session_id: str, items: list[dict]) -> int:
         latest_chat_text = ""
         latest_chat_ts = 0.0
     pending = _voice_chat_pending_get(sid)
-    pending_text = str(pending.get("text", "")).strip() if isinstance(pending, dict) else ""
+    pending_text = _stt_voice_text_normalize(str(pending.get("text", "")).strip()) if isinstance(pending, dict) else ""
     pending_ts = float(pending.get("ts", 0.0) or 0.0) if isinstance(pending, dict) else 0.0
     if pending_text and _stt_chat_drop_reason(pending_text, min_words_chat=chat_min_words):
         _voice_chat_pending_clear(sid)

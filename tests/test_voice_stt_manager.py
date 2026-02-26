@@ -763,6 +763,17 @@ class TestVoiceSttManager(unittest.TestCase):
         self.assertEqual(direct_chat._stt_chat_drop_reason("me escuchas", min_words_chat=2), "")
         self.assertEqual(direct_chat._stt_chat_drop_reason("eh", min_words_chat=2), "")
 
+    def test_stt_voice_text_normalize_common_misrecognitions(self) -> None:
+        self.assertEqual(direct_chat._stt_voice_text_normalize("preguntale a Hemini"), "preguntale a gemini")
+        self.assertEqual(
+            direct_chat._stt_voice_text_normalize("de que obra son las noticias"),
+            "de que hora son las noticias",
+        )
+
+    def test_voice_chat_text_looks_incomplete_for_partial_gemini_request(self) -> None:
+        self.assertTrue(direct_chat._voice_chat_text_looks_incomplete("podes preguntarle a gemini"))
+        self.assertFalse(direct_chat._voice_chat_text_looks_incomplete("podes preguntarle a gemini sobre iran y eeuu"))
+
     def test_stt_segmentation_profile_chat_defaults_are_dictation_friendly(self) -> None:
         profile = direct_chat._stt_segmentation_profile(True)
         self.assertGreaterEqual(int(profile.get("min_speech_ms", 0) or 0), 180)
