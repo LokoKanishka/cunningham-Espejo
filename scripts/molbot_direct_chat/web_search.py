@@ -40,6 +40,21 @@ def extract_web_search_query(message: str) -> str | None:
         q = (m.group(1) or "").strip().strip("\"'").strip()
         if q:
             return q[:400]
+
+    # Common "latest/news" asks should also trigger local web search to avoid
+    # stale/hallucinated answers when the user did request current information.
+    news_patterns = [
+        r"(?:noticias|novedades|actualidad|ultima(?:s)?|última(?:s)?)\s+(?:de|del|sobre)\s+(.+)$",
+        r"(?:pod[eé]s?\s+contar(?:me)?|cont(?:a|á|á)me|cu[ée]nta(?:me)?|dec(?:ime|íme)|resum(?:ime|íme))\s+noticias\s+(?:de|del|sobre)\s+(.+)$",
+        r"(?:que|qué)\s+(?:pasa|hay)\s+(?:con|en)\s+(.+?)\s+(?:hoy|ahora|actualmente)\b",
+    ]
+    for pat in news_patterns:
+        m = re.search(pat, msg, flags=re.IGNORECASE | re.DOTALL)
+        if not m:
+            continue
+        q = (m.group(1) or "").strip().strip("\"'").strip(" \t,.;:!?¡¿")
+        if q:
+            return q[:400]
     return None
 
 
