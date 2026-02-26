@@ -1723,6 +1723,9 @@ def _voice_chat_model_payload(session_id: str) -> dict:
     sid = _safe_session_id(session_id or "default")
     catalog = _model_catalog()
     model_id = str(catalog.get("default_model", "openai-codex/gpt-5.1-codex-mini")).strip() or "openai-codex/gpt-5.1-codex-mini"
+    model_override = str(os.environ.get("DIRECT_CHAT_STT_BRIDGE_MODEL", "")).strip()
+    if model_override:
+        model_id = model_override
     backend = "cloud"
     by_id = catalog.get("by_id", {})
     if isinstance(by_id, dict):
@@ -1731,7 +1734,15 @@ def _voice_chat_model_payload(session_id: str) -> dict:
             b = str(meta.get("backend", "cloud")).strip().lower()
             if b in ("cloud", "local"):
                 backend = b
+    backend_override = str(os.environ.get("DIRECT_CHAT_STT_BRIDGE_BACKEND", "")).strip().lower()
+    if backend_override in ("cloud", "local"):
+        backend = backend_override
     history = _load_history(sid, model=model_id, backend=backend)
+    hist_limit = max(0, _int_env("DIRECT_CHAT_STT_BRIDGE_HISTORY_MAX", 24))
+    if isinstance(history, list) and hist_limit > 0:
+        history = history[-hist_limit:]
+    elif hist_limit <= 0:
+        history = []
     return {
         "session_id": sid,
         "model": model_id,
@@ -1750,6 +1761,8 @@ def _voice_chat_submit_backend(session_id: str, text: str, ts: float = 0.0) -> b
     if _DIRECT_CHAT_HTTP_PORT <= 0:
         return False
     model_payload = _voice_chat_model_payload(sid)
+    allow_firefox = _env_flag("DIRECT_CHAT_STT_BRIDGE_ALLOW_FIREFOX", False)
+    bridge_tools = ["tts"] + (["firefox"] if allow_firefox else [])
     payload = {
         "message": clean,
         "session_id": sid,
@@ -1757,7 +1770,7 @@ def _voice_chat_submit_backend(session_id: str, text: str, ts: float = 0.0) -> b
         "model_backend": str(model_payload.get("model_backend", "cloud")),
         "history": model_payload.get("history", []),
         "mode": "operativo",
-        "allowed_tools": ["firefox", "tts"],
+        "allowed_tools": bridge_tools,
         "attachments": [],
         "source": "voice_server_bridge",
         "voice_item_ts": float(ts or 0.0),

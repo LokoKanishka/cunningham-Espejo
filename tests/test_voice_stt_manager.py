@@ -39,6 +39,17 @@ class TestVoiceSttManager(unittest.TestCase):
         with direct_chat._UI_SESSION_HINT_LOCK:
             direct_chat._UI_LAST_SESSION_ID = ""
             direct_chat._UI_LAST_SEEN_TS = 0.0
+        self._env_backup = {
+            "DIRECT_CHAT_STT_BRIDGE_HISTORY_MAX": os.environ.get("DIRECT_CHAT_STT_BRIDGE_HISTORY_MAX"),
+            "DIRECT_CHAT_STT_BRIDGE_ALLOW_FIREFOX": os.environ.get("DIRECT_CHAT_STT_BRIDGE_ALLOW_FIREFOX"),
+        }
+
+    def tearDown(self) -> None:
+        for key, val in self._env_backup.items():
+            if val is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = val
 
     def test_default_voice_state_enables_stt_chat(self) -> None:
         prev = os.environ.get("DIRECT_CHAT_STT_CHAT_ENABLED")
@@ -510,6 +521,63 @@ class TestVoiceSttManager(unittest.TestCase):
         self.assertFalse(direct_chat._voice_chat_should_process("sess_a", "hola", ts=10.1))
         self.assertTrue(direct_chat._voice_chat_should_process("sess_a", "hola", ts=10.2))
         self.assertTrue(direct_chat._voice_chat_should_process("sess_b", "hola", ts=10.1))
+
+    def test_voice_chat_model_payload_trims_history_for_bridge(self) -> None:
+        prev_load_history = direct_chat._load_history
+        prev_model_catalog = direct_chat._model_catalog
+        try:
+            os.environ["DIRECT_CHAT_STT_BRIDGE_HISTORY_MAX"] = "3"
+            direct_chat._load_history = lambda *args, **kwargs: [  # type: ignore
+                {"role": "user", "content": f"m{i}"} for i in range(7)
+            ]
+            direct_chat._model_catalog = lambda *args, **kwargs: {  # type: ignore
+                "default_model": "openai-codex/gpt-5.1-codex-mini",
+                "by_id": {"openai-codex/gpt-5.1-codex-mini": {"backend": "cloud"}},
+            }
+            payload = direct_chat._voice_chat_model_payload("sess_a")
+        finally:
+            direct_chat._load_history = prev_load_history  # type: ignore
+            direct_chat._model_catalog = prev_model_catalog  # type: ignore
+        hist = payload.get("history", [])
+        self.assertEqual(len(hist), 3)
+        self.assertEqual([it.get("content") for it in hist], ["m4", "m5", "m6"])
+
+    def test_voice_chat_submit_backend_uses_tts_only_tools_by_default(self) -> None:
+        seen_payload = {}
+        prev_voice_enabled = direct_chat._voice_enabled
+        prev_bridge_enabled = direct_chat._voice_server_chat_bridge_enabled
+        prev_model_payload = direct_chat._voice_chat_model_payload
+        prev_requests_post = direct_chat.requests.post
+        prev_http_port = direct_chat._DIRECT_CHAT_HTTP_PORT
+        try:
+            os.environ["DIRECT_CHAT_STT_BRIDGE_ALLOW_FIREFOX"] = "0"
+            direct_chat._DIRECT_CHAT_HTTP_PORT = 8787
+            direct_chat._voice_enabled = lambda: True  # type: ignore
+            direct_chat._voice_server_chat_bridge_enabled = lambda: True  # type: ignore
+            direct_chat._voice_chat_model_payload = lambda _sid: {  # type: ignore
+                "model": "openai-codex/gpt-5.1-codex-mini",
+                "model_backend": "cloud",
+                "history": [],
+            }
+
+            class _Resp:
+                status_code = 200
+
+            def _fake_post(url, json=None, timeout=None):  # noqa: A002
+                _ = (url, timeout)
+                seen_payload.update(json or {})
+                return _Resp()
+
+            direct_chat.requests.post = _fake_post  # type: ignore
+            ok = direct_chat._voice_chat_submit_backend("sess_a", "hola", ts=1.2)
+        finally:
+            direct_chat._voice_enabled = prev_voice_enabled  # type: ignore
+            direct_chat._voice_server_chat_bridge_enabled = prev_bridge_enabled  # type: ignore
+            direct_chat._voice_chat_model_payload = prev_model_payload  # type: ignore
+            direct_chat.requests.post = prev_requests_post  # type: ignore
+            direct_chat._DIRECT_CHAT_HTTP_PORT = prev_http_port
+        self.assertTrue(ok)
+        self.assertEqual(seen_payload.get("allowed_tools"), ["tts"])
 
     def test_stt_chat_drop_reason_rules(self) -> None:
         self.assertEqual(direct_chat._stt_chat_drop_reason("suscribite", min_words_chat=2), "chat_banned_phrase")
