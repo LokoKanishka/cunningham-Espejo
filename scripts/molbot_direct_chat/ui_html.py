@@ -615,7 +615,7 @@ HTML = r"""<!doctype html>
 	      if (!voiceEnabled) return;
 	      if (sttSending) return;
 	      try {
-	        const q = new URLSearchParams({ session_id: sessionId, limit: "2" });
+	        const q = new URLSearchParams({ session_id: sessionId, limit: "2", consumer: "ui" });
 	        const r = await fetch(`/api/stt/poll?${q.toString()}`);
 	        if (r.status === 409) {
 	          await claimVoiceOwner();

@@ -856,7 +856,7 @@ def _voice_command_kind(text: str) -> str:
         return "pause"
     if any(tok in ("pauza", "posa", "poza") for tok in compact_tokens):
         return "pause"
-    if any(k in compact for k in ("paus", "pauz", "deten", "parar", "para ", "alto", "basta", "stop")):
+    if any(k in compact for k in ("paus", "pauz", "deten", "parar", "alto", "basta", "stop")):
         return "pause"
     if re.search(
         r"^(detenete|detente|pausa|pauza|posa|poza|pausa lectura|pausar lectura|detener lectura|parar lectura|basta|stop)\b",
@@ -1798,6 +1798,8 @@ def _voice_chat_bridge_process_items(session_id: str, items: list[dict]) -> int:
         return 0
     processed = 0
     chat_min_words = max(1, _int_env("DIRECT_CHAT_STT_CHAT_MIN_WORDS", 2))
+    latest_chat_text = ""
+    latest_chat_ts = 0.0
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -1831,8 +1833,13 @@ def _voice_chat_bridge_process_items(session_id: str, items: list[dict]) -> int:
             ts = float(item.get("ts", 0.0) or 0.0)
         except Exception:
             ts = 0.0
+        # Keep only the latest dictation text from this poll batch to avoid
+        # queueing stale phrases while a previous backend call is in-flight.
+        latest_chat_text = text
+        latest_chat_ts = ts
+    if latest_chat_text:
         target_sid = _recent_ui_session_id() or sid
-        if _voice_chat_submit_backend(target_sid, text, ts=ts):
+        if _voice_chat_submit_backend(target_sid, latest_chat_text, ts=latest_chat_ts):
             if target_sid != sid and target_sid and target_sid != "default":
                 try:
                     _STT_MANAGER.claim_owner(target_sid)
@@ -1856,7 +1863,8 @@ def _voice_chat_bridge_loop() -> None:
             if not bool(st.get("stt_enabled", False)) or not bool(st.get("stt_chat_enabled", False)):
                 _VOICE_CHAT_BRIDGE_STOP.wait(0.35)
                 continue
-            items = _STT_MANAGER.poll(session_id=sid, limit=4)
+            batch_limit = max(1, min(24, _int_env("DIRECT_CHAT_STT_BRIDGE_POLL_LIMIT", 12)))
+            items = _STT_MANAGER.poll(session_id=sid, limit=batch_limit)
             if items:
                 _voice_chat_bridge_process_items(sid, items)
         except Exception:
@@ -8046,6 +8054,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/stt/poll":
             query = parse_qs(parsed.query)
             sid = _safe_session_id((query.get("session_id", ["default"])[0]))
+            consumer = str(query.get("consumer", [""])[0]).strip().lower()
             try:
                 limit = int(str(query.get("limit", ["3"])[0]).strip() or "3")
             except Exception:
@@ -8064,7 +8073,12 @@ class Handler(BaseHTTPRequestHandler):
                     },
                 )
                 return
-            items = _STT_MANAGER.poll(session_id=sid, limit=limit)
+            # When server-side chat bridge is active, UI polling must not drain
+            # STT items or messages may be lost by double-consumption.
+            if consumer == "ui" and _voice_server_chat_bridge_enabled() and _DIRECT_CHAT_HTTP_PORT > 0:
+                items = []
+            else:
+                items = _STT_MANAGER.poll(session_id=sid, limit=limit)
             stt_status = _STT_MANAGER.status()
             self._json(
                 200,
@@ -8624,13 +8638,30 @@ class Handler(BaseHTTPRequestHandler):
                 # If the selected model is unknown/missing, still allow local actions.
                 local_action = _maybe_handle_local_action(message, allowed_tools, session_id=session_id)
                 if local_action is not None:
+                    reply = str(local_action.get("reply", ""))
+                    merged_local = []
+                    raw_hist = payload.get("history", [])
+                    if isinstance(raw_hist, list):
+                        for item in raw_hist[-80:]:
+                            if isinstance(item, dict) and item.get("role") in ("user", "assistant") and isinstance(item.get("content"), str):
+                                merged_local.append({"role": item["role"], "content": item["content"]})
+                    merged_local.append({"role": "user", "content": message})
+                    merged_local.append({"role": "assistant", "content": reply})
+                    _save_history(session_id, merged_local, model=model, backend=requested_backend)
+                    _chat_events_append(
+                        session_id,
+                        role="user",
+                        content=message,
+                        source=user_msg_source,
+                        ts=voice_item_ts if is_voice_origin else time.time(),
+                    )
+                    _chat_events_append(session_id, role="assistant", content=reply, source="local_action", ts=time.time())
                     if self.path == "/api/chat/stream":
                         self.send_response(200)
                         self.send_header("Content-Type", "text/event-stream")
                         self.send_header("Cache-Control", "no-cache")
                         self.send_header("Connection", "close")
                         self.end_headers()
-                        reply = str(local_action.get("reply", ""))
                         if (not _is_voice_control_command(message)) and (not bool(local_action.get("no_auto_tts"))):
                             _maybe_speak_reply(reply, allowed_tools)
                         event = {"token": reply}
@@ -8646,7 +8677,7 @@ class Handler(BaseHTTPRequestHandler):
                         self.close_connection = True
                         return
                     if (not _is_voice_control_command(message)) and (not bool(local_action.get("no_auto_tts"))):
-                        _maybe_speak_reply(str(local_action.get("reply", "")), allowed_tools)
+                        _maybe_speak_reply(reply, allowed_tools)
                     self._json(200, local_action)
                     return
                 self._json(400, e.as_payload())
@@ -8667,13 +8698,29 @@ class Handler(BaseHTTPRequestHandler):
 
             local_action = _maybe_handle_local_action(message, allowed_tools, session_id=session_id)
             if local_action is not None:
+                reply = str(local_action.get("reply", ""))
+                merged_local = []
+                if isinstance(history, list):
+                    for item in history[-80:]:
+                        if isinstance(item, dict) and item.get("role") in ("user", "assistant") and isinstance(item.get("content"), str):
+                            merged_local.append({"role": item["role"], "content": item["content"]})
+                merged_local.append({"role": "user", "content": message})
+                merged_local.append({"role": "assistant", "content": reply})
+                _save_history(session_id, merged_local, model=model, backend=resolved_backend)
+                _chat_events_append(
+                    session_id,
+                    role="user",
+                    content=message,
+                    source=user_msg_source,
+                    ts=voice_item_ts if is_voice_origin else time.time(),
+                )
+                _chat_events_append(session_id, role="assistant", content=reply, source="local_action", ts=time.time())
                 if self.path == "/api/chat/stream":
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream")
                     self.send_header("Cache-Control", "no-cache")
                     self.send_header("Connection", "close")
                     self.end_headers()
-                    reply = str(local_action.get("reply", ""))
                     if (not _is_voice_control_command(message)) and (not bool(local_action.get("no_auto_tts"))):
                         _maybe_speak_reply(reply, allowed_tools)
                     event = {"token": reply}
@@ -8690,7 +8737,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
 
                 if (not _is_voice_control_command(message)) and (not bool(local_action.get("no_auto_tts"))):
-                    _maybe_speak_reply(str(local_action.get("reply", "")), allowed_tools)
+                    _maybe_speak_reply(reply, allowed_tools)
                 self._json(200, local_action)
                 return
 

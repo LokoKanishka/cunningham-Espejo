@@ -278,6 +278,7 @@ class TestVoiceSttManager(unittest.TestCase):
         self.assertEqual(direct_chat._voice_command_kind("poza"), "pause")
         self.assertEqual(direct_chat._voice_command_kind("continuar"), "continue")
         self.assertEqual(direct_chat._voice_command_kind("repetir"), "repeat")
+        self.assertEqual(direct_chat._voice_command_kind("que me podes leer de atras para adelante"), "")
         self.assertEqual(direct_chat._voice_command_kind("esposa"), "")
         self.assertEqual(direct_chat._voice_command_kind("frase libre"), "")
 
@@ -391,6 +392,27 @@ class TestVoiceSttManager(unittest.TestCase):
             direct_chat._voice_chat_submit_backend = prev_submit  # type: ignore
         self.assertEqual(out, 2)
         self.assertEqual(seen, [("sess_a", "hola", 12.5)])
+
+    def test_voice_chat_bridge_process_items_keeps_latest_chat_text_per_batch(self) -> None:
+        seen = []
+        prev_submit = direct_chat._voice_chat_submit_backend
+        def _fake_submit(sid, text, ts=0.0):
+            seen.append((sid, text, ts))
+            return True
+        try:
+            direct_chat._voice_chat_submit_backend = _fake_submit  # type: ignore
+            out = direct_chat._voice_chat_bridge_process_items(
+                "sess_a",
+                [
+                    {"kind": "chat_text", "text": "hola uno", "ts": 1.0},
+                    {"kind": "chat_text", "text": "hola dos", "ts": 2.0},
+                    {"kind": "chat_text", "text": "hola tres", "ts": 3.0},
+                ],
+            )
+        finally:
+            direct_chat._voice_chat_submit_backend = prev_submit  # type: ignore
+        self.assertEqual(out, 1)
+        self.assertEqual(seen, [("sess_a", "hola tres", 3.0)])
 
     def test_voice_chat_bridge_process_items_pauses_tts_for_voice_any_command(self) -> None:
         pauses = []
