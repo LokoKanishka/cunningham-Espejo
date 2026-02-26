@@ -6,6 +6,7 @@ import queue
 import re
 import threading
 import time
+from collections import deque
 from typing import Callable, Optional
 
 
@@ -27,6 +28,7 @@ class STTConfig:
     chat_min_speech_ms: int = 180
     max_silence_ms: int = 350
     max_segment_s: float = 2.0
+    start_preroll_ms: int = 260
     rms_speech_threshold: float = 0.002
     rms_min_frames: int = 2
     segment_hysteresis_off_ratio: float = 0.65
@@ -540,6 +542,9 @@ class STTWorker:
         rms_consecutive = 0
         noise_rms_samples: list[float] = []
         noise_window_max = max(10, int(1200 / max(10, int(cfg.frame_ms))))
+        preroll_ms = max(0, min(1000, int(getattr(cfg, "start_preroll_ms", 0) or 0)))
+        preroll_frames_cap = max(0, int(round(float(preroll_ms) / max(10.0, float(cfg.frame_ms)))))
+        preroll_frames: deque[bytes] | None = deque(maxlen=preroll_frames_cap) if preroll_frames_cap > 0 else None
         noise_floor_current = 0.0
         effective_seg_thr_current = max(0.006, float(cfg.rms_speech_threshold))
         segment_thr_off_current = max(0.0003, effective_seg_thr_current * max(0.10, min(0.95, float(cfg.segment_hysteresis_off_ratio))))
@@ -573,6 +578,7 @@ class STTWorker:
                 "segment_thr_on": float(effective_seg_thr_current),
                 "segment_thr_off": float(segment_thr_off_current),
                 "min_segment_ms": int(effective_min_segment_ms),
+                "start_preroll_ms": int(preroll_ms),
                 "speech_hangover_ms": int(max(0, hangover_left_ms)),
                 "speech_state": speech_state,
                 "stt_preamp_gain": float(preamp_gain_current),
@@ -593,6 +599,14 @@ class STTWorker:
             last_voice_mono = 0.0
             current_silence_ms = 0
             hangover_left_ms = 0
+
+        def remember_preroll(frame_pcm16: bytes) -> None:
+            if preroll_frames is None or (not frame_pcm16):
+                return
+            try:
+                preroll_frames.append(frame_pcm16)
+            except Exception:
+                return
 
         def maybe_emit_segment(pcm16: bytes):
             nonlocal last_segment_ms
@@ -711,6 +725,10 @@ class STTWorker:
                     speech_start_mono = now
                     last_voice_mono = now
                     buf = bytearray()
+                    if preroll_frames:
+                        for f in preroll_frames:
+                            if f:
+                                buf.extend(f)
                 buf.extend(frame_pcm16)
                 last_voice_mono = now
                 if (now - speech_start_mono) > cfg.max_segment_s:
@@ -720,6 +738,7 @@ class STTWorker:
                 if not in_speech:
                     current_silence_ms = int(min(60000, current_silence_ms + cfg.frame_ms))
                     emit_runtime_diag()
+                    remember_preroll(frame_pcm16)
                     return
                 silence_ms = int((now - last_voice_mono) * 1000)
                 current_silence_ms = silence_ms
@@ -727,6 +746,7 @@ class STTWorker:
                     maybe_emit_segment(bytes(buf))
                     reset_segment()
             emit_runtime_diag()
+            remember_preroll(frame_pcm16)
 
         try:
             with stream:
@@ -756,6 +776,8 @@ class STTWorker:
                         # Anti-eco gating: drop everything and reset segments.
                         emit_runtime_diag({"kind": "stt_drop", "reason": "should_listen_false"})
                         reset_segment()
+                        if preroll_frames is not None:
+                            preroll_frames.clear()
                         frame_buffer = bytearray()
                         rms_consecutive = 0
                         hangover_left_ms = 0

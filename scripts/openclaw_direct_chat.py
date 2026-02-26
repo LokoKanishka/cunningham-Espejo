@@ -1331,6 +1331,7 @@ class STTManager:
             chat_min_speech_ms=int(seg_profile.get("chat_min_speech_ms", 180)),
             max_silence_ms=int(seg_profile.get("max_silence_ms", 350)),
             max_segment_s=float(seg_profile.get("max_segment_s", 1.8)),
+            start_preroll_ms=max(0, min(1000, self._env_int("DIRECT_CHAT_STT_START_PREROLL_MS", 260))),
             rms_speech_threshold=max(0.0005, float(segment_rms_threshold)),
             rms_min_frames=max(1, self._env_int("DIRECT_CHAT_STT_RMS_MIN_FRAMES", 2)),
             segment_hysteresis_off_ratio=max(
