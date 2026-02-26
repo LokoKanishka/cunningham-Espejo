@@ -142,7 +142,7 @@ _UI_SESSION_HINT_LOCK = threading.Lock()
 _UI_LAST_SESSION_ID = ""
 _UI_LAST_SEEN_TS = 0.0
 _STT_CHAT_BANNED_RE = re.compile(r"\bsuscrib\w*\b|\bsubscribe\b", flags=re.IGNORECASE)
-_STT_CHAT_ALLOW_SHORT = {"hola", "ok", "si", "sí", "no"}
+_STT_CHAT_ALLOW_SHORT = {"hola", "ok", "si", "sí", "no", "eh", "ey", "aca", "acá", "dale", "listo", "bueno"}
 
 
 def _bargein_config() -> dict:
@@ -610,7 +610,7 @@ def _default_voice_state() -> dict:
         "speaker": str(os.environ.get("DIRECT_CHAT_TTS_SPEAKER", "Ana Florence")).strip() or "Ana Florence",
         "speaker_wav": str(os.environ.get("DIRECT_CHAT_TTS_SPEAKER_WAV", "")).strip(),
         "stt_device": str(os.environ.get("DIRECT_CHAT_STT_DEVICE", "")).strip(),
-        "stt_min_chars": max(1, _int_env("DIRECT_CHAT_STT_MIN_CHARS", 3)),
+        "stt_min_chars": max(1, _int_env("DIRECT_CHAT_STT_MIN_CHARS", 2)),
         "stt_command_only": _env_flag("DIRECT_CHAT_STT_COMMAND_ONLY", True),
         "stt_chat_enabled": _env_flag("DIRECT_CHAT_STT_CHAT_ENABLED", True),
         "stt_debug": _env_flag("DIRECT_CHAT_STT_DEBUG", False),
@@ -619,8 +619,8 @@ def _default_voice_state() -> dict:
         "stt_rms_threshold": float(legacy_threshold),
         # New split thresholds.
         "stt_segment_rms_threshold": _clamp_float(
-            os.environ.get("DIRECT_CHAT_STT_SEGMENT_RMS_THRESHOLD", "0.002"),
-            default=0.002,
+            os.environ.get("DIRECT_CHAT_STT_SEGMENT_RMS_THRESHOLD", "0.0015"),
+            default=0.0015,
             min_value=0.0005,
         ),
         "stt_barge_rms_threshold": _clamp_float(
@@ -630,10 +630,43 @@ def _default_voice_state() -> dict:
         ),
         "stt_barge_any": _env_flag("DIRECT_CHAT_STT_BARGE_ANY", False),
         "stt_barge_any_cooldown_ms": max(300, _int_env("DIRECT_CHAT_STT_BARGE_ANY_COOLDOWN_MS", 1200)),
-        "stt_preamp_gain": max(0.05, float(os.environ.get("DIRECT_CHAT_STT_PREAMP_GAIN", "1.0") or 1.0)),
-        "stt_agc_enabled": _env_flag("DIRECT_CHAT_STT_AGC_ENABLED", False),
-        "stt_agc_target_rms": max(0.01, min(0.30, float(os.environ.get("DIRECT_CHAT_STT_AGC_TARGET_RMS", "0.06") or 0.06))),
+        "stt_preamp_gain": max(0.05, float(os.environ.get("DIRECT_CHAT_STT_PREAMP_GAIN", "1.8") or 1.8)),
+        "stt_agc_enabled": _env_flag("DIRECT_CHAT_STT_AGC_ENABLED", True),
+        "stt_agc_target_rms": max(0.01, min(0.30, float(os.environ.get("DIRECT_CHAT_STT_AGC_TARGET_RMS", "0.08") or 0.08))),
     }
+
+
+def _autotune_voice_capture_state(state: dict) -> dict:
+    if not isinstance(state, dict):
+        return {}
+    if not _env_flag("DIRECT_CHAT_STT_CAPTURE_AUTOTUNE", True):
+        return state
+    if not bool(state.get("stt_chat_enabled", True)):
+        return state
+    try:
+        state["stt_preamp_gain"] = max(1.8, min(3.0, float(state.get("stt_preamp_gain", 1.8) or 1.8)))
+    except Exception:
+        state["stt_preamp_gain"] = 1.8
+    state["stt_agc_enabled"] = True
+    try:
+        state["stt_agc_target_rms"] = max(0.07, min(0.14, float(state.get("stt_agc_target_rms", 0.08) or 0.08)))
+    except Exception:
+        state["stt_agc_target_rms"] = 0.08
+    try:
+        seg_thr = max(0.0008, min(0.0045, float(state.get("stt_segment_rms_threshold", 0.002) or 0.002)))
+    except Exception:
+        seg_thr = 0.002
+    state["stt_segment_rms_threshold"] = float(seg_thr)
+    try:
+        legacy_thr = max(0.001, min(0.012, float(state.get("stt_rms_threshold", 0.012) or 0.012)))
+    except Exception:
+        legacy_thr = 0.012
+    state["stt_rms_threshold"] = float(legacy_thr)
+    try:
+        state["stt_min_chars"] = max(1, min(2, int(state.get("stt_min_chars", 2) or 2)))
+    except Exception:
+        state["stt_min_chars"] = 2
+    return state
 
 
 def _load_voice_state() -> dict:
@@ -715,6 +748,7 @@ def _load_voice_state() -> dict:
                     state["stt_agc_target_rms"] = max(0.01, min(0.30, float(state.get("stt_agc_target_rms", 0.06))))
     except Exception:
         pass
+    state = _autotune_voice_capture_state(state)
     # Safety pass for older persisted states.
     state["stt_rms_threshold"] = _stt_legacy_rms_threshold_from_state(state)
     state["stt_segment_rms_threshold"] = _stt_segment_rms_threshold_from_state(state)
@@ -815,12 +849,12 @@ def _stt_chat_drop_reason(text: str, min_words_chat: int = 2) -> str:
 
 def _stt_segmentation_profile(chat_enabled: bool) -> dict:
     if bool(chat_enabled):
-        min_ms = max(180, _int_env("DIRECT_CHAT_STT_CHAT_MIN_SEGMENT_MS", 250))
+        min_ms = max(150, _int_env("DIRECT_CHAT_STT_CHAT_MIN_SEGMENT_MS", 180))
         return {
             "min_speech_ms": int(min_ms),
             "chat_min_speech_ms": int(min_ms),
-            "max_silence_ms": int(max(250, _int_env("DIRECT_CHAT_STT_CHAT_MAX_SILENCE_MS", 600))),
-            "max_segment_s": float(max(1.8, _float_env("DIRECT_CHAT_STT_CHAT_MAX_SEGMENT_SEC", 3.5))),
+            "max_silence_ms": int(max(250, _int_env("DIRECT_CHAT_STT_CHAT_MAX_SILENCE_MS", 450))),
+            "max_segment_s": float(max(1.8, _float_env("DIRECT_CHAT_STT_CHAT_MAX_SEGMENT_SEC", 2.6))),
         }
     return {
         "min_speech_ms": int(max(120, _int_env("DIRECT_CHAT_STT_MIN_SPEECH_MS", 220))),
@@ -918,7 +952,7 @@ class STTManager:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._worker = None
-        self._queue: queue.Queue[dict] = queue.Queue(maxsize=max(1, self._env_int("DIRECT_CHAT_STT_QUEUE_SIZE", 24)))
+        self._queue: queue.Queue[dict] = queue.Queue(maxsize=max(1, self._env_int("DIRECT_CHAT_STT_QUEUE_SIZE", 64)))
         self._enabled = False
         self._owner_session_id = ""
         self._last_error = ""

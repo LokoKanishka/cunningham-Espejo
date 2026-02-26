@@ -64,6 +64,13 @@ ALLOW_SHORT = {
     "poza",
     "detenete",
     "continuar",
+    "eh",
+    "ey",
+    "aca",
+    "acá",
+    "dale",
+    "listo",
+    "bueno",
 }
 
 
@@ -183,7 +190,7 @@ def _effective_segment_threshold(config_threshold: float, noise_samples: list[fl
     else:
         noise_floor = 0.0
     # Guardrail: avoid near-zero thresholds that keep speech_like latched forever.
-    return max(0.006, cfg_thr, noise_floor * 3.0)
+    return max(0.004, cfg_thr, noise_floor * 2.8)
 
 
 def _apply_preamp_agc_frame(

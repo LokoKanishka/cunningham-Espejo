@@ -42,6 +42,7 @@ class TestVoiceSttManager(unittest.TestCase):
         self._env_backup = {
             "DIRECT_CHAT_STT_BRIDGE_HISTORY_MAX": os.environ.get("DIRECT_CHAT_STT_BRIDGE_HISTORY_MAX"),
             "DIRECT_CHAT_STT_BRIDGE_ALLOW_FIREFOX": os.environ.get("DIRECT_CHAT_STT_BRIDGE_ALLOW_FIREFOX"),
+            "DIRECT_CHAT_STT_CAPTURE_AUTOTUNE": os.environ.get("DIRECT_CHAT_STT_CAPTURE_AUTOTUNE"),
         }
 
     def tearDown(self) -> None:
@@ -583,13 +584,33 @@ class TestVoiceSttManager(unittest.TestCase):
         self.assertEqual(direct_chat._stt_chat_drop_reason("suscribite", min_words_chat=2), "chat_banned_phrase")
         self.assertEqual(direct_chat._stt_chat_drop_reason("hola", min_words_chat=2), "")
         self.assertEqual(direct_chat._stt_chat_drop_reason("me escuchas", min_words_chat=2), "")
-        self.assertEqual(direct_chat._stt_chat_drop_reason("eh", min_words_chat=2), "chat_too_few_words")
+        self.assertEqual(direct_chat._stt_chat_drop_reason("eh", min_words_chat=2), "")
 
     def test_stt_segmentation_profile_chat_defaults_are_dictation_friendly(self) -> None:
         profile = direct_chat._stt_segmentation_profile(True)
-        self.assertGreaterEqual(int(profile.get("min_speech_ms", 0) or 0), 250)
-        self.assertGreaterEqual(int(profile.get("max_silence_ms", 0) or 0), 600)
-        self.assertGreaterEqual(float(profile.get("max_segment_s", 0.0) or 0.0), 3.5)
+        self.assertGreaterEqual(int(profile.get("min_speech_ms", 0) or 0), 180)
+        self.assertGreaterEqual(int(profile.get("max_silence_ms", 0) or 0), 450)
+        self.assertGreaterEqual(float(profile.get("max_segment_s", 0.0) or 0.0), 2.6)
+
+    def test_voice_capture_autotune_raises_gain_and_lowers_seg_threshold(self) -> None:
+        os.environ["DIRECT_CHAT_STT_CAPTURE_AUTOTUNE"] = "1"
+        tuned = direct_chat._autotune_voice_capture_state(
+            {
+                "stt_chat_enabled": True,
+                "stt_preamp_gain": 1.0,
+                "stt_agc_enabled": False,
+                "stt_agc_target_rms": 0.06,
+                "stt_segment_rms_threshold": 0.008,
+                "stt_rms_threshold": 0.02,
+                "stt_min_chars": 3,
+            }
+        )
+        self.assertGreaterEqual(float(tuned.get("stt_preamp_gain", 0.0) or 0.0), 1.8)
+        self.assertTrue(bool(tuned.get("stt_agc_enabled")))
+        self.assertGreaterEqual(float(tuned.get("stt_agc_target_rms", 0.0) or 0.0), 0.07)
+        self.assertLessEqual(float(tuned.get("stt_segment_rms_threshold", 1.0) or 1.0), 0.0045)
+        self.assertLessEqual(float(tuned.get("stt_rms_threshold", 1.0) or 1.0), 0.012)
+        self.assertLessEqual(int(tuned.get("stt_min_chars", 99) or 99), 2)
 
     def test_stt_manager_chat_mode_filters_banned_phrase(self) -> None:
         mgr = direct_chat.STTManager()
