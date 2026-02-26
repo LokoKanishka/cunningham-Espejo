@@ -118,6 +118,33 @@ class TestVoiceSttManager(unittest.TestCase):
         self.assertEqual(mgr.poll("sess_a", limit=5), [])
         mgr.disable()
 
+    def test_resolve_stt_device_replaces_loopback_with_physical_input(self) -> None:
+        mgr = direct_chat.STTManager()
+        prev_allow = os.environ.get("DIRECT_CHAT_STT_ALLOW_LOOPBACK_DEVICE")
+        try:
+            os.environ["DIRECT_CHAT_STT_ALLOW_LOOPBACK_DEVICE"] = "0"
+            mgr.list_devices = lambda: [  # type: ignore
+                {"index": 14, "name": "pulse", "default": False},
+                {"index": 4, "name": "HD Pro Webcam C920: USB Audio (hw:1,0)", "default": True},
+                {"index": 8, "name": "USB Audio: - (hw:4,0)", "default": False},
+            ]
+            out = mgr._resolve_stt_device(14)
+            self.assertEqual(out, 4)
+        finally:
+            if prev_allow is None:
+                os.environ.pop("DIRECT_CHAT_STT_ALLOW_LOOPBACK_DEVICE", None)
+            else:
+                os.environ["DIRECT_CHAT_STT_ALLOW_LOOPBACK_DEVICE"] = prev_allow
+
+    def test_resolve_stt_device_keeps_non_loopback(self) -> None:
+        mgr = direct_chat.STTManager()
+        mgr.list_devices = lambda: [  # type: ignore
+            {"index": 14, "name": "pulse", "default": False},
+            {"index": 4, "name": "HD Pro Webcam C920: USB Audio (hw:1,0)", "default": True},
+        ]
+        out = mgr._resolve_stt_device(4)
+        self.assertEqual(out, 4)
+
     def test_stt_manager_poll_bypasses_tts_guard_for_voice_commands(self) -> None:
         mgr = direct_chat.STTManager()
         with mgr._lock:

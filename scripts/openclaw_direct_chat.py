@@ -1062,6 +1062,76 @@ class STTManager:
             raw = str(os.environ.get("DIRECT_CHAT_STT_DEVICE", "")).strip()
         return self._parse_device(raw)
 
+    @staticmethod
+    def _is_likely_loopback_device_name(name: str) -> bool:
+        n = str(name or "").strip().lower()
+        if not n:
+            return False
+        if n in ("pulse", "default", "default input", "default device"):
+            return True
+        markers = (
+            "monitor",
+            "loopback",
+            "stereo mix",
+            "what u hear",
+            "wave out",
+            "output",
+        )
+        return any(m in n for m in markers)
+
+    def _resolve_stt_device(self, configured_device):
+        if _env_flag("DIRECT_CHAT_STT_ALLOW_LOOPBACK_DEVICE", False):
+            return configured_device
+        devices = self.list_devices()
+        if not isinstance(devices, list) or not devices:
+            return configured_device
+
+        selected = None
+        if configured_device is not None:
+            for d in devices:
+                if not isinstance(d, dict):
+                    continue
+                idx = d.get("index")
+                name = str(d.get("name", "")).strip()
+                if isinstance(configured_device, int):
+                    if idx == configured_device:
+                        selected = d
+                        break
+                else:
+                    if str(configured_device).strip().lower() == name.lower():
+                        selected = d
+                        break
+
+        if selected is None:
+            return configured_device
+
+        sel_name = str(selected.get("name", ""))
+        if not self._is_likely_loopback_device_name(sel_name):
+            return configured_device
+
+        non_loopback = [
+            d
+            for d in devices
+            if isinstance(d, dict) and not self._is_likely_loopback_device_name(str(d.get("name", "")))
+        ]
+        if not non_loopback:
+            return configured_device
+
+        preferred = None
+        for d in non_loopback:
+            if bool(d.get("default", False)):
+                preferred = d
+                break
+        if preferred is None:
+            preferred = non_loopback[0]
+        replacement = preferred.get("index")
+        if isinstance(replacement, int):
+            self._log(
+                f"[stt] device_loopback_guard: configured={configured_device}({sel_name}) -> fallback={replacement}({preferred.get('name', '')})"
+            )
+            return replacement
+        return configured_device
+
     def _command_only_enabled(self) -> bool:
         state = self._voice_state()
         if "stt_command_only" in state:
@@ -1239,7 +1309,7 @@ class STTManager:
         except Exception:
             min_chars = max(1, int(min_chars_default))
         segment_rms_threshold = _stt_segment_rms_threshold_from_state(state)
-        selected_device = self._selected_stt_device()
+        selected_device = self._resolve_stt_device(self._selected_stt_device())
         chat_mode_enabled = bool(self._chat_enabled())
         seg_profile = _stt_segmentation_profile(chat_mode_enabled)
         try:
