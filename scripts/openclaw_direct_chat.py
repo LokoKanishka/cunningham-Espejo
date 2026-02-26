@@ -137,6 +137,8 @@ _VOICE_CHAT_BRIDGE_THREAD: threading.Thread | None = None
 _VOICE_CHAT_BRIDGE_STOP = threading.Event()
 _VOICE_CHAT_DEDUPE_LOCK = threading.Lock()
 _VOICE_CHAT_DEDUPE_BY_SESSION: dict[str, dict[str, float]] = {}
+_VOICE_CHAT_PENDING_LOCK = threading.Lock()
+_VOICE_CHAT_PENDING_BY_SESSION: dict[str, dict[str, float | str]] = {}
 _CHAT_EVENTS_LOCK = threading.Lock()
 _UI_SESSION_HINT_LOCK = threading.Lock()
 _UI_LAST_SESSION_ID = ""
@@ -1936,6 +1938,90 @@ def _voice_chat_submit_backend(session_id: str, text: str, ts: float = 0.0) -> b
     return bool(resp.status_code < 400)
 
 
+def _voice_chat_merge_text(prev_text: str, new_text: str) -> str:
+    prev = str(prev_text or "").strip()
+    new = str(new_text or "").strip()
+    if not prev:
+        return new
+    if not new:
+        return prev
+    prev_l = prev.lower()
+    new_l = new.lower()
+    if prev_l == new_l or prev_l.endswith(new_l):
+        return prev
+    if new_l.startswith(prev_l):
+        return new
+    if new_l in prev_l:
+        return prev
+    return f"{prev} {new}".strip()
+
+
+def _voice_chat_pending_put(session_id: str, text: str, ts: float = 0.0) -> None:
+    sid = _safe_session_id(session_id or "default")
+    clean = str(text or "").strip()
+    if not clean:
+        return
+    now_mono = time.monotonic()
+    try:
+        ts_val = float(ts or 0.0)
+    except Exception:
+        ts_val = 0.0
+    with _VOICE_CHAT_PENDING_LOCK:
+        prev = _VOICE_CHAT_PENDING_BY_SESSION.get(sid, {})
+        prev_text = str(prev.get("text", "")).strip() if isinstance(prev, dict) else ""
+        merged = _voice_chat_merge_text(prev_text, clean)
+        prev_ts = float(prev.get("ts", 0.0) or 0.0) if isinstance(prev, dict) else 0.0
+        _VOICE_CHAT_PENDING_BY_SESSION[sid] = {
+            "text": merged[:900],
+            "ts": max(prev_ts, ts_val),
+            "updated_mono": now_mono,
+        }
+
+
+def _voice_chat_pending_get(session_id: str) -> dict | None:
+    sid = _safe_session_id(session_id or "default")
+    with _VOICE_CHAT_PENDING_LOCK:
+        cur = _VOICE_CHAT_PENDING_BY_SESSION.get(sid)
+        if not isinstance(cur, dict):
+            return None
+        return dict(cur)
+
+
+def _voice_chat_pending_clear(session_id: str) -> None:
+    sid = _safe_session_id(session_id or "default")
+    with _VOICE_CHAT_PENDING_LOCK:
+        _VOICE_CHAT_PENDING_BY_SESSION.pop(sid, None)
+
+
+def _voice_chat_pending_ready(session_id: str, pending: dict) -> bool:
+    sid = _safe_session_id(session_id or "default")
+    if not isinstance(pending, dict):
+        return False
+    now_mono = time.monotonic()
+    settle_ms = max(120, _int_env("DIRECT_CHAT_STT_BRIDGE_COMMIT_SETTLE_MS", 850))
+    min_silence_ms = max(220, _int_env("DIRECT_CHAT_STT_BRIDGE_MIN_SILENCE_MS", 520))
+    max_wait_ms = max(settle_ms, _int_env("DIRECT_CHAT_STT_BRIDGE_MAX_WAIT_MS", 3200))
+    updated_mono = float(pending.get("updated_mono", now_mono) or now_mono)
+    elapsed_ms = int(max(0.0, (now_mono - updated_mono) * 1000.0))
+    st = _STT_MANAGER.status()
+    if not bool(st.get("stt_running", False)):
+        return True
+    if elapsed_ms >= max_wait_ms:
+        return True
+    if elapsed_ms < settle_ms:
+        return False
+    owner = str(st.get("stt_owner_session_id", "") or "").strip()
+    if owner and owner != sid:
+        return False
+    if bool(st.get("stt_in_speech", False)) or bool(st.get("stt_vad_active", False)):
+        return False
+    try:
+        silence_ms = int(st.get("stt_silence_ms", 0) or 0)
+    except Exception:
+        silence_ms = 0
+    return silence_ms >= min_silence_ms
+
+
 def _apply_voice_pause_interrupt(session_id: str, source: str = "voice_cmd", keyword: str = "") -> bool:
     sid = _safe_session_id(session_id or "default")
     src = str(source or "").strip().lower()
@@ -1961,7 +2047,7 @@ def _apply_voice_pause_interrupt(session_id: str, source: str = "voice_cmd", key
 def _voice_chat_bridge_process_items(session_id: str, items: list[dict]) -> int:
     sid = _safe_session_id(session_id or "default")
     if not isinstance(items, list):
-        return 0
+        items = []
     processed = 0
     chat_min_words = max(1, _int_env("DIRECT_CHAT_STT_CHAT_MIN_WORDS", 2))
     merged_window_sec = max(0.4, _float_env("DIRECT_CHAT_STT_BRIDGE_MERGE_WINDOW_SEC", 2.4))
@@ -2029,12 +2115,21 @@ def _voice_chat_bridge_process_items(session_id: str, items: list[dict]) -> int:
             merged_parts.append(part)
         latest_chat_text = " ".join(merged_parts).strip()
         latest_chat_ts = max((float(ts or 0.0) for _t, ts in chunks), default=0.0)
+        if latest_chat_text:
+            _voice_chat_pending_put(sid, latest_chat_text, ts=latest_chat_ts)
     else:
         latest_chat_text = ""
         latest_chat_ts = 0.0
-    if latest_chat_text and (not _stt_chat_drop_reason(latest_chat_text, min_words_chat=chat_min_words)):
+    pending = _voice_chat_pending_get(sid)
+    pending_text = str(pending.get("text", "")).strip() if isinstance(pending, dict) else ""
+    pending_ts = float(pending.get("ts", 0.0) or 0.0) if isinstance(pending, dict) else 0.0
+    if pending_text and _stt_chat_drop_reason(pending_text, min_words_chat=chat_min_words):
+        _voice_chat_pending_clear(sid)
+        pending_text = ""
+    if pending_text and _voice_chat_pending_ready(sid, pending or {}):
         target_sid = _recent_ui_session_id() or sid
-        if _voice_chat_submit_backend(target_sid, latest_chat_text, ts=latest_chat_ts):
+        if _voice_chat_submit_backend(target_sid, pending_text, ts=pending_ts):
+            _voice_chat_pending_clear(sid)
             if target_sid != sid and target_sid and target_sid != "default":
                 try:
                     _STT_MANAGER.claim_owner(target_sid)
@@ -2056,12 +2151,13 @@ def _voice_chat_bridge_loop() -> None:
             if not sid:
                 sid = "default"
             if not bool(st.get("stt_enabled", False)) or not bool(st.get("stt_chat_enabled", False)):
+                with _VOICE_CHAT_PENDING_LOCK:
+                    _VOICE_CHAT_PENDING_BY_SESSION.clear()
                 _VOICE_CHAT_BRIDGE_STOP.wait(0.35)
                 continue
             batch_limit = max(1, min(24, _int_env("DIRECT_CHAT_STT_BRIDGE_POLL_LIMIT", 12)))
             items = _STT_MANAGER.poll(session_id=sid, limit=batch_limit)
-            if items:
-                _voice_chat_bridge_process_items(sid, items)
+            _voice_chat_bridge_process_items(sid, items)
         except Exception:
             pass
         _VOICE_CHAT_BRIDGE_STOP.wait(0.22)

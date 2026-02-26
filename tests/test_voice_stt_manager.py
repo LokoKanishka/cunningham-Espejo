@@ -36,6 +36,8 @@ class TestVoiceSttManager(unittest.TestCase):
     def setUp(self) -> None:
         with direct_chat._VOICE_CHAT_DEDUPE_LOCK:
             direct_chat._VOICE_CHAT_DEDUPE_BY_SESSION = {}
+        with direct_chat._VOICE_CHAT_PENDING_LOCK:
+            direct_chat._VOICE_CHAT_PENDING_BY_SESSION = {}
         with direct_chat._UI_SESSION_HINT_LOCK:
             direct_chat._UI_LAST_SESSION_ID = ""
             direct_chat._UI_LAST_SEEN_TS = 0.0
@@ -538,6 +540,68 @@ class TestVoiceSttManager(unittest.TestCase):
             direct_chat._voice_chat_submit_backend = prev_submit  # type: ignore
         self.assertEqual(out, 1)
         self.assertEqual(seen, [("sess_a", "hoy del conflicto entre iran y estados unidos", 10.4)])
+
+    def test_voice_chat_bridge_waits_until_silence_before_submit(self) -> None:
+        seen = []
+        prev_submit = direct_chat._voice_chat_submit_backend
+        prev_status = direct_chat._STT_MANAGER.status
+
+        state = {"in_speech": True, "silence_ms": 0}
+
+        def _fake_submit(sid, text, ts=0.0):
+            seen.append((sid, text, ts))
+            return True
+
+        def _fake_status():
+            return {
+                "stt_running": True,
+                "stt_enabled": True,
+                "stt_chat_enabled": True,
+                "stt_owner_session_id": "sess_a",
+                "stt_in_speech": bool(state["in_speech"]),
+                "stt_vad_active": bool(state["in_speech"]),
+                "stt_silence_ms": int(state["silence_ms"]),
+            }
+
+        prev_settle = os.environ.get("DIRECT_CHAT_STT_BRIDGE_COMMIT_SETTLE_MS")
+        prev_sil = os.environ.get("DIRECT_CHAT_STT_BRIDGE_MIN_SILENCE_MS")
+        try:
+            os.environ["DIRECT_CHAT_STT_BRIDGE_COMMIT_SETTLE_MS"] = "20"
+            os.environ["DIRECT_CHAT_STT_BRIDGE_MIN_SILENCE_MS"] = "40"
+            direct_chat._voice_chat_submit_backend = _fake_submit  # type: ignore
+            direct_chat._STT_MANAGER.status = _fake_status  # type: ignore
+            out1 = direct_chat._voice_chat_bridge_process_items(
+                "sess_a",
+                [{"kind": "chat_text", "text": "hoy del conflicto entre iran y estados", "ts": 1.0}],
+            )
+            self.assertEqual(out1, 0)
+            self.assertEqual(seen, [])
+            time.sleep(0.03)
+            out2 = direct_chat._voice_chat_bridge_process_items("sess_a", [])
+            self.assertEqual(out2, 0)
+            self.assertEqual(seen, [])
+            state["in_speech"] = False
+            state["silence_ms"] = 260
+            out3 = direct_chat._voice_chat_bridge_process_items(
+                "sess_a",
+                [{"kind": "chat_text", "text": "unidos", "ts": 1.2}],
+            )
+            self.assertEqual(out3, 0)
+            time.sleep(0.14)
+            out4 = direct_chat._voice_chat_bridge_process_items("sess_a", [])
+            self.assertEqual(out4, 1)
+        finally:
+            direct_chat._voice_chat_submit_backend = prev_submit  # type: ignore
+            direct_chat._STT_MANAGER.status = prev_status  # type: ignore
+            if prev_settle is None:
+                os.environ.pop("DIRECT_CHAT_STT_BRIDGE_COMMIT_SETTLE_MS", None)
+            else:
+                os.environ["DIRECT_CHAT_STT_BRIDGE_COMMIT_SETTLE_MS"] = prev_settle
+            if prev_sil is None:
+                os.environ.pop("DIRECT_CHAT_STT_BRIDGE_MIN_SILENCE_MS", None)
+            else:
+                os.environ["DIRECT_CHAT_STT_BRIDGE_MIN_SILENCE_MS"] = prev_sil
+        self.assertEqual(seen, [("sess_a", "hoy del conflicto entre iran y estados unidos", 1.2)])
 
     def test_voice_chat_bridge_process_items_pauses_tts_for_voice_any_command(self) -> None:
         pauses = []
