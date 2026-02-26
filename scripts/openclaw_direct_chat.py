@@ -8101,6 +8101,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/stt/poll":
             query = parse_qs(parsed.query)
             sid = _safe_session_id((query.get("session_id", ["default"])[0]))
+            _mark_ui_session_active(sid)
             consumer = str(query.get("consumer", [""])[0]).strip().lower()
             try:
                 limit = int(str(query.get("limit", ["3"])[0]).strip() or "3")
@@ -8141,6 +8142,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/stt/diag":
             query = parse_qs(parsed.query)
             sid = _safe_session_id((query.get("session_id", ["default"])[0]))
+            _mark_ui_session_active(sid)
             stt_status = _STT_MANAGER.status()
             owner = str(stt_status.get("stt_owner_session_id", "")).strip()
             if owner and sid != owner:
@@ -8169,6 +8171,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/stt/level":
             query = parse_qs(parsed.query)
             sid = _safe_session_id((query.get("session_id", ["default"])[0]))
+            _mark_ui_session_active(sid)
             stt_status = _STT_MANAGER.status()
             owner = str(stt_status.get("stt_owner_session_id", "")).strip()
             owner_mismatch = bool(owner and sid != owner)
