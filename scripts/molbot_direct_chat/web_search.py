@@ -55,6 +55,24 @@ def extract_web_search_query(message: str) -> str | None:
         q = (m.group(1) or "").strip().strip("\"'").strip(" \t,.;:!?¡¿")
         if q:
             return q[:400]
+
+    # Dictation often arrives as terse fragments like:
+    # "hoy de el conflicto entre iran y esto...".
+    # If it sounds like a current-affairs ask, treat it as web search query.
+    lowered = re.sub(r"\s+", " ", msg).strip().lower()
+    topical = bool(
+        re.search(
+            r"\b(conflicto|guerra|crisis|iran|israel|ee\.?\s*uu|estados\s+unidos|rusia|ucrania|economia|economía|inflaci[oó]n|d[oó]lar)\b",
+            lowered,
+            flags=re.IGNORECASE,
+        )
+    )
+    timely = bool(re.search(r"\b(hoy|ahora|actual(?:idad|mente)?|reciente(?:s)?)\b", lowered, flags=re.IGNORECASE))
+    if topical and timely:
+        q = re.sub(r"^\s*(?:hoy|ahora|actualmente)\s*(?:de|del|sobre|acerca de)?\s*", "", msg, flags=re.IGNORECASE).strip()
+        q = q.strip("\"'").strip(" \t,.;:!?¡¿")
+        if q:
+            return q[:400]
     return None
 
 

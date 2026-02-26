@@ -23,7 +23,10 @@ class TestWebSearchExtraction(unittest.TestCase):
         q = web_search.extract_web_search_query("noticias sobre inflacion en argentina")
         self.assertEqual(q, "inflacion en argentina")
 
+    def test_extract_web_search_query_timing_plus_conflict_fragment(self) -> None:
+        q = web_search.extract_web_search_query("hoy de el conflicto entre irán y esto")
+        self.assertEqual(q, "el conflicto entre irán y esto")
+
 
 if __name__ == "__main__":
     unittest.main()
-

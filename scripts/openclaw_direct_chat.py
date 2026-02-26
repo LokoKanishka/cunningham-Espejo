@@ -1964,8 +1964,8 @@ def _voice_chat_bridge_process_items(session_id: str, items: list[dict]) -> int:
         return 0
     processed = 0
     chat_min_words = max(1, _int_env("DIRECT_CHAT_STT_CHAT_MIN_WORDS", 2))
-    latest_chat_text = ""
-    latest_chat_ts = 0.0
+    merged_window_sec = max(0.4, _float_env("DIRECT_CHAT_STT_BRIDGE_MERGE_WINDOW_SEC", 2.4))
+    chat_chunks: list[tuple[str, float]] = []
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -1993,17 +1993,46 @@ def _voice_chat_bridge_process_items(session_id: str, items: list[dict]) -> int:
         text = str(item.get("text", "")).strip()
         if not text:
             continue
-        if _stt_chat_drop_reason(text, min_words_chat=chat_min_words):
+        drop_reason = _stt_chat_drop_reason(text, min_words_chat=chat_min_words)
+        # Keep ultra-short fragments to merge with adjacent dictation chunks
+        # from the same phrase (for example "estados" + "unidos").
+        if drop_reason and drop_reason != "chat_too_few_words":
             continue
         try:
             ts = float(item.get("ts", 0.0) or 0.0)
         except Exception:
             ts = 0.0
-        # Keep only the latest dictation text from this poll batch to avoid
-        # queueing stale phrases while a previous backend call is in-flight.
-        latest_chat_text = text
-        latest_chat_ts = ts
-    if latest_chat_text:
+        chat_chunks.append((text, ts))
+    if chat_chunks:
+        max_ts = max((float(ts or 0.0) for _text, ts in chat_chunks), default=0.0)
+        if max_ts > 0.0:
+            chunks = [(t, ts) for t, ts in chat_chunks if float(ts or 0.0) <= 0.0 or (max_ts - float(ts or 0.0)) <= merged_window_sec]
+        else:
+            chunks = list(chat_chunks)
+        chunks = chunks[-6:]
+        merged_parts: list[str] = []
+        for chunk_text, _chunk_ts in chunks:
+            part = str(chunk_text or "").strip()
+            if not part:
+                continue
+            if not merged_parts:
+                merged_parts.append(part)
+                continue
+            prev = str(merged_parts[-1])
+            prev_l = prev.lower()
+            part_l = part.lower()
+            if part_l == prev_l or prev_l.endswith(part_l):
+                continue
+            if part_l.startswith(prev_l):
+                merged_parts[-1] = part
+                continue
+            merged_parts.append(part)
+        latest_chat_text = " ".join(merged_parts).strip()
+        latest_chat_ts = max((float(ts or 0.0) for _t, ts in chunks), default=0.0)
+    else:
+        latest_chat_text = ""
+        latest_chat_ts = 0.0
+    if latest_chat_text and (not _stt_chat_drop_reason(latest_chat_text, min_words_chat=chat_min_words)):
         target_sid = _recent_ui_session_id() or sid
         if _voice_chat_submit_backend(target_sid, latest_chat_text, ts=latest_chat_ts):
             if target_sid != sid and target_sid and target_sid != "default":

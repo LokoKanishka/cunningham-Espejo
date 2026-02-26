@@ -496,7 +496,7 @@ class TestVoiceSttManager(unittest.TestCase):
         self.assertEqual(out, 2)
         self.assertEqual(seen, [("sess_a", "hola", 12.5)])
 
-    def test_voice_chat_bridge_process_items_keeps_latest_chat_text_per_batch(self) -> None:
+    def test_voice_chat_bridge_process_items_merges_recent_chat_text_fragments(self) -> None:
         seen = []
         prev_submit = direct_chat._voice_chat_submit_backend
         def _fake_submit(sid, text, ts=0.0):
@@ -515,7 +515,29 @@ class TestVoiceSttManager(unittest.TestCase):
         finally:
             direct_chat._voice_chat_submit_backend = prev_submit  # type: ignore
         self.assertEqual(out, 1)
-        self.assertEqual(seen, [("sess_a", "hola tres", 3.0)])
+        self.assertEqual(seen, [("sess_a", "hola uno hola dos hola tres", 3.0)])
+
+    def test_voice_chat_bridge_process_items_keeps_short_tail_to_complete_phrase(self) -> None:
+        seen = []
+        prev_submit = direct_chat._voice_chat_submit_backend
+
+        def _fake_submit(sid, text, ts=0.0):
+            seen.append((sid, text, ts))
+            return True
+
+        try:
+            direct_chat._voice_chat_submit_backend = _fake_submit  # type: ignore
+            out = direct_chat._voice_chat_bridge_process_items(
+                "sess_a",
+                [
+                    {"kind": "chat_text", "text": "hoy del conflicto entre iran y estados", "ts": 10.0},
+                    {"kind": "chat_text", "text": "unidos", "ts": 10.4},
+                ],
+            )
+        finally:
+            direct_chat._voice_chat_submit_backend = prev_submit  # type: ignore
+        self.assertEqual(out, 1)
+        self.assertEqual(seen, [("sess_a", "hoy del conflicto entre iran y estados unidos", 10.4)])
 
     def test_voice_chat_bridge_process_items_pauses_tts_for_voice_any_command(self) -> None:
         pauses = []
