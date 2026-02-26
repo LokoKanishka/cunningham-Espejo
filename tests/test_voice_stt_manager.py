@@ -720,7 +720,7 @@ class TestVoiceSttManager(unittest.TestCase):
         self.assertEqual(len(hist), 3)
         self.assertEqual([it.get("content") for it in hist], ["m4", "m5", "m6"])
 
-    def test_voice_chat_submit_backend_uses_tts_only_tools_by_default(self) -> None:
+    def test_voice_chat_submit_backend_enables_web_tools_by_default(self) -> None:
         seen_payload = {}
         prev_voice_enabled = direct_chat._voice_enabled
         prev_bridge_enabled = direct_chat._voice_server_chat_bridge_enabled
@@ -755,7 +755,7 @@ class TestVoiceSttManager(unittest.TestCase):
             direct_chat.requests.post = prev_requests_post  # type: ignore
             direct_chat._DIRECT_CHAT_HTTP_PORT = prev_http_port
         self.assertTrue(ok)
-        self.assertEqual(seen_payload.get("allowed_tools"), ["tts"])
+        self.assertEqual(seen_payload.get("allowed_tools"), ["tts", "web_search", "web_ask"])
 
     def test_stt_chat_drop_reason_rules(self) -> None:
         self.assertEqual(direct_chat._stt_chat_drop_reason("suscribite", min_words_chat=2), "chat_banned_phrase")
@@ -765,6 +765,12 @@ class TestVoiceSttManager(unittest.TestCase):
 
     def test_stt_voice_text_normalize_common_misrecognitions(self) -> None:
         self.assertEqual(direct_chat._stt_voice_text_normalize("preguntale a Hemini"), "preguntale a gemini")
+        self.assertEqual(direct_chat._stt_voice_text_normalize("Puedes preguntarle a Hemini Informa"), "Puedes preguntarle a gemini")
+        self.assertEqual(
+            direct_chat._stt_voice_text_normalize("hoy del conflicto entre iran y esto"),
+            "hoy del conflicto entre iran y eeuu",
+        )
+        self.assertEqual(direct_chat._stt_voice_text_normalize("siglo de vida de la maria"), "ciclo de vida de la mariposa")
         self.assertEqual(
             direct_chat._stt_voice_text_normalize("de que obra son las noticias"),
             "de que hora son las noticias",

@@ -856,6 +856,11 @@ def _stt_voice_text_normalize(text: str) -> str:
         return ""
     # Common near-miss for "Gemini" in noisy STT outputs.
     out = re.sub(r"\b(?:hemini|jemini|gemni|geminy|gemin)\b", "gemini", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bgemini\s+informa\b", "gemini", out, flags=re.IGNORECASE)
+    out = re.sub(r"\biran\s+y\s+esto(?:s)?\b", "iran y eeuu", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bsiglo\s+de\s+vida\b", "ciclo de vida", out, flags=re.IGNORECASE)
+    if re.search(r"\bciclo\s+de\s+vida\b", out, flags=re.IGNORECASE):
+        out = re.sub(r"\bde\s+la\s+maria\b", "de la mariposa", out, flags=re.IGNORECASE)
     # Contextual near-miss: "de que obra son ..." -> "de que hora son ..."
     out = re.sub(r"\bde\s+que\s+obra\s+(son|es)\b", r"de que hora \1", out, flags=re.IGNORECASE)
     out = re.sub(r"\bque\s+obra\s+(son|es)\b", r"que hora \1", out, flags=re.IGNORECASE)
@@ -1930,7 +1935,15 @@ def _voice_chat_submit_backend(session_id: str, text: str, ts: float = 0.0) -> b
         return False
     model_payload = _voice_chat_model_payload(sid)
     allow_firefox = _env_flag("DIRECT_CHAT_STT_BRIDGE_ALLOW_FIREFOX", False)
-    bridge_tools = ["tts"] + (["firefox"] if allow_firefox else [])
+    bridge_tools = ["tts"]
+    if _env_flag("DIRECT_CHAT_STT_BRIDGE_ALLOW_WEB_SEARCH", True):
+        bridge_tools.append("web_search")
+    if _env_flag("DIRECT_CHAT_STT_BRIDGE_ALLOW_WEB_ASK", True):
+        bridge_tools.append("web_ask")
+    if _env_flag("DIRECT_CHAT_STT_BRIDGE_ALLOW_DESKTOP", False):
+        bridge_tools.append("desktop")
+    if allow_firefox:
+        bridge_tools.append("firefox")
     payload = {
         "message": clean,
         "session_id": sid,
