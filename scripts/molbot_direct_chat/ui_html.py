@@ -189,6 +189,10 @@ HTML = r"""<!doctype html>
           <span class="voice-dot"></span>
           <span id="voiceToggleText">VOZ OFF</span>
         </button>
+	      <button class="voice-toggle stt-chat-toggle" id="sttChatToggle" data-on="1" type="button">
+          <span class="voice-dot"></span>
+          <span id="sttChatToggleText">STT→CHAT ON</span>
+        </button>
       <span class="small">Slash: /new /escritorio /lib /rescan /read N /next /repeat /status /help reader</span>
     </div>
 
@@ -218,6 +222,8 @@ HTML = r"""<!doctype html>
 	    const toolDesktopEl = document.getElementById("toolDesktop");
 	    const voiceToggleEl = document.getElementById("voiceToggle");
 	    const voiceToggleTextEl = document.getElementById("voiceToggleText");
+	    const sttChatToggleEl = document.getElementById("sttChatToggle");
+	    const sttChatToggleTextEl = document.getElementById("sttChatToggleText");
 	    const attachEl = document.getElementById("attach");
 	    const attachInfoEl = document.getElementById("attachInfo");
 	    const meterEl = document.getElementById("meter");
@@ -230,6 +236,7 @@ HTML = r"""<!doctype html>
 	    let history = [];
 	    let pendingAttachments = [];
       let voiceEnabled = true;
+      let sttChatEnabled = true;
       let speakingTimer = null;
 	      let activeStreamController = null;
 	      let readerAutoTimer = null;
@@ -614,9 +621,10 @@ HTML = r"""<!doctype html>
 	          await claimVoiceOwner();
 	          return;
 	        }
-		        if (!r.ok) return;
-		        const j = await r.json();
+	        if (!r.ok) return;
+	        const j = await r.json();
 	        const chatEnabled = !!j?.stt_chat_enabled;
+	        setSttChatVisual(chatEnabled);
 	        const sttDebug = !!j?.stt_debug;
 	        const serverBridgeEnabled = !!j?.stt_server_chat_bridge_enabled;
 	        setChatFeedEnabled(voiceEnabled && serverBridgeEnabled);
@@ -729,6 +737,12 @@ HTML = r"""<!doctype html>
 	      }
 	    }
 
+	    function setSttChatVisual(enabled) {
+	      sttChatEnabled = !!enabled;
+      sttChatToggleEl.dataset.on = sttChatEnabled ? "1" : "0";
+      sttChatToggleTextEl.textContent = sttChatEnabled ? "STT→CHAT ON" : "STT→CHAT OFF";
+	    }
+
     function markSpeaking(active) {
       if (active) {
         voiceToggleEl.classList.add("speaking");
@@ -742,6 +756,7 @@ HTML = r"""<!doctype html>
 	        const r = await fetch("/api/voice");
 	        const j = await r.json();
 	        setVoiceVisual(!!j.enabled);
+	        setSttChatVisual(!!j.stt_chat_enabled);
 	        setChatFeedEnabled(!!j.enabled && !!j.stt_server_chat_bridge_enabled);
 	        if (j.enabled && String(j.stt_owner_session_id || "").trim() === "" && sessionId !== "default") {
 	          await claimVoiceOwner();
@@ -750,6 +765,7 @@ HTML = r"""<!doctype html>
       } catch {}
       const ls = localStorage.getItem("molbot_voice_enabled");
       setVoiceVisual(ls !== "0");
+      setSttChatVisual(true);
     }
 
     async function setVoiceStateServer(enabled) {
@@ -759,6 +775,17 @@ HTML = r"""<!doctype html>
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ enabled: !!enabled, session_id: sessionId }),
+        });
+      } catch {}
+    }
+
+    async function setSttChatStateServer(enabled) {
+      setSttChatVisual(enabled);
+      try {
+        await fetch("/api/voice", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ stt_chat_enabled: !!enabled, session_id: sessionId }),
         });
       } catch {}
     }
@@ -1360,6 +1387,11 @@ HTML = r"""<!doctype html>
     voiceToggleEl.addEventListener("click", async () => {
       await setVoiceStateServer(!voiceEnabled);
       if (!voiceEnabled) markSpeaking(false);
+    });
+
+    sttChatToggleEl.addEventListener("click", async () => {
+      await setSttChatStateServer(!sttChatEnabled);
+      await syncVoiceState();
     });
 
     syncVoiceState();

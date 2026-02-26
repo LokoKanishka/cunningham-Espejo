@@ -609,7 +609,7 @@ def _default_voice_state() -> dict:
         "stt_device": str(os.environ.get("DIRECT_CHAT_STT_DEVICE", "")).strip(),
         "stt_min_chars": max(1, _int_env("DIRECT_CHAT_STT_MIN_CHARS", 3)),
         "stt_command_only": _env_flag("DIRECT_CHAT_STT_COMMAND_ONLY", True),
-        "stt_chat_enabled": _env_flag("DIRECT_CHAT_STT_CHAT_ENABLED", False),
+        "stt_chat_enabled": _env_flag("DIRECT_CHAT_STT_CHAT_ENABLED", True),
         "stt_debug": _env_flag("DIRECT_CHAT_STT_DEBUG", False),
         "stt_no_audio_timeout_sec": max(1.0, float(os.environ.get("DIRECT_CHAT_STT_NO_AUDIO_TIMEOUT_SEC", "3.0"))),
         # Legacy single threshold (kept for backward compatibility).
@@ -998,7 +998,7 @@ class STTManager:
         state = self._voice_state()
         if "stt_chat_enabled" in state:
             return bool(state.get("stt_chat_enabled"))
-        return _env_flag("DIRECT_CHAT_STT_CHAT_ENABLED", False)
+        return _env_flag("DIRECT_CHAT_STT_CHAT_ENABLED", True)
 
     def _debug_enabled(self) -> bool:
         state = self._voice_state()
@@ -7795,7 +7795,7 @@ class Handler(BaseHTTPRequestHandler):
             "stt_device": str(state.get("stt_device", "")),
             "stt_min_chars": int(stt_min_chars),
             "stt_command_only": bool(state.get("stt_command_only", True)),
-            "stt_chat_enabled": bool(state.get("stt_chat_enabled", False)),
+            "stt_chat_enabled": bool(state.get("stt_chat_enabled", _env_flag("DIRECT_CHAT_STT_CHAT_ENABLED", True))),
             "stt_debug": bool(state.get("stt_debug", False)),
             "stt_no_audio_timeout_sec": float(stt_no_audio_timeout),
             "stt_rms_threshold": float(stt_rms_threshold),

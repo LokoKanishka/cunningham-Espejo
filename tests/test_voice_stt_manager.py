@@ -37,6 +37,19 @@ class TestVoiceSttManager(unittest.TestCase):
         with direct_chat._VOICE_CHAT_DEDUPE_LOCK:
             direct_chat._VOICE_CHAT_DEDUPE_BY_SESSION = {}
 
+    def test_default_voice_state_enables_stt_chat(self) -> None:
+        prev = os.environ.get("DIRECT_CHAT_STT_CHAT_ENABLED")
+        try:
+            if "DIRECT_CHAT_STT_CHAT_ENABLED" in os.environ:
+                del os.environ["DIRECT_CHAT_STT_CHAT_ENABLED"]
+            st = direct_chat._default_voice_state()
+            self.assertTrue(bool(st.get("stt_chat_enabled")))
+        finally:
+            if prev is None:
+                os.environ.pop("DIRECT_CHAT_STT_CHAT_ENABLED", None)
+            else:
+                os.environ["DIRECT_CHAT_STT_CHAT_ENABLED"] = prev
+
     @patch("openclaw_direct_chat._save_voice_state")
     @patch("openclaw_direct_chat._load_voice_state", return_value={"enabled": False, "speaker": "Ana Florence", "speaker_wav": ""})
     @patch.object(direct_chat, "_STT_MANAGER")
