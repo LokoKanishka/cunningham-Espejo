@@ -138,6 +138,9 @@ _VOICE_CHAT_BRIDGE_STOP = threading.Event()
 _VOICE_CHAT_DEDUPE_LOCK = threading.Lock()
 _VOICE_CHAT_DEDUPE_BY_SESSION: dict[str, dict[str, float]] = {}
 _CHAT_EVENTS_LOCK = threading.Lock()
+_UI_SESSION_HINT_LOCK = threading.Lock()
+_UI_LAST_SESSION_ID = ""
+_UI_LAST_SEEN_TS = 0.0
 _STT_CHAT_BANNED_RE = re.compile(r"\bsuscrib\w*\b|\bsubscribe\b", flags=re.IGNORECASE)
 _STT_CHAT_ALLOW_SHORT = {"hola", "ok", "si", "sí", "no"}
 
@@ -732,7 +735,8 @@ def _set_voice_enabled(enabled: bool, session_id: str = "") -> None:
         state = _load_voice_state()
         state["enabled"] = bool(enabled)
         _save_voice_state(state)
-    _sync_stt_with_voice(enabled=bool(enabled), session_id=session_id if enabled else "")
+    should_run = bool(state.get("enabled", False) or state.get("stt_chat_enabled", False))
+    _sync_stt_with_voice(enabled=bool(enabled), session_id=session_id if should_run else "")
 
 
 def _voice_enabled() -> bool:
@@ -757,6 +761,40 @@ def _float_env(name: str, default: float) -> float:
         return float(raw)
     except Exception:
         return float(default)
+
+
+def _ui_session_hint_ttl_sec() -> float:
+    return max(5.0, _float_env("DIRECT_CHAT_STT_UI_SESSION_HINT_TTL_SEC", 120.0))
+
+
+def _mark_ui_session_active(session_id: str) -> None:
+    sid = _safe_session_id(session_id or "default")
+    if not sid:
+        sid = "default"
+    now = time.time()
+    global _UI_LAST_SESSION_ID, _UI_LAST_SEEN_TS
+    with _UI_SESSION_HINT_LOCK:
+        _UI_LAST_SESSION_ID = sid
+        _UI_LAST_SEEN_TS = now
+
+
+def _ui_session_snapshot() -> tuple[str, float]:
+    with _UI_SESSION_HINT_LOCK:
+        sid = str(_UI_LAST_SESSION_ID or "")
+        seen_ts = float(_UI_LAST_SEEN_TS or 0.0)
+    if seen_ts <= 0.0:
+        return sid, -1.0
+    return sid, max(0.0, time.time() - seen_ts)
+
+
+def _recent_ui_session_id(max_age_sec: float | None = None) -> str:
+    sid, age = _ui_session_snapshot()
+    if not sid or sid == "default":
+        return ""
+    ttl = float(max_age_sec) if isinstance(max_age_sec, (int, float)) and float(max_age_sec) > 0 else _ui_session_hint_ttl_sec()
+    if age < 0.0 or age > ttl:
+        return ""
+    return sid
 
 
 def _stt_chat_drop_reason(text: str, min_words_chat: int = 2) -> str:
@@ -1383,7 +1421,8 @@ class STTManager:
         debug_enabled = self._debug_enabled()
         reader_active = bool(_reader_voice_any_barge_target_active(sid))
         barge_any_enabled = self._barge_any_enabled()
-        barge_target_active = bool(barge_any_enabled and tts_playing and reader_active)
+        # Allow any-speech barge while *any* TTS is playing, not only Reader mode.
+        barge_target_active = bool(barge_any_enabled and tts_playing)
         if not barge_target_active:
             with self._lock:
                 self._last_barge_any_mono = 0.0
@@ -1731,6 +1770,28 @@ def _voice_chat_submit_backend(session_id: str, text: str, ts: float = 0.0) -> b
     return bool(resp.status_code < 400)
 
 
+def _apply_voice_pause_interrupt(session_id: str, source: str = "voice_cmd", keyword: str = "") -> bool:
+    sid = _safe_session_id(session_id or "default")
+    src = str(source or "").strip().lower()
+    key = str(keyword or "").strip()[:80]
+    if not key:
+        key = "voz" if src in ("voice_any", "stt_any") else "detenete"
+    reader_active = bool(_reader_voice_any_barge_target_active(sid))
+    if reader_active:
+        _READER_STORE.set_continuous(sid, False, reason="reader_user_paused")
+        _READER_STORE.set_reader_state(sid, "paused", reason="reader_user_paused")
+    if _tts_is_playing():
+        reason = "barge_in_triggered" if src in ("voice_any", "stt_any") else "reader_user_interrupt"
+        _request_tts_stop(
+            reason=reason,
+            keyword=key,
+            detail=f"triggered:{src or 'voice_cmd'}",
+            session_id=sid,
+        )
+        return True
+    return bool(reader_active)
+
+
 def _voice_chat_bridge_process_items(session_id: str, items: list[dict]) -> int:
     sid = _safe_session_id(session_id or "default")
     if not isinstance(items, list):
@@ -1740,7 +1801,26 @@ def _voice_chat_bridge_process_items(session_id: str, items: list[dict]) -> int:
     for item in items:
         if not isinstance(item, dict):
             continue
-        if str(item.get("kind", "")).strip().lower() != "chat_text":
+        kind = str(item.get("kind", "")).strip().lower()
+        if kind == "voice_cmd":
+            cmd = str(item.get("cmd", "")).strip().lower()
+            text = str(item.get("text", "")).strip()
+            if not cmd and text:
+                cmd = _voice_command_kind(text)
+            if cmd != "pause":
+                continue
+            target_sid = _recent_ui_session_id() or sid
+            source = str(item.get("source", "voice_cmd")).strip().lower() or "voice_cmd"
+            if _apply_voice_pause_interrupt(target_sid, source=source, keyword=text):
+                if target_sid != sid and target_sid and target_sid != "default":
+                    try:
+                        _STT_MANAGER.claim_owner(target_sid)
+                        sid = target_sid
+                    except Exception:
+                        pass
+                processed += 1
+            continue
+        if kind != "chat_text":
             continue
         text = str(item.get("text", "")).strip()
         if not text:
@@ -1751,7 +1831,14 @@ def _voice_chat_bridge_process_items(session_id: str, items: list[dict]) -> int:
             ts = float(item.get("ts", 0.0) or 0.0)
         except Exception:
             ts = 0.0
-        if _voice_chat_submit_backend(sid, text, ts=ts):
+        target_sid = _recent_ui_session_id() or sid
+        if _voice_chat_submit_backend(target_sid, text, ts=ts):
+            if target_sid != sid and target_sid and target_sid != "default":
+                try:
+                    _STT_MANAGER.claim_owner(target_sid)
+                    sid = target_sid
+                except Exception:
+                    pass
             processed += 1
     return processed
 
@@ -1808,7 +1895,9 @@ atexit.register(_stop_voice_chat_bridge)
 
 def _sync_stt_with_voice(enabled: bool, session_id: str = "") -> None:
     try:
-        if enabled:
+        state = _load_voice_state()
+        should_run = bool(bool(enabled) or bool(state.get("stt_chat_enabled", False)))
+        if should_run:
             _STT_MANAGER.enable(session_id=session_id)
             _start_voice_chat_bridge()
             return
@@ -1886,7 +1975,14 @@ def _set_stt_runtime_config(
         _save_voice_state(state)
     os.environ["DIRECT_CHAT_STT_DEVICE"] = str(state.get("stt_device", "")).strip()
     try:
-        _STT_MANAGER.restart()
+        should_run = bool(state.get("enabled", False) or state.get("stt_chat_enabled", False))
+        owner = str(_STT_MANAGER.status().get("stt_owner_session_id", "")).strip()
+        sid = _safe_session_id(owner or "")
+        if should_run:
+            _sync_stt_with_voice(enabled=bool(state.get("enabled", False)), session_id=(sid if sid != "default" else ""))
+            _STT_MANAGER.restart()
+        else:
+            _sync_stt_with_voice(enabled=False, session_id="")
     except Exception:
         pass
     return state
@@ -6583,16 +6679,12 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         )
     ):
         st = _READER_STORE.get_session(session_id, include_chunks=False)
-        if not st.get("ok"):
+        had_reader_session = bool(st.get("ok"))
+        interrupted = _apply_voice_pause_interrupt(session_id, source="typed", keyword="detenete")
+        if (not had_reader_session) and (not interrupted):
             return {"reply": "No hay sesión de lectura activa en este chat.", "no_auto_tts": True}
-        _request_tts_stop(
-            reason="reader_user_barge_in",
-            keyword="detenete",
-            detail="triggered:user_pause",
-            session_id=session_id,
-        )
-        _READER_STORE.set_continuous(session_id, False, reason="reader_user_paused")
-        _READER_STORE.set_reader_state(session_id, "paused", reason="reader_user_paused")
+        if not had_reader_session:
+            return {"reply": "Pausado (texto).", "no_auto_tts": True}
         st_after = _READER_STORE.get_session(session_id, include_chunks=False)
         return {
             "reply": "Pausado (texto). Para retomar, decí: continuar",
@@ -7748,6 +7840,7 @@ class Handler(BaseHTTPRequestHandler):
     def _voice_payload(self, state: dict) -> dict:
         enabled = bool(state.get("enabled", False))
         stt_status = _STT_MANAGER.status()
+        ui_last_sid, ui_last_age = _ui_session_snapshot()
         health = _alltalk_health_cached(force=False)
         server_ok = bool(health.get("ok", False))
         server_detail = str(health.get("detail", "health_unknown"))
@@ -7820,6 +7913,8 @@ class Handler(BaseHTTPRequestHandler):
             "tts_diagnostic": _voice_diagnostics(),
             "tts_playing": bool(_tts_is_playing()),
             "last_status": _VOICE_LAST_STATUS,
+            "ui_last_session_id": str(ui_last_sid or ""),
+            "ui_last_seen_age_sec": (None if ui_last_age < 0.0 else float(ui_last_age)),
             **_bargein_status(),
             **stt_status,
         }
@@ -7918,6 +8013,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/chat/poll":
             query = parse_qs(parsed.query)
             sid = _safe_session_id(str(query.get("session_id", query.get("session", ["default"]))[0]))
+            _mark_ui_session_active(sid)
             try:
                 after = int(str(query.get("after", ["0"])[0]).strip() or "0")
             except Exception:
@@ -8014,17 +8110,7 @@ class Handler(BaseHTTPRequestHandler):
             sid = _safe_session_id((query.get("session_id", ["default"])[0]))
             stt_status = _STT_MANAGER.status()
             owner = str(stt_status.get("stt_owner_session_id", "")).strip()
-            if owner and sid != owner:
-                self._json(
-                    409,
-                    {
-                        "ok": False,
-                        "error": "stt_owner_mismatch",
-                        "session_id": sid,
-                        **stt_status,
-                    },
-                )
-                return
+            owner_mismatch = bool(owner and sid != owner)
             try:
                 segment_threshold = max(
                     0.0005,
@@ -8056,6 +8142,8 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "ok": True,
                     "session_id": sid,
+                    "stt_owner_session_id": owner,
+                    "owner_mismatch": owner_mismatch,
                     "rms": float(stt_status.get("stt_rms_current", 0.0) or 0.0),
                     "threshold": float(segment_threshold),
                     "threshold_effective": float(
@@ -8337,7 +8425,7 @@ class Handler(BaseHTTPRequestHandler):
                     requested_enabled = bool(payload.get("enabled"))
                     _set_voice_enabled(requested_enabled, session_id=session_id if requested_enabled else "")
                     state = _load_voice_state()
-                elif bool(state.get("enabled", False)) and session_id != "default":
+                elif bool(state.get("enabled", False) or state.get("stt_chat_enabled", False)) and session_id != "default":
                     _STT_MANAGER.enable(session_id=session_id)
 
                 speaker = str(payload.get("speaker", "")).strip()
@@ -8422,7 +8510,12 @@ class Handler(BaseHTTPRequestHandler):
                 state["stt_barge_rms_threshold"] = _stt_barge_rms_threshold_from_state(state)
                 _save_voice_state(state)
                 os.environ["DIRECT_CHAT_STT_DEVICE"] = str(state.get("stt_device", "")).strip()
-                if (
+                should_run = bool(state.get("enabled", False) or state.get("stt_chat_enabled", False))
+                _sync_stt_with_voice(
+                    enabled=bool(state.get("enabled", False)),
+                    session_id=(session_id if should_run and session_id != "default" else ""),
+                )
+                if should_run and (
                     "stt_device" in payload
                     or "stt_command_only" in payload
                     or "stt_chat_enabled" in payload
@@ -8481,6 +8574,7 @@ class Handler(BaseHTTPRequestHandler):
             payload = self._parse_payload()
             message = str(payload.get("message", "")).strip()
             session_id = _safe_session_id(str(payload.get("session_id", "default")))
+            _mark_ui_session_active(session_id)
             allowed_tools = _extract_allowed_tools(payload)
             source_tag = str(payload.get("source", "")).strip().lower()
             voice_item_ts = 0.0
@@ -8788,8 +8882,11 @@ def main():
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     httpd.gateway_token = token
     httpd.gateway_port = args.gateway_port
-    if _voice_enabled():
-        _start_voice_chat_bridge()
+    try:
+        boot_state = _load_voice_state()
+        _sync_stt_with_voice(enabled=bool(boot_state.get("enabled", False)), session_id="")
+    except Exception:
+        pass
     print(f"Direct chat ready: http://{args.host}:{args.port}")
     print(f"Target gateway: http://127.0.0.1:{args.gateway_port}/v1/chat/completions")
     httpd.serve_forever()

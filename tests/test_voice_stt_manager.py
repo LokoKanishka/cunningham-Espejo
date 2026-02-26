@@ -36,6 +36,9 @@ class TestVoiceSttManager(unittest.TestCase):
     def setUp(self) -> None:
         with direct_chat._VOICE_CHAT_DEDUPE_LOCK:
             direct_chat._VOICE_CHAT_DEDUPE_BY_SESSION = {}
+        with direct_chat._UI_SESSION_HINT_LOCK:
+            direct_chat._UI_LAST_SESSION_ID = ""
+            direct_chat._UI_LAST_SEEN_TS = 0.0
 
     def test_default_voice_state_enables_stt_chat(self) -> None:
         prev = os.environ.get("DIRECT_CHAT_STT_CHAT_ENABLED")
@@ -147,6 +150,32 @@ class TestVoiceSttManager(unittest.TestCase):
         self.assertEqual(items2, [])
         self.assertEqual([str(i.get("cmd", "")).strip().lower() for i in items3], ["pause"])
         self.assertEqual([str(i.get("source", "")).strip().lower() for i in items3], ["voice_any"])
+        mgr.disable()
+
+    def test_stt_manager_barge_any_pauses_outside_reader_when_tts_playing(self) -> None:
+        mgr = direct_chat.STTManager()
+        with mgr._lock:
+            mgr._enabled = True
+            mgr._owner_session_id = "sess_a"
+            mgr._worker = _DummyWorker(running=True)
+            mgr._vad_active = True
+            mgr._in_speech = True
+            mgr._rms_current = 0.08
+            mgr._silence_ms = 0
+        mgr._barge_any_enabled = lambda: True  # type: ignore
+        mgr._barge_any_cooldown_ms = lambda: 1200  # type: ignore
+        mgr._debug_enabled = lambda: False  # type: ignore
+        prev_tts_is_playing = direct_chat._tts_is_playing
+        prev_reader_target = direct_chat._reader_voice_any_barge_target_active
+        try:
+            direct_chat._tts_is_playing = lambda: True  # type: ignore
+            direct_chat._reader_voice_any_barge_target_active = lambda _sid: False  # type: ignore
+            items = mgr.poll("sess_a", limit=2)
+        finally:
+            direct_chat._tts_is_playing = prev_tts_is_playing  # type: ignore
+            direct_chat._reader_voice_any_barge_target_active = prev_reader_target  # type: ignore
+        self.assertEqual([str(i.get("cmd", "")).strip().lower() for i in items], ["pause"])
+        self.assertEqual([str(i.get("source", "")).strip().lower() for i in items], ["voice_any"])
         mgr.disable()
 
     def test_stt_manager_barge_any_cooldown_is_silent(self) -> None:
@@ -360,8 +389,99 @@ class TestVoiceSttManager(unittest.TestCase):
             )
         finally:
             direct_chat._voice_chat_submit_backend = prev_submit  # type: ignore
-        self.assertEqual(out, 1)
+        self.assertEqual(out, 2)
         self.assertEqual(seen, [("sess_a", "hola", 12.5)])
+
+    def test_voice_chat_bridge_process_items_pauses_tts_for_voice_any_command(self) -> None:
+        pauses = []
+        adopted = []
+        prev_pause = direct_chat._apply_voice_pause_interrupt
+        prev_recent_ui = direct_chat._recent_ui_session_id
+        prev_claim = direct_chat._STT_MANAGER.claim_owner
+
+        def _fake_pause(sid, source="voice_cmd", keyword=""):
+            pauses.append((sid, source, keyword))
+            return True
+
+        def _fake_claim(sid):
+            adopted.append(sid)
+            return None
+
+        try:
+            direct_chat._apply_voice_pause_interrupt = _fake_pause  # type: ignore
+            direct_chat._recent_ui_session_id = lambda: "ui_sess"  # type: ignore
+            direct_chat._STT_MANAGER.claim_owner = _fake_claim  # type: ignore
+            out = direct_chat._voice_chat_bridge_process_items(
+                "owner_sess",
+                [{"kind": "voice_cmd", "cmd": "pause", "text": "hola", "source": "voice_any", "ts": 1.0}],
+            )
+        finally:
+            direct_chat._apply_voice_pause_interrupt = prev_pause  # type: ignore
+            direct_chat._recent_ui_session_id = prev_recent_ui  # type: ignore
+            direct_chat._STT_MANAGER.claim_owner = prev_claim  # type: ignore
+        self.assertEqual(out, 1)
+        self.assertEqual(pauses, [("ui_sess", "voice_any", "hola")])
+        self.assertEqual(adopted, ["ui_sess"])
+
+    def test_voice_chat_bridge_prefers_recent_ui_session_and_adopts_owner(self) -> None:
+        seen = []
+        adopted = []
+        prev_submit = direct_chat._voice_chat_submit_backend
+        prev_claim = direct_chat._STT_MANAGER.claim_owner
+
+        def _fake_submit(sid, text, ts=0.0):
+            seen.append((sid, text, ts))
+            return True
+
+        def _fake_claim(sid):
+            adopted.append(sid)
+            return None
+
+        try:
+            direct_chat._voice_chat_submit_backend = _fake_submit  # type: ignore
+            direct_chat._STT_MANAGER.claim_owner = _fake_claim  # type: ignore
+            direct_chat._mark_ui_session_active("ui_sess")
+            out = direct_chat._voice_chat_bridge_process_items(
+                "owner_sess",
+                [{"kind": "chat_text", "text": "hola mundo", "ts": 9.25}],
+            )
+        finally:
+            direct_chat._voice_chat_submit_backend = prev_submit  # type: ignore
+            direct_chat._STT_MANAGER.claim_owner = prev_claim  # type: ignore
+        self.assertEqual(out, 1)
+        self.assertEqual(seen, [("ui_sess", "hola mundo", 9.25)])
+        self.assertEqual(adopted, ["ui_sess"])
+
+    def test_voice_chat_bridge_falls_back_owner_when_ui_session_hint_is_stale(self) -> None:
+        seen = []
+        adopted = []
+        prev_submit = direct_chat._voice_chat_submit_backend
+        prev_claim = direct_chat._STT_MANAGER.claim_owner
+
+        def _fake_submit(sid, text, ts=0.0):
+            seen.append((sid, text, ts))
+            return True
+
+        def _fake_claim(sid):
+            adopted.append(sid)
+            return None
+
+        try:
+            direct_chat._voice_chat_submit_backend = _fake_submit  # type: ignore
+            direct_chat._STT_MANAGER.claim_owner = _fake_claim  # type: ignore
+            direct_chat._mark_ui_session_active("ui_sess")
+            with direct_chat._UI_SESSION_HINT_LOCK:
+                direct_chat._UI_LAST_SEEN_TS = time.time() - 999.0
+            out = direct_chat._voice_chat_bridge_process_items(
+                "owner_sess",
+                [{"kind": "chat_text", "text": "hola mundo", "ts": 9.25}],
+            )
+        finally:
+            direct_chat._voice_chat_submit_backend = prev_submit  # type: ignore
+            direct_chat._STT_MANAGER.claim_owner = prev_claim  # type: ignore
+        self.assertEqual(out, 1)
+        self.assertEqual(seen, [("owner_sess", "hola mundo", 9.25)])
+        self.assertEqual(adopted, [])
 
     def test_voice_chat_dedupe_uses_session_ts_text(self) -> None:
         self.assertTrue(direct_chat._voice_chat_should_process("sess_a", "hola", ts=10.1))
@@ -509,12 +629,20 @@ class TestVoiceSttManager(unittest.TestCase):
             direct_chat._TTS_PLAYING_STREAM_ID = prev_stream
             direct_chat._BARGEIN_STATS = prev_stats
 
+    @patch("openclaw_direct_chat._load_voice_state", return_value={"enabled": False, "stt_chat_enabled": False})
     @patch("openclaw_direct_chat._stop_bargein_monitor")
     @patch.object(direct_chat, "_STT_MANAGER")
-    def test_sync_stt_with_voice_disable_stops_barge_monitor(self, mock_manager, mock_stop_barge) -> None:
+    def test_sync_stt_with_voice_disable_stops_barge_monitor(self, mock_manager, mock_stop_barge, _mock_load) -> None:
         direct_chat._sync_stt_with_voice(enabled=False, session_id="")
         mock_stop_barge.assert_called_once()
         mock_manager.disable.assert_called_once()
+
+    @patch("openclaw_direct_chat._load_voice_state", return_value={"enabled": False, "stt_chat_enabled": True})
+    @patch.object(direct_chat, "_STT_MANAGER")
+    def test_sync_stt_with_voice_keeps_stt_on_when_chat_enabled(self, mock_manager, _mock_load) -> None:
+        direct_chat._sync_stt_with_voice(enabled=False, session_id="sess_a")
+        mock_manager.enable.assert_called_once_with(session_id="sess_a")
+        mock_manager.disable.assert_not_called()
 
 
 if __name__ == "__main__":

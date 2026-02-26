@@ -790,6 +790,20 @@ HTML = r"""<!doctype html>
       } catch {}
     }
 
+    function shutdownVoiceStateOnUnload() {
+      try {
+        const payload = JSON.stringify({
+          enabled: false,
+          stt_chat_enabled: false,
+          session_id: sessionId,
+        });
+        if (navigator && typeof navigator.sendBeacon === "function") {
+          const blob = new Blob([payload], { type: "application/json" });
+          navigator.sendBeacon("/api/voice", blob);
+        }
+      } catch {}
+    }
+
     function el(tag, cls, text) {
       const node = document.createElement(tag);
       if (cls) node.className = cls;
@@ -1393,6 +1407,8 @@ HTML = r"""<!doctype html>
       await setSttChatStateServer(!sttChatEnabled);
       await syncVoiceState();
     });
+
+    window.addEventListener("beforeunload", shutdownVoiceStateOnUnload);
 
     syncVoiceState();
     refreshModels()
