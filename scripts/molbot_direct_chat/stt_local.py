@@ -549,6 +549,7 @@ class STTWorker:
         agc_gain_current = 1.0
         input_gain_total_current = preamp_gain_current
         raw_rms_current = 0.0
+        rms_after_gain_current = 0.0
 
         def emit_runtime_diag(extra: Optional[dict] = None) -> None:
             vad_true_ratio = (float(vad_true_frames) / float(frames_seen)) if frames_seen > 0 else 0.0
@@ -559,6 +560,7 @@ class STTWorker:
                 "last_audio_ts": float(last_audio_ts or 0.0),
                 "raw_rms_current": float(raw_rms_current),
                 "rms_current": float(rms_current),
+                "rms_after_gain": float(rms_after_gain_current),
                 "vad_active": bool(in_speech_now),
                 "in_speech": bool(in_speech),
                 "vad_frames": int(vad_frames),
@@ -640,13 +642,14 @@ class STTWorker:
             nonlocal in_speech_now, rms_consecutive, in_speech, speech_start_mono, last_voice_mono, buf
             nonlocal current_silence_ms, noise_floor_current, effective_seg_thr_current, segment_thr_off_current
             nonlocal hangover_left_ms
-            nonlocal preamp_gain_current, agc_gain_current, input_gain_total_current, raw_rms_current
+            nonlocal preamp_gain_current, agc_gain_current, input_gain_total_current, raw_rms_current, rms_after_gain_current
             if not frame_pcm16:
                 return
+            raw_frame_pcm16 = frame_pcm16
             frames_seen += 1
             last_audio_ts = time.time()
             frame_pcm16, preamp_gain_current, agc_gain_current, input_gain_total_current, rms_after_gain = _apply_preamp_agc_frame(
-                frame_pcm16,
+                raw_frame_pcm16,
                 preamp_gain=float(cfg.preamp_gain),
                 agc_enabled=bool(cfg.agc_enabled),
                 agc_target_rms=float(cfg.agc_target_rms),
@@ -656,20 +659,23 @@ class STTWorker:
                 agc_gain_current=float(agc_gain_current),
             )
             try:
-                raw_rms_current = float(audioop.rms(frame_pcm16, 2) / 32768.0) / max(0.05, float(input_gain_total_current))
+                raw_rms_current = float(audioop.rms(raw_frame_pcm16, 2) / 32768.0)
             except Exception:
                 raw_rms_current = 0.0
             try:
-                rms_current = float(rms_after_gain)
+                rms_after_gain_current = float(rms_after_gain)
             except Exception:
-                rms_current = 0.0
+                rms_after_gain_current = raw_rms_current
+            # Gate VAD/segmentation with raw mic level so AGC/preamp does not
+            # inflate room noise into permanent speech.
+            rms_current = float(raw_rms_current)
 
             try:
-                vad_true = bool(vad.is_speech(frame_pcm16, target_rate))
+                vad_true = bool(vad.is_speech(raw_frame_pcm16, target_rate))
             except Exception:
                 vad_true = False
             if not vad_true:
-                noise_rms_samples.append(rms_current)
+                noise_rms_samples.append(raw_rms_current)
                 if len(noise_rms_samples) > noise_window_max:
                     del noise_rms_samples[: len(noise_rms_samples) - noise_window_max]
             if noise_rms_samples:
@@ -684,7 +690,7 @@ class STTWorker:
             # Treat VAD as advisory and avoid flicker by applying hysteresis + hangover.
             speech_like, rms_consecutive, hangover_left_ms, segment_thr_off_current = _segment_speech_like_state(
                 vad_true=vad_true,
-                rms_current=rms_current,
+                rms_current=raw_rms_current,
                 threshold_on=effective_seg_thr_current,
                 in_speech=in_speech,
                 rms_consecutive=rms_consecutive,
