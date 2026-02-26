@@ -356,6 +356,42 @@ class TestVoiceSttManager(unittest.TestCase):
         self.assertTrue(direct_chat._voice_chat_should_process("sess_a", "hola", ts=10.2))
         self.assertTrue(direct_chat._voice_chat_should_process("sess_b", "hola", ts=10.1))
 
+    def test_stt_chat_drop_reason_rules(self) -> None:
+        self.assertEqual(direct_chat._stt_chat_drop_reason("suscribite", min_words_chat=2), "chat_banned_phrase")
+        self.assertEqual(direct_chat._stt_chat_drop_reason("hola", min_words_chat=2), "")
+        self.assertEqual(direct_chat._stt_chat_drop_reason("me escuchas", min_words_chat=2), "")
+        self.assertEqual(direct_chat._stt_chat_drop_reason("eh", min_words_chat=2), "chat_too_few_words")
+
+    def test_stt_segmentation_profile_chat_defaults_are_dictation_friendly(self) -> None:
+        profile = direct_chat._stt_segmentation_profile(True)
+        self.assertGreaterEqual(int(profile.get("min_speech_ms", 0) or 0), 250)
+        self.assertGreaterEqual(int(profile.get("max_silence_ms", 0) or 0), 600)
+        self.assertGreaterEqual(float(profile.get("max_segment_s", 0.0) or 0.0), 3.5)
+
+    def test_stt_manager_chat_mode_filters_banned_phrase(self) -> None:
+        mgr = direct_chat.STTManager()
+        with mgr._lock:
+            mgr._enabled = True
+            mgr._owner_session_id = "sess_a"
+            mgr._worker = _DummyWorker(running=True)
+        mgr._command_only_enabled = lambda: True  # type: ignore
+        mgr._chat_enabled = lambda: True  # type: ignore
+        mgr._debug_enabled = lambda: False  # type: ignore
+        mgr._queue.put({"text": "suscribite al canal", "ts": 1.0})
+        prev_tts_is_playing = direct_chat._tts_is_playing
+        prev_reader_target = direct_chat._reader_voice_any_barge_target_active
+        try:
+            direct_chat._tts_is_playing = lambda: False  # type: ignore
+            direct_chat._reader_voice_any_barge_target_active = lambda _sid: False  # type: ignore
+            items = mgr.poll("sess_a", limit=4)
+        finally:
+            direct_chat._tts_is_playing = prev_tts_is_playing  # type: ignore
+            direct_chat._reader_voice_any_barge_target_active = prev_reader_target  # type: ignore
+        self.assertEqual(items, [])
+        st = mgr.status()
+        self.assertEqual(str(st.get("match_reason", "")), "chat_banned_phrase")
+        mgr.disable()
+
     def test_chat_events_poll_returns_incremental_items(self) -> None:
         prev_history_dir = direct_chat.HISTORY_DIR
         try:

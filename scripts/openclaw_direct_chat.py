@@ -138,6 +138,8 @@ _VOICE_CHAT_BRIDGE_STOP = threading.Event()
 _VOICE_CHAT_DEDUPE_LOCK = threading.Lock()
 _VOICE_CHAT_DEDUPE_BY_SESSION: dict[str, dict[str, float]] = {}
 _CHAT_EVENTS_LOCK = threading.Lock()
+_STT_CHAT_BANNED_RE = re.compile(r"\bsuscrib\w*\b|\bsubscribe\b", flags=re.IGNORECASE)
+_STT_CHAT_ALLOW_SHORT = {"hola", "ok", "si", "sí", "no"}
 
 
 def _bargein_config() -> dict:
@@ -747,6 +749,49 @@ def _int_env(name: str, default: int) -> int:
         return int(default)
 
 
+def _float_env(name: str, default: float) -> float:
+    raw = str(os.environ.get(name, "")).strip()
+    if not raw:
+        return float(default)
+    try:
+        return float(raw)
+    except Exception:
+        return float(default)
+
+
+def _stt_chat_drop_reason(text: str, min_words_chat: int = 2) -> str:
+    normalized = _normalize_text(text)
+    if not normalized:
+        return "chat_empty_text"
+    if _STT_CHAT_BANNED_RE.search(normalized):
+        return "chat_banned_phrase"
+    tokens = [tok for tok in re.findall(r"[a-z0-9áéíóúñü]+", normalized, flags=re.IGNORECASE) if tok]
+    if not tokens:
+        return "chat_empty_text"
+    if len(tokens) >= max(1, int(min_words_chat)):
+        return ""
+    if normalized in _STT_CHAT_ALLOW_SHORT:
+        return ""
+    return "chat_too_few_words"
+
+
+def _stt_segmentation_profile(chat_enabled: bool) -> dict:
+    if bool(chat_enabled):
+        min_ms = max(180, _int_env("DIRECT_CHAT_STT_CHAT_MIN_SEGMENT_MS", 250))
+        return {
+            "min_speech_ms": int(min_ms),
+            "chat_min_speech_ms": int(min_ms),
+            "max_silence_ms": int(max(250, _int_env("DIRECT_CHAT_STT_CHAT_MAX_SILENCE_MS", 600))),
+            "max_segment_s": float(max(1.8, _float_env("DIRECT_CHAT_STT_CHAT_MAX_SEGMENT_SEC", 3.5))),
+        }
+    return {
+        "min_speech_ms": int(max(120, _int_env("DIRECT_CHAT_STT_MIN_SPEECH_MS", 220))),
+        "chat_min_speech_ms": int(max(120, _int_env("DIRECT_CHAT_STT_CHAT_MIN_SPEECH_MS", 180))),
+        "max_silence_ms": int(max(180, _int_env("DIRECT_CHAT_STT_MAX_SILENCE_MS", 350))),
+        "max_segment_s": float(max(1.2, _float_env("DIRECT_CHAT_STT_MAX_SEGMENT_SEC", 1.8))),
+    }
+
+
 def _voice_command_kind(text: str) -> str:
     n = _normalize_text(text)
     if not n:
@@ -1121,6 +1166,7 @@ class STTManager:
         segment_rms_threshold = _stt_segment_rms_threshold_from_state(state)
         selected_device = self._selected_stt_device()
         chat_mode_enabled = bool(self._chat_enabled())
+        seg_profile = _stt_segmentation_profile(chat_mode_enabled)
         try:
             preamp_gain = max(0.05, float(state.get("stt_preamp_gain", os.environ.get("DIRECT_CHAT_STT_PREAMP_GAIN", "1.0"))))
         except Exception:
@@ -1136,10 +1182,10 @@ class STTManager:
             device=selected_device,
             frame_ms=max(10, min(30, self._env_int("DIRECT_CHAT_STT_FRAME_MS", 30))),
             vad_mode=max(0, min(3, self._env_int("DIRECT_CHAT_STT_VAD_MODE", 1))),
-            min_speech_ms=max(120, self._env_int("DIRECT_CHAT_STT_MIN_SPEECH_MS", 220)),
-            chat_min_speech_ms=max(120, self._env_int("DIRECT_CHAT_STT_CHAT_MIN_SPEECH_MS", 180)),
-            max_silence_ms=max(180, self._env_int("DIRECT_CHAT_STT_MAX_SILENCE_MS", 350)),
-            max_segment_s=max(1.2, self._env_float("DIRECT_CHAT_STT_MAX_SEGMENT_SEC", 1.8)),
+            min_speech_ms=int(seg_profile.get("min_speech_ms", 220)),
+            chat_min_speech_ms=int(seg_profile.get("chat_min_speech_ms", 180)),
+            max_silence_ms=int(seg_profile.get("max_silence_ms", 350)),
+            max_segment_s=float(seg_profile.get("max_segment_s", 1.8)),
             rms_speech_threshold=max(0.0005, float(segment_rms_threshold)),
             rms_min_frames=max(1, self._env_int("DIRECT_CHAT_STT_RMS_MIN_FRAMES", 2)),
             segment_hysteresis_off_ratio=max(
@@ -1333,6 +1379,7 @@ class STTManager:
         tts_playing = _tts_is_playing()
         command_only = self._command_only_enabled()
         chat_enabled = self._chat_enabled()
+        chat_min_words = max(1, _int_env("DIRECT_CHAT_STT_CHAT_MIN_WORDS", 2))
         debug_enabled = self._debug_enabled()
         reader_active = bool(_reader_voice_any_barge_target_active(sid))
         barge_any_enabled = self._barge_any_enabled()
@@ -1441,6 +1488,12 @@ class STTManager:
                     continue
                 voice_chat_passthrough = bool(chat_enabled and (not tts_playing) and (not reader_active))
                 if voice_chat_passthrough and (not cmd):
+                    drop_reason = _stt_chat_drop_reason(text, min_words_chat=chat_min_words)
+                    if drop_reason:
+                        with self._lock:
+                            self._last_match_reason = str(drop_reason)
+                            self._register_drop_locked(str(drop_reason))
+                        continue
                     with self._lock:
                         self._last_match_reason = "voice_chat_text"
                     event = {"text": text, "norm": norm_text, "ts": ts, "kind": "chat_text", "source": "voice_chat"}
@@ -1469,6 +1522,13 @@ class STTManager:
                     continue
                 with self._lock:
                     self._last_match_reason = "accepted_text"
+                if (not cmd):
+                    drop_reason = _stt_chat_drop_reason(text, min_words_chat=chat_min_words)
+                    if drop_reason:
+                        with self._lock:
+                            self._last_match_reason = str(drop_reason)
+                            self._register_drop_locked(str(drop_reason))
+                        continue
                 event = {"text": text, "ts": ts}
                 out.append(event)
                 with self._lock:
@@ -1676,6 +1736,7 @@ def _voice_chat_bridge_process_items(session_id: str, items: list[dict]) -> int:
     if not isinstance(items, list):
         return 0
     processed = 0
+    chat_min_words = max(1, _int_env("DIRECT_CHAT_STT_CHAT_MIN_WORDS", 2))
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -1683,6 +1744,8 @@ def _voice_chat_bridge_process_items(session_id: str, items: list[dict]) -> int:
             continue
         text = str(item.get("text", "")).strip()
         if not text:
+            continue
+        if _stt_chat_drop_reason(text, min_words_chat=chat_min_words):
             continue
         try:
             ts = float(item.get("ts", 0.0) or 0.0)
