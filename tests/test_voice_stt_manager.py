@@ -65,6 +65,18 @@ class TestVoiceSttManager(unittest.TestCase):
             else:
                 os.environ["DIRECT_CHAT_STT_CHAT_ENABLED"] = prev
 
+    def test_default_voice_state_enables_barge_any(self) -> None:
+        prev = os.environ.get("DIRECT_CHAT_STT_BARGE_ANY")
+        try:
+            os.environ.pop("DIRECT_CHAT_STT_BARGE_ANY", None)
+            st = direct_chat._default_voice_state()
+            self.assertTrue(bool(st.get("stt_barge_any")))
+        finally:
+            if prev is None:
+                os.environ.pop("DIRECT_CHAT_STT_BARGE_ANY", None)
+            else:
+                os.environ["DIRECT_CHAT_STT_BARGE_ANY"] = prev
+
     @patch("openclaw_direct_chat._save_voice_state")
     @patch("openclaw_direct_chat._load_voice_state", return_value={"enabled": False, "speaker": "Ana Florence", "speaker_wav": ""})
     @patch.object(direct_chat, "_STT_MANAGER")
@@ -281,6 +293,33 @@ class TestVoiceSttManager(unittest.TestCase):
             direct_chat._tts_is_playing = prev_tts_is_playing  # type: ignore
             direct_chat._reader_voice_any_barge_target_active = prev_reader_target  # type: ignore
         self.assertEqual(items, [])
+        mgr.disable()
+
+    def test_stt_manager_buffers_non_command_during_tts_and_flushes_after(self) -> None:
+        mgr = direct_chat.STTManager()
+        with mgr._lock:
+            mgr._enabled = True
+            mgr._owner_session_id = "sess_a"
+            mgr._worker = _DummyWorker(running=True)
+        mgr._chat_enabled = lambda: True  # type: ignore
+        mgr._barge_any_enabled = lambda: True  # type: ignore
+        mgr._debug_enabled = lambda: False  # type: ignore
+        mgr._queue.put({"text": "hola cunningham", "ts": 10.0})
+        prev_tts_is_playing = direct_chat._tts_is_playing
+        prev_reader_target = direct_chat._reader_voice_any_barge_target_active
+        try:
+            direct_chat._tts_is_playing = lambda: True  # type: ignore
+            direct_chat._reader_voice_any_barge_target_active = lambda _sid: False  # type: ignore
+            first = mgr.poll("sess_a", limit=4)
+            self.assertEqual(first, [])
+            direct_chat._tts_is_playing = lambda: False  # type: ignore
+            second = mgr.poll("sess_a", limit=4)
+        finally:
+            direct_chat._tts_is_playing = prev_tts_is_playing  # type: ignore
+            direct_chat._reader_voice_any_barge_target_active = prev_reader_target  # type: ignore
+        self.assertEqual(len(second), 1)
+        self.assertEqual(str(second[0].get("kind", "")).strip().lower(), "chat_text")
+        self.assertEqual(str(second[0].get("text", "")).strip().lower(), "hola cunningham")
         mgr.disable()
 
     def test_voice_command_kind(self) -> None:

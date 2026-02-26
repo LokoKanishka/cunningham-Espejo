@@ -704,6 +704,7 @@ HTML = r"""<!doctype html>
 
     function startSttPolling() {
       if (!voiceEnabled) return;
+      claimVoiceOwner();
       if (sttPollTimer) return;
       sttPollTimer = setInterval(() => {
         pollSttOnce();
@@ -758,7 +759,8 @@ HTML = r"""<!doctype html>
 	        setVoiceVisual(!!j.enabled);
 	        setSttChatVisual(!!j.stt_chat_enabled);
 	        setChatFeedEnabled(!!j.enabled && !!j.stt_server_chat_bridge_enabled);
-	        if (j.enabled && String(j.stt_owner_session_id || "").trim() === "" && sessionId !== "default") {
+	        const owner = String(j.stt_owner_session_id || "").trim();
+	        if (j.enabled && sessionId !== "default" && owner !== sessionId) {
 	          await claimVoiceOwner();
 	        }
         return;

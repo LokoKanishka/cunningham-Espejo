@@ -628,7 +628,7 @@ def _default_voice_state() -> dict:
             default=legacy_threshold,
             min_value=0.001,
         ),
-        "stt_barge_any": _env_flag("DIRECT_CHAT_STT_BARGE_ANY", False),
+        "stt_barge_any": _env_flag("DIRECT_CHAT_STT_BARGE_ANY", True),
         "stt_barge_any_cooldown_ms": max(300, _int_env("DIRECT_CHAT_STT_BARGE_ANY_COOLDOWN_MS", 1200)),
         "stt_preamp_gain": max(0.05, float(os.environ.get("DIRECT_CHAT_STT_PREAMP_GAIN", "1.8") or 1.8)),
         "stt_agc_enabled": _env_flag("DIRECT_CHAT_STT_AGC_ENABLED", True),
@@ -666,6 +666,7 @@ def _autotune_voice_capture_state(state: dict) -> dict:
         state["stt_min_chars"] = max(1, min(2, int(state.get("stt_min_chars", 2) or 2)))
     except Exception:
         state["stt_min_chars"] = 2
+    state["stt_barge_any"] = True
     return state
 
 
@@ -989,6 +990,7 @@ class STTManager:
         self._last_match_reason = ""
         self._last_match_ts = 0.0
         self._last_barge_any_mono = 0.0
+        self._pending_chat_after_tts: dict | None = None
 
     @staticmethod
     def _env_int(name: str, default: int) -> int:
@@ -1225,6 +1227,7 @@ class STTManager:
         self._last_match_reason = ""
         self._last_match_ts = 0.0
         self._last_barge_any_mono = 0.0
+        self._pending_chat_after_tts = None
 
     def _build_worker_locked(self):
         from molbot_direct_chat import stt_local
@@ -1455,6 +1458,22 @@ class STTManager:
         debug_enabled = self._debug_enabled()
         reader_active = bool(_reader_voice_any_barge_target_active(sid))
         barge_any_enabled = self._barge_any_enabled()
+        if (not tts_playing) and chat_enabled and (not reader_active):
+            with self._lock:
+                pending_after_tts = dict(self._pending_chat_after_tts) if isinstance(self._pending_chat_after_tts, dict) else None
+                self._pending_chat_after_tts = None
+            if pending_after_tts:
+                text_p = str(pending_after_tts.get("text", "")).strip()
+                if text_p and (not _stt_chat_drop_reason(text_p, min_words_chat=chat_min_words)):
+                    ts_p = float(pending_after_tts.get("ts", time.time()) or time.time())
+                    norm_p = str(pending_after_tts.get("norm", _normalize_text(text_p)))
+                    out.append({"text": text_p, "norm": norm_p, "ts": ts_p, "kind": "chat_text", "source": "voice_chat"})
+                    with self._lock:
+                        self._items_total += 1
+                        self._voice_text_committed += 1
+                        self._stt_chat_commit_total += 1
+                        self._last_item_ts = max(self._last_item_ts, ts_p)
+                        self._last_match_reason = "voice_chat_text_flushed"
         # Allow any-speech barge while *any* TTS is playing, not only Reader mode.
         barge_target_active = bool(barge_any_enabled and tts_playing)
         if not barge_target_active:
@@ -1544,6 +1563,27 @@ class STTManager:
                         self._last_item_ts = max(self._last_item_ts, ts)
                     continue
                 if tts_playing and (not cmd):
+                    if chat_enabled and barge_any_enabled and (not reader_active):
+                        drop_reason = _stt_chat_drop_reason(text, min_words_chat=chat_min_words)
+                        if not drop_reason:
+                            with self._lock:
+                                self._pending_chat_after_tts = {
+                                    "text": text[:320],
+                                    "norm": norm_text[:320],
+                                    "ts": ts,
+                                }
+                                self._last_match_reason = "tts_guard_buffered"
+                            if debug_enabled:
+                                out.append(
+                                    {
+                                        "kind": "stt_debug",
+                                        "text": text,
+                                        "norm": norm_text,
+                                        "reason": "tts_guard_buffered",
+                                        "ts": ts,
+                                    }
+                                )
+                            continue
                     with self._lock:
                         self._last_match_reason = "tts_guard_non_command"
                     if debug_enabled:
