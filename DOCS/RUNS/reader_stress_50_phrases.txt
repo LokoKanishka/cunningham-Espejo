@@ -1,0 +1,50 @@
+1. Bueno luci abri el libro 1 que quiero que empieces a leer desde el capitulo 1.
+2. Che, por favor abrime el libro 1 asi arrancamos lectura.
+3. Cuando puedas, leer libro 1 y seguimos desde ahi.
+4. Dale, abri libro 1 porque quiero escuchar el comienzo.
+5. Luci, leeme libro 1 tranqui y despues vemos.
+6. Antes de seguir, abri el libro numero 1.
+7. Quiero que ahora mismo abri el libro 1 y empieces.
+8. Mira, para esta prueba: abrime libro 1 por favor.
+9. Necesito foco, abri el libro 1 y no te vayas por las ramas.
+10. En serio, leer libro 1 que estamos validando reader.
+11. Para testear, decime biblioteca primero y listo.
+12. Che luci, mostrame la biblioteca asi elijo bien.
+13. Podrias abrir la biblioteca y listar mis libros?
+14. Antes de nada, biblioteca rescan por favor.
+15. Necesito que actualices biblioteca porque agregue archivos.
+16. Pasame estado lectura asi veo donde quedamos.
+17. Bueno, decime donde voy en la lectura actual.
+18. Quiero status lectura completo con cursor y todo.
+19. Si estas leyendo, por favor pausa lectura un segundo.
+20. Detenete un toque que te quiero preguntar algo.
+21. Te pido pausar lectura porque anote mal.
+22. Necesito que pares la lectura ahora, gracias.
+23. Stop lectura por favor, se mezclo el audio.
+24. Listo, continuar cuando puedas.
+25. Dale segui leyendo desde donde estabas.
+26. Che, siguiente bloque porfa.
+27. Quiero que sigas leyendo ahora mismo.
+28. Next, seguimos con el proximo bloque.
+29. Podrias continuar desde "matriz" para retomar exacto?
+30. Intenta continuar desde "capitulo uno" por favor.
+31. Necesito volver una frase porque no entendi.
+32. Podrias volver un parrafo asi lo repaso?
+33. Che, repetir ese bloque porque se corto.
+34. Repeti lo ultimo, no llegue a escucharlo.
+35. Poneme modo manual on para avanzar paso a paso.
+36. Dejemos manual on por ahora asi controlo yo.
+37. Cambiame modo manual off y que siga solo.
+38. Quiero manual off para volver al autopiloto.
+39. Activame continuo on asi no tengo que pedir siguiente.
+40. Mejor continuo off porque quiero ir de a poco.
+41. Luci, por favor abri libro 2 y despues seguir leyendo.
+42. Si podes, abrime el libro numero 3 para arrancar.
+43. Che, leer libro 4 que ese es el correcto.
+44. Te digo una larga: bueno luci, cuando termines eso abri el libro 5 y empeza a leer.
+45. Mira esta frase larga: necesito que abri el libro 6 porque quiero escuchar el inicio ahora.
+46. Para validar NLU: podrias, sin vueltas, abrime libro 7 y arrancar lectura continua?
+47. Otra mas: loco abri el libro 8 asi hacemos la prueba de punta a punta.
+48. En esta tambien: bueno, si no es molestia, leer libro 9 y luego estado lectura.
+49. Con ruido verbal: eh luci mm abri el libro 10 dale.
+50. Comando embebido final: che, antes de cerrar, abri el libro 11 que mañana sigo.

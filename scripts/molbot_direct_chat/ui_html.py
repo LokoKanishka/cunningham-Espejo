@@ -9,21 +9,21 @@ HTML = r"""<!doctype html>
   <title>Molbot Direct Chat</title>
   <style>
     :root {
-      --bg: #0f1222;
-      --panel: #181d33;
-      --muted: #8f9ab8;
-      --text: #eef2ff;
-      --user: #21305f;
-      --assistant: #212842;
-      --accent: #4dd4ac;
-      --border: #2b3359;
+      --bg: #050506;
+      --panel: #0d0a0b;
+      --muted: #79ff88;
+      --text: #39ff5a;
+      --user: #2b0a11;
+      --assistant: #1a0b0f;
+      --accent: #ff2343;
+      --border: #641321;
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
       font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
       color: var(--text);
-      background: radial-gradient(1200px 700px at 20% -10%, #22306a 0%, transparent 55%), var(--bg);
+      background: radial-gradient(1200px 700px at 20% -10%, #6b0f21 0%, transparent 55%), var(--bg);
       min-height: 100vh;
       display: flex;
       align-items: center;
@@ -67,9 +67,9 @@ HTML = r"""<!doctype html>
       display: inline-flex;
       align-items: center;
       gap: 8px;
-      border: 1px solid #2fffd9;
-      color: #b7fff2;
-      background: linear-gradient(135deg, rgba(8, 38, 44, 0.85), rgba(6, 18, 32, 0.95));
+      border: 1px solid #ff405f;
+      color: #9dffad;
+      background: linear-gradient(135deg, rgba(132, 13, 35, 0.98), rgba(62, 6, 17, 0.98));
       border-radius: 999px;
       padding: 6px 12px;
       font-size: 12px;
@@ -77,39 +77,40 @@ HTML = r"""<!doctype html>
       letter-spacing: 0.06em;
       cursor: pointer;
       text-transform: uppercase;
-      box-shadow: 0 0 0 1px rgba(47, 255, 217, 0.2) inset;
+      box-shadow: 0 0 0 1px rgba(255, 58, 89, 0.35) inset, 0 0 12px rgba(255, 58, 89, 0.25);
     }
     .voice-toggle[data-on="0"] {
-      border-color: #6a789f;
-      color: #b4bdd6;
-      background: linear-gradient(135deg, rgba(26, 34, 58, 0.92), rgba(19, 25, 43, 0.96));
-      box-shadow: none;
+      border-color: #5d3b41;
+      color: #8f9b92;
+      background: linear-gradient(135deg, rgba(28, 24, 25, 0.98), rgba(17, 14, 15, 0.98));
+      box-shadow: inset 0 0 0 1px rgba(110, 90, 94, 0.35);
+      opacity: 0.82;
     }
     .voice-dot {
       width: 9px;
       height: 9px;
       border-radius: 50%;
-      background: #2fffd9;
-      box-shadow: 0 0 10px rgba(47, 255, 217, 0.9);
+      background: #ff3a59;
+      box-shadow: 0 0 10px rgba(255, 58, 89, 0.9);
       transition: transform 0.12s ease;
     }
     .voice-toggle[data-on="0"] .voice-dot {
-      background: #8b96b8;
+      background: #6b585c;
       box-shadow: none;
     }
     .voice-toggle.speaking .voice-dot {
       animation: voice-pulse 0.8s infinite;
     }
     @keyframes voice-pulse {
-      0% { transform: scale(1.0); box-shadow: 0 0 4px rgba(47, 255, 217, 0.6); }
-      50% { transform: scale(1.35); box-shadow: 0 0 14px rgba(47, 255, 217, 1); }
-      100% { transform: scale(1.0); box-shadow: 0 0 4px rgba(47, 255, 217, 0.6); }
+      0% { transform: scale(1.0); box-shadow: 0 0 4px rgba(255, 58, 89, 0.65); }
+      50% { transform: scale(1.35); box-shadow: 0 0 14px rgba(255, 58, 89, 1); }
+      100% { transform: scale(1.0); box-shadow: 0 0 4px rgba(255, 58, 89, 0.65); }
     }
     .meter {
       font-size: 12px;
       color: var(--muted);
       border: 1px solid var(--border);
-      background: rgba(18, 24, 49, 0.85);
+      background: rgba(35, 10, 15, 0.88);
       border-radius: 999px;
       padding: 6px 10px;
       white-space: nowrap;
@@ -141,14 +142,29 @@ HTML = r"""<!doctype html>
     }
     textarea, input, select {
       color: var(--text);
-      background: #121831;
+      background: #13090c;
       border: 1px solid var(--border);
       border-radius: 10px;
       padding: 8px 10px;
     }
+    option {
+      color: var(--text);
+      background: #2a090f;
+    }
+    input[type="checkbox"] { accent-color: var(--accent); }
+    input[type="file"]::file-selector-button,
+    input[type="file"]::-webkit-file-upload-button {
+      color: #320108;
+      background: #ff2b4a;
+      border: 1px solid #a3162b;
+      border-radius: 8px;
+      padding: 6px 10px;
+      font-weight: 700;
+      cursor: pointer;
+    }
     textarea { min-height: 74px; resize: vertical; width: 100%; }
     button {
-      color: #06291f;
+      color: #032a09;
       background: var(--accent);
       border: 0;
       border-radius: 10px;
@@ -157,10 +173,15 @@ HTML = r"""<!doctype html>
       cursor: pointer;
     }
     button.alt {
-      background: transparent;
-      border: 1px solid var(--border);
-      color: var(--text);
+      background: linear-gradient(135deg, rgba(44, 10, 16, 0.95), rgba(25, 8, 11, 0.98));
+      border: 1px solid #902336;
+      color: #ff4f6d;
       font-weight: 600;
+    }
+    button.alt:hover {
+      background: linear-gradient(135deg, rgba(62, 12, 21, 0.98), rgba(33, 8, 13, 0.98));
+      border-color: #b92b43;
+      color: #ff6c86;
     }
     .small { font-size: 12px; color: var(--muted); }
   </style>
@@ -256,6 +277,7 @@ HTML = r"""<!doctype html>
 	      let chatFeedBusy = false;
 	      let chatFeedEnabled = false;
 	      let lastChatSeq = 0;
+	      let readerLiveRenderId = 0;
 
 	    function fmtMb(mb) {
 	      if (mb == null || Number.isNaN(mb)) return "?";
@@ -500,11 +522,17 @@ HTML = r"""<!doctype html>
 	      const out = await postChatJson(payload, null);
 	      if (out?.recovered) return;
 	      const reply = String(out?.data?.reply || "").trim();
+	      const readerMeta = out?.data?.reader || {};
+	      let renderedLive = false;
 	      if (reply) {
-	        await push("assistant", reply);
+	        renderedLive = launchReaderLiveRender(reply, readerMeta);
+	        if (!renderedLive) {
+	          await push("assistant", reply);
+	        }
 	        bumpSpeakingVisual();
 	      }
-	      applyReaderMeta(out?.data?.reader || {});
+	      applyReaderMeta(readerMeta);
+	      if (reply && renderedLive) return;
 	      await saveServerHistory();
 	    }
 
@@ -851,6 +879,92 @@ HTML = r"""<!doctype html>
       draw();
     }
 
+    async function postReaderProgress(readerMeta, offsetChars, quality = "ui_live") {
+      try {
+        const chunkId = String(readerMeta?.chunk_id || "").trim();
+        if (!chunkId) return;
+        const payload = {
+          session_id: sessionId,
+          chunk_id: chunkId,
+          offset_chars: Math.max(0, Math.trunc(Number(offsetChars) || 0)),
+          quality: String(quality || "ui_live"),
+        };
+        await fetch("/api/reader/progress", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+      } catch {}
+    }
+
+    function _splitReaderReplyForLive(reply, chunkText) {
+      const full = String(reply || "");
+      const chunk = String(chunkText || "");
+      if (!chunk) return { lead: "", body: full };
+      const idx = full.lastIndexOf(chunk);
+      if (idx < 0) return { lead: "", body: chunk };
+      return { lead: full.slice(0, idx), body: full.slice(idx) };
+    }
+
+    function launchReaderLiveRender(reply, readerMeta) {
+      const meta = (readerMeta && typeof readerMeta === "object") ? readerMeta : null;
+      if (!meta) return false;
+      if (!voiceEnabled || !meta?.tts_gate_required) return false;
+      const chunkText = String(meta?.chunk_text || "").trim();
+      const streamId = clampInt(meta?.tts_wait_stream_id, 0, 0, 10000000);
+      if (!chunkText || streamId <= 0) return false;
+
+      const split = _splitReaderReplyForLive(String(reply || ""), chunkText);
+      const lead = String(split.lead || "");
+      const body = String(split.body || chunkText);
+      const msg = { role: "assistant", content: lead };
+      history.push(msg);
+      history = history.slice(-200);
+      draw();
+
+      const parts = body.split(/(\s+)/).filter((p) => p.length > 0);
+      const wordCount = Math.max(1, parts.filter((p) => /\S/.test(p)).length);
+      const charsPerSec = 16;
+      const estMs = Math.max(1400, Math.min(90000, Math.round((Math.max(1, body.length) / charsPerSec) * 1000)));
+      const wordDelay = clampInt(Math.round(estMs / wordCount), 130, 50, 360);
+      const baseOffset = clampInt(meta?.offset_chars, 0, 0, 5000000);
+      const renderId = ++readerLiveRenderId;
+
+      let pos = 0;
+      let rendered = "";
+      let lastProgressAt = 0;
+      const step = () => {
+        if (renderId !== readerLiveRenderId) return;
+        if (!history.includes(msg)) return;
+        if (pos >= parts.length) {
+          msg.content = lead + rendered;
+          draw();
+          const finalOffset = baseOffset + rendered.length;
+          postReaderProgress(meta, finalOffset, "ui_live_final");
+          saveServerHistory();
+          return;
+        }
+        const part = parts[pos++];
+        rendered += part;
+        msg.content = lead + rendered;
+        draw();
+
+        const isWord = /\S/.test(part);
+        if (isWord) {
+          const now = Date.now();
+          if ((now - lastProgressAt) >= 140 || pos >= parts.length) {
+            lastProgressAt = now;
+            const liveOffset = baseOffset + rendered.length;
+            postReaderProgress(meta, liveOffset, "ui_live");
+          }
+        }
+        const delay = isWord ? wordDelay : 0;
+        setTimeout(step, delay);
+      };
+      setTimeout(step, 0);
+      return true;
+    }
+
     async function readAttachments(files) {
       const out = [];
       for (const f of files) {
@@ -1145,12 +1259,19 @@ HTML = r"""<!doctype html>
           return;
         }
         const reply = String(out?.data?.reply || "").trim();
+        const readerMeta = out?.data?.reader || {};
+        let renderedLive = false;
         if (reply) {
-          await push("assistant", reply);
+          renderedLive = launchReaderLiveRender(reply, readerMeta);
+          if (!renderedLive) {
+            await push("assistant", reply);
+          }
           bumpSpeakingVisual();
         }
-        applyReaderMeta(out?.data?.reader || {});
-        await saveServerHistory();
+        applyReaderMeta(readerMeta);
+        if (!renderedLive) {
+          await saveServerHistory();
+        }
       } catch (err) {
         if (err?.name !== "AbortError") {
           await push("assistant", "Error: " + (err?.message || String(err)));
@@ -1282,12 +1403,19 @@ HTML = r"""<!doctype html>
           const out = await postChatJson(payload, controller);
           if (!out?.recovered) {
             const reply = String(out?.data?.reply || "").trim();
+            const readerMeta = out?.data?.reader || {};
+            let renderedLive = false;
             if (reply) {
-              await push("assistant", reply);
+              renderedLive = launchReaderLiveRender(reply, readerMeta);
+              if (!renderedLive) {
+                await push("assistant", reply);
+              }
               bumpSpeakingVisual();
             }
-            applyReaderMeta(out?.data?.reader || {});
-            await saveServerHistory();
+            applyReaderMeta(readerMeta);
+            if (!renderedLive) {
+              await saveServerHistory();
+            }
           }
         } else {
           const res = await fetch("/api/chat/stream", {

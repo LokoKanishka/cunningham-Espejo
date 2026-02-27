@@ -8,6 +8,7 @@ import json
 import os
 import queue
 import re
+import socket
 import shutil
 import subprocess
 import sys
@@ -115,6 +116,7 @@ _TTS_PLAYING_STREAM_ID = 0
 _TTS_LAST_ACTIVITY_MONO = 0.0
 _TTS_ECHO_GUARD_SEC = 0.8
 _TTS_STOP_REASON_BY_STREAM: dict[int, str] = {}
+_TTS_PLAYBACK_MONO_BY_STREAM: dict[int, float] = {}
 _BARGEIN_LOCK = threading.Lock()
 _BARGEIN_MONITOR = None
 _BARGEIN_STATS = {"count": 0, "last_ts": 0.0, "last_keyword": "", "last_detail": "not_started"}
@@ -338,6 +340,14 @@ def _reader_mark_barge_in_from_stream(
     if not sid:
         return
     pm = playback_ms
+    if pm is None and stream_id > 0:
+        try:
+            with _TTS_STREAM_LOCK:
+                started_mono = float(_TTS_PLAYBACK_MONO_BY_STREAM.get(int(stream_id), 0.0) or 0.0)
+            if started_mono > 0.0:
+                pm = max(0.0, (time.monotonic() - started_mono) * 1000.0)
+        except Exception:
+            pm = None
     if pm is None and isinstance(pending, dict):
         created_mono = float(pending.get("created_mono", 0.0) or 0.0)
         if created_mono > 0.0:
@@ -2697,6 +2707,7 @@ def _start_new_tts_stream() -> tuple[int, threading.Event]:
     if prev_stream_id > 0:
         with _TTS_STREAM_LOCK:
             _TTS_STOP_REASON_BY_STREAM[int(prev_stream_id)] = "stream_replaced"
+            _TTS_PLAYBACK_MONO_BY_STREAM.pop(int(prev_stream_id), None)
 
     prev_event.set()
     _stop_playback_process()
@@ -2724,6 +2735,21 @@ def _set_tts_queue(stream_id: int, tts_queue: queue.Queue | None) -> None:
     with _TTS_STREAM_LOCK:
         if stream_id == _TTS_STREAM_ID:
             _TTS_ACTIVE_QUEUE = tts_queue
+
+
+def _mark_tts_stream_playback_start(stream_id: int) -> None:
+    if int(stream_id or 0) <= 0:
+        return
+    now_mono = time.monotonic()
+    with _TTS_STREAM_LOCK:
+        _TTS_PLAYBACK_MONO_BY_STREAM[int(stream_id)] = float(now_mono)
+
+
+def _clear_tts_stream_playback_start(stream_id: int) -> None:
+    if int(stream_id or 0) <= 0:
+        return
+    with _TTS_STREAM_LOCK:
+        _TTS_PLAYBACK_MONO_BY_STREAM.pop(int(stream_id), None)
 
 
 def _play_audio_blocking(path: Path, stop_event: threading.Event) -> tuple[bool, str]:
@@ -3007,6 +3033,7 @@ def _speak_reply_async(text: str) -> int:
         played_any = False
         last_detail = "ok_stream"
         interrupted = False
+        playback_started = False
 
         try:
             while True:
@@ -3027,6 +3054,9 @@ def _speak_reply_async(text: str) -> int:
                         interrupted = True
                     break
 
+                if not playback_started:
+                    playback_started = True
+                    _mark_tts_stream_playback_start(stream_id)
                 ok, detail = _play_audio_blocking(item, stop_event)
                 try:
                     item.unlink(missing_ok=True)
@@ -3046,6 +3076,7 @@ def _speak_reply_async(text: str) -> int:
             producer_thread.join(timeout=1.0)
             _set_tts_queue(stream_id, None)
             _stop_bargein_monitor()
+            _clear_tts_stream_playback_start(stream_id)
             with _TTS_STREAM_LOCK:
                 if _TTS_PLAYING_STREAM_ID == stream_id:
                     _TTS_PLAYING_STREAM_ID = 0
@@ -5778,6 +5809,7 @@ class ReaderSessionStore:
             pending_text = str(pending.get("text", ""))
             text_len = len(pending_text)
             offset = int(pending.get("offset_chars", 0) or 0)
+            prev_offset = int(offset)
             quality = "approx"
             if offset_hint is not None:
                 try:
@@ -5795,6 +5827,12 @@ class ReaderSessionStore:
                     cps = max(4.0, float(os.environ.get("DIRECT_CHAT_READER_APPROX_CHARS_PER_SEC", "16")))
                     elapsed = max(0.0, now - last_delivery_ts)
                     offset = int(elapsed * cps)
+            # Prefer already-known live progress when available to avoid jumping
+            # backwards/forwards from rough time estimates.
+            prev_quality = str(pending.get("offset_quality", "") or "").strip().lower()
+            if prev_offset > 0 and prev_quality in ("ui_live", "live", "phrase", "rewind_sentence", "rewind_paragraph"):
+                offset = max(prev_offset, int(offset))
+                quality = "existing_live"
             if text_len > 0:
                 offset = max(0, min(offset, text_len))
             else:
@@ -5810,6 +5848,56 @@ class ReaderSessionStore:
             sess["reader_state"] = "commenting"
             out = self._session_view(sid, sess, include_chunks=False)
             out["interrupted"] = True
+            out["chunk"] = self._pending_view(pending)
+            return out
+
+        return self._with_state(True, _write)
+
+    def update_progress(
+        self,
+        session_id: str,
+        chunk_id: str = "",
+        offset_chars: int = 0,
+        quality: str = "ui_live",
+    ) -> dict:
+        sid = _safe_session_id(session_id)
+        wanted_chunk = str(chunk_id or "").strip()
+        qual = str(quality or "ui_live").strip().lower()[:24] or "ui_live"
+
+        def _write(state: dict) -> dict:
+            sessions = state.get("sessions", {})
+            if not isinstance(sessions, dict) or sid not in sessions or not isinstance(sessions.get(sid), dict):
+                return self._session_missing(sid)
+            sess = sessions[sid]
+            pending = sess.get("pending")
+            if not isinstance(pending, dict):
+                out = self._session_view(sid, sess, include_chunks=False)
+                out["progress_updated"] = False
+                out["detail"] = "reader_no_pending_chunk"
+                return out
+            got_chunk = str(pending.get("chunk_id", "")).strip()
+            if wanted_chunk and got_chunk and wanted_chunk != got_chunk:
+                out = self._session_view(sid, sess, include_chunks=False)
+                out["progress_updated"] = False
+                out["detail"] = "reader_progress_chunk_mismatch"
+                out["expected_chunk_id"] = wanted_chunk
+                out["pending_chunk_id"] = got_chunk
+                return out
+            now = float(time.time())
+            try:
+                target = int(offset_chars)
+            except Exception:
+                target = int(pending.get("offset_chars", 0) or 0)
+            current = int(pending.get("offset_chars", 0) or 0)
+            # Never move backwards from live UI updates.
+            if target < current:
+                target = current
+            self._set_pending_offset(pending, offset_chars=target, now=now, quality=qual)
+            sess["bookmark"] = self._bookmark_from_pending(pending, now=now, quality_fallback=qual)
+            sess["updated_ts"] = now
+            sess["last_event"] = "reader_progress_update"
+            out = self._session_view(sid, sess, include_chunks=False)
+            out["progress_updated"] = True
             out["chunk"] = self._pending_view(pending)
             return out
 
@@ -5933,16 +6021,22 @@ class ReaderSessionStore:
                 sess["pending"] = pending
             ptext = str(pending.get("text", ""))
             idx = ptext.lower().find(needle.lower()) if needle else -1
+            seek_wrapped = False
             if idx < 0:
                 next_idx = int(pending.get("chunk_index", 0) or 0) + 1
-                if 0 <= next_idx < len(chunks):
-                    raw_n = chunks[next_idx] if isinstance(chunks[next_idx], dict) else {}
-                    text_n = str(raw_n.get("text", ""))
-                    idx_n = text_n.lower().find(needle.lower()) if needle else -1
-                    if idx_n >= 0:
+                scan_ranges = [range(max(0, next_idx), len(chunks))]
+                if next_idx > 0 and chunks:
+                    scan_ranges.append(range(0, min(next_idx, len(chunks))))
+                for pass_idx, scan_range in enumerate(scan_ranges):
+                    for scan_idx in scan_range:
+                        raw_n = chunks[scan_idx] if isinstance(chunks[scan_idx], dict) else {}
+                        text_n = str(raw_n.get("text", ""))
+                        idx_n = text_n.lower().find(needle.lower()) if needle else -1
+                        if idx_n < 0:
+                            continue
                         pending = {
-                            "chunk_index": next_idx,
-                            "chunk_id": str(raw_n.get("id", f"chunk_{next_idx + 1:03d}"))[:80],
+                            "chunk_index": scan_idx,
+                            "chunk_id": str(raw_n.get("id", f"chunk_{scan_idx + 1:03d}"))[:80],
                             "text": text_n[:8000],
                             "offset_chars": 0,
                             "offset_quality": "start",
@@ -5954,6 +6048,10 @@ class ReaderSessionStore:
                         sess["pending"] = pending
                         ptext = str(pending.get("text", ""))
                         idx = idx_n
+                        seek_wrapped = bool(pass_idx > 0)
+                        break
+                    if idx >= 0:
+                        break
             if idx < 0:
                 out = self._session_view(sid, sess, include_chunks=False)
                 out["ok"] = False
@@ -5968,6 +6066,7 @@ class ReaderSessionStore:
             out = self._session_view(sid, sess, include_chunks=False)
             out["seeked"] = True
             out["chunk"] = self._pending_view(pending)
+            out["seek_wrapped"] = bool(seek_wrapped)
             return out
 
         return self._with_state(True, _write)
@@ -6415,6 +6514,28 @@ def _reader_pacing_wait_ms(state: dict | None, now_ts: float | None = None, cfg:
     return max(wait_interval_ms, wait_burst_ms)
 
 
+_READER_BOOK_CMD_RE = re.compile(
+    r"\b(?:leer|leeme|abrir|abri|abrime)\s+(?:el\s+)?(?:libro\s+)?(?:numero\s+|nro\.?\s+|n°\s+)?(\d+)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _extract_reader_book_index(message: str) -> int | None:
+    normalized = _normalize_text(message)
+    if not normalized:
+        return None
+    m = _READER_BOOK_CMD_RE.search(normalized)
+    if not m:
+        return None
+    try:
+        idx = int(str(m.group(1) or "").strip())
+    except Exception:
+        return None
+    if idx <= 0:
+        return None
+    return idx
+
+
 def _is_reader_control_command(message: str) -> bool:
     normalized = _normalize_text(message)
     if not normalized:
@@ -6433,6 +6554,7 @@ def _is_reader_control_command(message: str) -> bool:
             "segui",
             "seguir",
             "seguir leyendo",
+            "sigas leyendo",
             "siguiente",
             "next",
             "continuar",
@@ -6444,17 +6566,21 @@ def _is_reader_control_command(message: str) -> bool:
             "continuo off",
             "modo manual on",
             "modo manual off",
+            "manual on",
+            "manual off",
             "detenete",
             "detente",
             "pausa lectura",
+            "pausar la lectura",
             "pausar lectura",
             "detener lectura",
             "parar lectura",
+            "pares la lectura",
             "stop lectura",
         )
     ):
         return True
-    return bool(re.search(r"(?:leer|abrir)\s+(?:el\s+)?(?:libro\s+)?(\d+)\b", normalized, flags=re.IGNORECASE))
+    return _extract_reader_book_index(normalized) is not None
 
 
 def _reader_chunk_reply(chunk: dict, total_chunks: int, title: str = "", prefix: str = "") -> str:
@@ -6512,6 +6638,8 @@ def _reader_meta(
         out["chunk_index"] = int(chunk.get("chunk_index", 0) or 0)
         out["chunk_id"] = str(chunk.get("chunk_id", ""))
         out["offset_chars"] = int(chunk.get("offset_chars", 0) or 0)
+        out["chunk_text"] = str(chunk.get("text", ""))
+        out["chunk_total_chars"] = len(str(chunk.get("text", "")))
     if isinstance(st.get("bookmark"), dict):
         out["bookmark"] = {
             "chunk_index": int(st["bookmark"].get("chunk_index", 0) or 0),
@@ -6932,14 +7060,11 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
             "reader": _reader_meta(session_id, st_after, auto_continue=False),
         }
 
-    m_read = re.search(r"(?:leer|abrir)\s+(?:el\s+)?(?:libro\s+)?(\d+)\b", normalized, flags=re.IGNORECASE)
-    if m_read:
+    read_idx = _extract_reader_book_index(normalized)
+    if read_idx is not None:
         out = _READER_LIBRARY.list_books()
         books = out.get("books", []) if isinstance(out, dict) else []
-        try:
-            idx = int(m_read.group(1))
-        except Exception:
-            idx = 0
+        idx = int(read_idx)
         if (not isinstance(books, list)) or idx < 1 or idx > len(books):
             limit = len(books) if isinstance(books, list) else 0
             return {"reply": f"Índice de libro inválido. Rango disponible: 1..{limit}.", "no_auto_tts": True}
@@ -7019,9 +7144,11 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
             "detenete",
             "detente",
             "pausa lectura",
+            "pausar la lectura",
             "pausar lectura",
             "detener lectura",
             "parar lectura",
+            "pares la lectura",
             "stop lectura",
         )
     ):
@@ -7039,11 +7166,16 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
             "reader": _reader_meta(session_id, st_after, auto_continue=False),
         }
 
-    m_continue_from = re.search(r'continuar\s+desde\s+["“](.+?)["”]', message, flags=re.IGNORECASE)
+    m_continue_from = re.search(r'continuar\s+desde\s+(?:la\s+)?frase\s+["“](.+?)["”]', message, flags=re.IGNORECASE)
+    if not m_continue_from:
+        m_continue_from = re.search(r'continuar\s+desde\s+["“](.+?)["”]', message, flags=re.IGNORECASE)
+    if not m_continue_from:
+        m_continue_from = re.search(r"continuar\s+desde\s+(?:la\s+)?frase\s+(.+)$", message, flags=re.IGNORECASE)
     if not m_continue_from:
         m_continue_from = re.search(r"continuar\s+desde\s+(.+)$", message, flags=re.IGNORECASE)
     if m_continue_from:
         phrase = str(m_continue_from.group(1) or "").strip()
+        phrase = re.sub(r"^(?:la\s+frase|frase)\s+", "", phrase, flags=re.IGNORECASE).strip()
         if not phrase:
             return {"reply": "Indicá una frase para continuar. Ejemplo: continuar desde \"matriz\".", "no_auto_tts": True}
         st_before = _READER_STORE.get_session(session_id, include_chunks=False)
@@ -7278,7 +7410,7 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
             ),
         }
 
-    if any(k in normalized for k in ("segui", "siguiente", "continuar", "seguir leyendo")) or bool(
+    if any(k in normalized for k in ("segui", "siguiente", "continuar", "seguir leyendo", "sigas leyendo")) or bool(
         re.search(r"\bnext\b", normalized)
     ):
         st_before = _READER_STORE.get_session(session_id, include_chunks=False)
@@ -8083,6 +8215,37 @@ class _ModelSelectionError(Exception):
         }
 
 
+class _BackendCallError(Exception):
+    def __init__(self, code: str, detail: str, status: int = 502):
+        super().__init__(detail)
+        self.code = str(code or "BACKEND_ERROR")
+        self.detail = str(detail or self.code)
+        self.status = int(status or 502)
+
+    def as_payload(self) -> dict:
+        return {
+            "error": self.code,
+            "detail": self.detail,
+        }
+
+
+def _looks_missing_model_error(detail: str) -> bool:
+    d = str(detail or "").strip().lower()
+    if not d:
+        return False
+    markers = (
+        "model not found",
+        "not found, try pulling",
+        "unknown model",
+        "no such model",
+        "missing model",
+        "model_not_found",
+        "does not exist",
+        "not installed",
+    )
+    return any(m in d for m in markers)
+
+
 def _resolve_model_request(model: str, model_backend: str | None = None) -> dict:
     catalog = _model_catalog()
     requested_model = str(model or "").strip() or str(catalog.get("default_model", "")).strip()
@@ -8581,6 +8744,7 @@ class Handler(BaseHTTPRequestHandler):
         return [system] + clean + [{"role": "user", "content": message + extra}]
 
     def _call_gateway(self, payload: dict) -> dict:
+        timeout_s = max(8.0, float(_int_env("DIRECT_CHAT_GATEWAY_TIMEOUT_SEC", 45)))
         req = Request(
             url=f"http://127.0.0.1:{self.server.gateway_port}/v1/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
@@ -8590,28 +8754,43 @@ class Handler(BaseHTTPRequestHandler):
             },
             method="POST",
         )
-        with urlopen(req, timeout=120) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        try:
+            with urlopen(req, timeout=timeout_s) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace")
+            if e.code in (400, 404) and _looks_missing_model_error(detail):
+                raise _BackendCallError("MISSING_MODEL", detail, status=400) from e
+            raise _BackendCallError("GATEWAY_HTTP_ERROR", f"HTTP {e.code}: {detail[:400]}", status=502) from e
+        except URLError as e:
+            raise _BackendCallError("GATEWAY_UNREACHABLE", str(e), status=502) from e
+        except (socket.timeout, TimeoutError) as e:
+            raise _BackendCallError("MODEL_TIMEOUT", f"gateway timeout after {timeout_s:.0f}s", status=504) from e
 
     def _call_ollama(self, payload: dict) -> dict:
         base = str(os.environ.get("DIRECT_CHAT_OLLAMA_URL", "http://127.0.0.1:11434")).strip().rstrip("/")
         timeout_s = max(10.0, float(_int_env("DIRECT_CHAT_OLLAMA_TIMEOUT_SEC", 120)))
+        conn_timeout_s = max(2.0, float(_int_env("DIRECT_CHAT_OLLAMA_CONNECT_TIMEOUT_SEC", 4)))
 
         v1_payload = dict(payload)
         v1_payload["stream"] = False
 
         try:
-            r = requests.post(f"{base}/v1/chat/completions", json=v1_payload, timeout=timeout_s)
+            r = requests.post(f"{base}/v1/chat/completions", json=v1_payload, timeout=(conn_timeout_s, timeout_s))
             if r.status_code < 400:
                 out = r.json() if r.content else {}
                 if isinstance(out, dict):
                     return out
+            detail = (r.text or "")[:300].replace("\n", " ")
+            if r.status_code in (400, 404) and _looks_missing_model_error(detail):
+                raise _BackendCallError("MISSING_MODEL", detail, status=400)
             if r.status_code not in (400, 404, 405):
-                detail = (r.text or "")[:300].replace("\n", " ")
-                raise RuntimeError(f"ollama_http_error:{r.status_code}:{detail}")
+                raise _BackendCallError("OLLAMA_HTTP_ERROR", f"HTTP {r.status_code}: {detail}", status=502)
+        except requests.exceptions.Timeout as e:
+            raise _BackendCallError("MODEL_TIMEOUT", f"ollama timeout after {timeout_s:.0f}s", status=504) from e
         except requests.exceptions.RequestException as e:
             # Fallback below to legacy Ollama API.
-            last_err = f"ollama_request_failed:{e}"
+            last_err = str(e)
         else:
             last_err = ""
 
@@ -8625,13 +8804,17 @@ class Handler(BaseHTTPRequestHandler):
             legacy_payload["options"] = {"temperature": temp}
 
         try:
-            r2 = requests.post(f"{base}/api/chat", json=legacy_payload, timeout=timeout_s)
+            r2 = requests.post(f"{base}/api/chat", json=legacy_payload, timeout=(conn_timeout_s, timeout_s))
+        except requests.exceptions.Timeout as e:
+            raise _BackendCallError("MODEL_TIMEOUT", f"ollama timeout after {timeout_s:.0f}s", status=504) from e
         except requests.exceptions.RequestException as e:
-            raise RuntimeError(last_err or f"ollama_request_failed:{e}") from e
+            raise _BackendCallError("OLLAMA_UNREACHABLE", last_err or str(e), status=502) from e
 
         if r2.status_code >= 400:
             detail = (r2.text or "")[:320].replace("\n", " ")
-            raise RuntimeError(f"ollama_http_error:{r2.status_code}:{detail}")
+            if r2.status_code in (400, 404) and _looks_missing_model_error(detail):
+                raise _BackendCallError("MISSING_MODEL", detail, status=400)
+            raise _BackendCallError("OLLAMA_HTTP_ERROR", f"HTTP {r2.status_code}: {detail}", status=502)
 
         raw = r2.json() if r2.content else {}
         content = _extract_reply_text(raw)
@@ -8717,6 +8900,41 @@ class Handler(BaseHTTPRequestHandler):
                     self._json(409, out)
                 else:
                     self._json(400, out)
+            except Exception as e:
+                self._json(500, {"ok": False, "error": str(e)})
+            return
+
+        if self.path == "/api/reader/progress":
+            try:
+                payload = self._parse_payload()
+                sid = _safe_session_id(str(payload.get("session_id", "default")))
+                chunk_id = str(payload.get("chunk_id", "")).strip()
+                raw_offset = payload.get("offset_chars")
+                try:
+                    offset_chars = int(raw_offset if raw_offset is not None else 0)
+                except Exception:
+                    offset_chars = 0
+                quality = str(payload.get("quality", "ui_live")).strip() or "ui_live"
+                out = _READER_STORE.update_progress(
+                    sid,
+                    chunk_id=chunk_id,
+                    offset_chars=offset_chars,
+                    quality=quality,
+                )
+                if out.get("ok") and bool(out.get("progress_updated", False)):
+                    self._json(200, out)
+                    return
+                detail = str(out.get("detail", "")).strip()
+                if detail == "reader_no_pending_chunk":
+                    self._json(409, out)
+                    return
+                if detail == "reader_progress_chunk_mismatch":
+                    self._json(409, out)
+                    return
+                if str(out.get("error", "")) == "reader_session_not_found":
+                    self._json(404, out)
+                    return
+                self._json(400, out)
             except Exception as e:
                 self._json(500, {"ok": False, "error": str(e)})
             return
@@ -9146,12 +9364,6 @@ class Handler(BaseHTTPRequestHandler):
                 ] + messages[1:]
 
             if self.path == "/api/chat/stream":
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "close")
-                self.end_headers()
-
                 # Robust pseudo-stream: avoids hanging when upstream SSE behavior
                 # changes and still gives progressive UX.
                 req_payload = {
@@ -9184,6 +9396,11 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 _chat_events_append(session_id, role="assistant", content=full, source="model", ts=time.time())
                 _maybe_speak_reply(full, allowed_tools)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self.end_headers()
                 step = 18
                 for i in range(0, len(full), step):
                     token = full[i:i + step]
@@ -9245,6 +9462,12 @@ class Handler(BaseHTTPRequestHandler):
                     "chat_seq": int(_chat_events_poll(session_id, after_seq=0, limit=1).get("seq", 0) or 0),
                 },
             )
+        except _ModelSelectionError as e:
+            self._json(400, e.as_payload())
+        except _BackendCallError as e:
+            if e.code == "MISSING_MODEL":
+                _model_catalog(force_refresh=True)
+            self._json(e.status, e.as_payload())
         except HTTPError as e:
             detail = e.read().decode("utf-8", errors="replace")
             self._json(e.code, {"error": f"Gateway HTTP {e.code}", "detail": detail})

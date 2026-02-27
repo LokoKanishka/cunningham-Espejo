@@ -156,6 +156,44 @@ class TestReaderSessionStore(unittest.TestCase):
         self.assertTrue(rew.get("rewound"))
         self.assertEqual(str(rew.get("rewind_unit", "")), "sentence")
 
+    def test_seek_phrase_scans_beyond_next_chunk(self) -> None:
+        self.store.start_session("sess_f2", chunks=["uno", "dos", "objetivo final aqui"], reset=True)
+        self.store.next_chunk("sess_f2")
+        sought = self.store.seek_phrase("sess_f2", "objetivo final")
+        self.assertTrue(sought.get("ok"))
+        self.assertTrue(sought.get("seeked"))
+        chunk = sought.get("chunk", {})
+        self.assertEqual(int(chunk.get("chunk_index", -1)), 2)
+        self.assertIn("objetivo", str(chunk.get("text", "")).lower())
+
+    def test_seek_phrase_wraps_to_previous_chunks(self) -> None:
+        self.store.start_session("sess_f3", chunks=["uno", "la herida no es escribe bien", "tres"], reset=True)
+        c1 = self.store.next_chunk("sess_f3").get("chunk", {})
+        self.store.commit("sess_f3", chunk_id=str(c1.get("chunk_id", "")), chunk_index=int(c1.get("chunk_index", 0)))
+        c2 = self.store.next_chunk("sess_f3").get("chunk", {})
+        self.store.commit("sess_f3", chunk_id=str(c2.get("chunk_id", "")), chunk_index=int(c2.get("chunk_index", 0)))
+        self.store.next_chunk("sess_f3")
+        sought = self.store.seek_phrase("sess_f3", "herida no es")
+        self.assertTrue(sought.get("ok"))
+        self.assertTrue(sought.get("seeked"))
+        self.assertTrue(bool(sought.get("seek_wrapped", False)))
+        chunk = sought.get("chunk", {})
+        self.assertEqual(int(chunk.get("chunk_index", -1)), 1)
+        self.assertIn("herida", str(chunk.get("text", "")).lower())
+
+    def test_update_progress_advances_pending_offset(self) -> None:
+        self.store.start_session("sess_prog", chunks=["uno dos tres cuatro cinco"], reset=True)
+        first = self.store.next_chunk("sess_prog")
+        chunk = first.get("chunk", {})
+        cid = str(chunk.get("chunk_id", ""))
+        out = self.store.update_progress("sess_prog", chunk_id=cid, offset_chars=8, quality="ui_live")
+        self.assertTrue(out.get("ok"))
+        self.assertTrue(out.get("progress_updated"))
+        chunk_after = out.get("chunk", {})
+        self.assertGreaterEqual(int(chunk_after.get("offset_chars", -1)), 8)
+        bookmark = out.get("bookmark", {})
+        self.assertEqual(str(bookmark.get("quality", "")), "ui_live")
+
     def test_manual_mode_toggle_controls_autopilot(self) -> None:
         self.store.start_session("sess_g", chunks=["uno", "dos"], reset=True)
         man_on = self.store.set_manual_mode("sess_g", True, reason="unit_manual_on")
@@ -287,6 +325,28 @@ class TestReaderHttpEndpoints(unittest.TestCase):
         bookmark = barge.get("bookmark", {})
         self.assertIsInstance(bookmark, dict)
         self.assertGreaterEqual(int(bookmark.get("offset_chars", -1)), 0)
+
+    def test_http_reader_progress_updates_pending_offset(self) -> None:
+        code, started = self._request(
+            "POST",
+            "/api/reader/session/start",
+            {"session_id": "http_prog", "chunks": ["uno dos tres cuatro"], "reset": True},
+        )
+        self.assertEqual(code, 200)
+        self.assertTrue(started.get("ok"))
+        code, first = self._request("GET", "/api/reader/session/next?session_id=http_prog")
+        self.assertEqual(code, 200)
+        chunk = first.get("chunk", {})
+        cid = str(chunk.get("chunk_id", ""))
+        code, out = self._request(
+            "POST",
+            "/api/reader/progress",
+            {"session_id": "http_prog", "chunk_id": cid, "offset_chars": 7, "quality": "ui_live"},
+        )
+        self.assertEqual(code, 200)
+        self.assertTrue(bool(out.get("progress_updated", False)))
+        chunk_after = out.get("chunk", {})
+        self.assertGreaterEqual(int(chunk_after.get("offset_chars", -1)), 7)
 
     def test_next_with_speak_and_autocommit_advances_cursor_after_tts_end(self) -> None:
         code, started = self._request(
@@ -423,6 +483,42 @@ class TestReaderHttpEndpoints(unittest.TestCase):
         )
         self.assertEqual(code, 200)
         self.assertIn("bloque 2/2", str(out.get("reply", "")).lower())
+
+    def test_continuar_desde_la_frase_alias_is_parsed(self) -> None:
+        code, started = self._request(
+            "POST",
+            "/api/reader/session/start",
+            {"session_id": "alias_phrase_sess", "chunks": ["uno", "la herida no es escribe bien", "tres"], "reset": True},
+        )
+        self.assertEqual(code, 200)
+        self.assertTrue(started.get("ok"))
+        code, first = self._request("GET", "/api/reader/session/next?session_id=alias_phrase_sess")
+        self.assertEqual(code, 200)
+        chunk = first.get("chunk", {})
+        code, committed = self._request(
+            "POST",
+            "/api/reader/session/commit",
+            {
+                "session_id": "alias_phrase_sess",
+                "chunk_id": str(chunk.get("chunk_id", "")),
+                "chunk_index": int(chunk.get("chunk_index", 0)),
+            },
+        )
+        self.assertEqual(code, 200)
+        self.assertTrue(committed.get("ok"))
+        code, out = self._request(
+            "POST",
+            "/api/chat",
+            {
+                "session_id": "alias_phrase_sess",
+                "message": "continuar desde la frase la herida no es",
+                "allowed_tools": [],
+                "history": [],
+            },
+        )
+        self.assertEqual(code, 200)
+        self.assertNotIn("no encontr", str(out.get("reply", "")).lower())
+        self.assertIn("herida", str(out.get("reply", "")).lower())
 
     def test_voice_payload_exposes_diagnostics(self) -> None:
         code, out = self._request("GET", "/api/voice")
