@@ -267,6 +267,7 @@ HTML = r"""<!doctype html>
 	      let readerAutoMinDelayMs = 1500;
 	      let readerAutoTtsGate = null;
 	      let readerAutoLastGateWarnAt = 0;
+	      let readerLiveMinNextAtMs = 0;
 	      let sttPollTimer = null;
 	      let sttSending = false;
 	      let sttLastText = "";
@@ -277,7 +278,8 @@ HTML = r"""<!doctype html>
 	      let chatFeedBusy = false;
 	      let chatFeedEnabled = false;
 	      let lastChatSeq = 0;
-	      let readerLiveRenderId = 0;
+	      let readerLiveRenderState = null;
+	      let readerVoiceCpsEstimate = 24.0;
 
 	    function fmtMb(mb) {
 	      if (mb == null || Number.isNaN(mb)) return "?";
@@ -373,6 +375,30 @@ HTML = r"""<!doctype html>
 	      const n = Number(value);
 	      if (!Number.isFinite(n)) return fallback;
 	      return Math.max(min, Math.min(max, Math.trunc(n)));
+	    }
+
+	    function canonicalText(value) {
+	      return String(value || "")
+	        .toLowerCase()
+	        .normalize("NFD")
+	        .replace(/[\u0300-\u036f]/g, "")
+	        .replace(/[^a-z0-9\s]/g, " ")
+	        .replace(/\s+/g, " ")
+	        .trim();
+	    }
+
+	    function historyHasMessage(role, content) {
+	      const target = String(content || "");
+	      if (!target) return false;
+	      const targetNorm = canonicalText(target);
+	      for (const item of history) {
+	        if (!item || String(item.role || "") !== role) continue;
+	        const got = String(item.content || "");
+	        if (!got) continue;
+	        if (got === target) return true;
+	        if (targetNorm && canonicalText(got) === targetNorm) return true;
+	      }
+	      return false;
 	    }
 
 	    function sleep(ms) {
@@ -481,14 +507,6 @@ HTML = r"""<!doctype html>
 	      return "";
 	    }
 
-	    function pauseAckBySource(source) {
-	      const s = String(source || "").trim().toLowerCase();
-	      if (s === "voice_any" || s === "stt_any") return "Pausado por voz (any).";
-	      if (s === "typed" || s === "text") return "Pausado (texto).";
-	      if (s === "voice_cmd" || s === "stt_cmd") return "Pausado por voz (cmd).";
-	      return "Pausado por voz (cmd).";
-	    }
-
 	    async function runVoiceReaderCommand(kind, text, source = "voice_cmd") {
 	      const now = Date.now();
 	      if ((now - sttLastBargeAtMs) < STT_BARGE_COOLDOWN_MS) return;
@@ -501,10 +519,12 @@ HTML = r"""<!doctype html>
 	        await push("assistant", `Comando por voz: "${spoken}".`);
 	      }
 	      stopReaderAuto();
+	      stopReaderLiveRender();
 	      abortCurrentStream();
 	      if (kind === "pause") {
 	        await pauseReaderContinuousSilently();
-	        await push("assistant", pauseAckBySource(sourceNorm));
+	        const hardStop = /\b(detenete|detente|stop|detener|parar)\b/i.test(spoken);
+	        await push("assistant", hardStop ? "detenida" : "si como seguimos?");
 	        await saveServerHistory();
 	        return;
 	      }
@@ -626,11 +646,38 @@ HTML = r"""<!doctype html>
 	          const seq = Number(item?.seq || 0);
 	          if (Number.isFinite(seq) && seq > lastChatSeq) lastChatSeq = seq;
 	          const role = String(item?.role || "").trim().toLowerCase();
+	          const source = String(item?.source || "").trim().toLowerCase();
 	          const content = String(item?.content || "").trim();
 	          if (!content) continue;
 	          if (role !== "user" && role !== "assistant") continue;
-	          const last = history.length ? history[history.length - 1] : null;
-	          if (last && String(last.role || "") === role && String(last.content || "") === content) continue;
+	          if (role === "user" && source === "ui_auto_reader") {
+	            // Internal reader step; never render as a user bubble.
+	            continue;
+	          }
+	          if (role === "assistant" && sendEl.disabled) {
+	            // UI already renders assistant reply locally; ignore mirrored feed entries.
+	            continue;
+	          }
+	          if (role === "assistant" && readerLiveRenderState && !readerLiveRenderState.done) {
+	            const live = readerLiveRenderState;
+	            const expected = `${live.lead || ""}${live.body || ""}`;
+	            const body = String(live.body || "");
+	            const sameByBody = body.length > 40 && (content.includes(body.slice(0, Math.min(120, body.length))) || content.endsWith(body));
+	            const contentNorm = canonicalText(content);
+	            const bodyNorm = canonicalText(body);
+	            const expectedNorm = canonicalText(expected);
+	            const sameByNormPrefix = bodyNorm.length > 40 && (
+	              contentNorm.includes(bodyNorm.slice(0, Math.min(140, bodyNorm.length)))
+	              || bodyNorm.includes(contentNorm.slice(0, Math.min(140, contentNorm.length)))
+	            );
+	            const looksReaderChunk = /bloque\s+\d+\s*\/\s*\d+/i.test(content) || /lectura iniciada/i.test(content);
+	            if (content === expected || sameByBody || contentNorm === expectedNorm || sameByNormPrefix || looksReaderChunk) {
+	              // Keep the progressive render as source of truth; ignore mirrored
+	              // full-text events from chat feed to avoid "fixed block" takeover.
+	              continue;
+	            }
+	          }
+	          if (historyHasMessage(role, content)) continue;
 	          await push(role, content, false);
 	        }
 	        const seqNow = Number(j?.seq || 0);
@@ -736,7 +783,7 @@ HTML = r"""<!doctype html>
       if (sttPollTimer) return;
       sttPollTimer = setInterval(() => {
         pollSttOnce();
-      }, 700);
+      }, 360);
       pollSttOnce();
     }
 
@@ -860,6 +907,13 @@ HTML = r"""<!doctype html>
 	      }
 	    }
 
+	    function stopReaderLiveRender() {
+	      if (readerLiveRenderState && !readerLiveRenderState.done) {
+	        readerLiveRenderState.done = true;
+	      }
+	      readerLiveRenderState = null;
+	    }
+
     function startAssistantMessage() {
       history.push({ role: "assistant", content: "" });
       draw();
@@ -900,21 +954,41 @@ HTML = r"""<!doctype html>
     function _splitReaderReplyForLive(reply, chunkText) {
       const full = String(reply || "");
       const chunk = String(chunkText || "");
-      if (!chunk) return { lead: "", body: full };
-      const idx = full.lastIndexOf(chunk);
-      if (idx < 0) return { lead: "", body: chunk };
-      return { lead: full.slice(0, idx), body: full.slice(idx) };
+      if (!chunk) return { lead: "", body: full, matched: false };
+      const candidates = [];
+      const chunkNoBom = chunk.replace(/\uFEFF/g, "");
+      candidates.push(chunk);
+      if (chunkNoBom && chunkNoBom !== chunk) candidates.push(chunkNoBom);
+      const chunkSoft = chunkNoBom.replace(/\s+/g, " ").trim();
+      if (chunkSoft && !candidates.includes(chunkSoft)) candidates.push(chunkSoft);
+      for (const cand of candidates) {
+        if (!cand) continue;
+        const idx = full.lastIndexOf(cand);
+        if (idx >= 0) return { lead: full.slice(0, idx), body: full.slice(idx), matched: true };
+      }
+      const blockMatch = full.match(/^(.*?)(\bBloque\s+\d+\s*\/\s*\d+\s*\n\n[\s\S]*)$/i);
+      if (blockMatch) {
+        const lead = String(blockMatch[1] || "");
+        const body = String(blockMatch[2] || "");
+        const bodyNorm = canonicalText(body);
+        const chunkNorm = canonicalText(chunkNoBom || chunk);
+        if (!chunkNorm || (bodyNorm && bodyNorm.includes(chunkNorm.slice(0, Math.min(80, chunkNorm.length))))) {
+          return { lead, body, matched: true };
+        }
+      }
+      return { lead: "", body: full, matched: false };
     }
 
-    function launchReaderLiveRender(reply, readerMeta) {
+	    function launchReaderLiveRender(reply, readerMeta) {
       const meta = (readerMeta && typeof readerMeta === "object") ? readerMeta : null;
       if (!meta) return false;
-      if (!voiceEnabled || !meta?.tts_gate_required) return false;
       const chunkText = String(meta?.chunk_text || "").trim();
+      if (!chunkText) return false;
       const streamId = clampInt(meta?.tts_wait_stream_id, 0, 0, 10000000);
-      if (!chunkText || streamId <= 0) return false;
+      const voiceDriven = !!voiceEnabled && !!meta?.tts_gate_required && streamId > 0;
 
       const split = _splitReaderReplyForLive(String(reply || ""), chunkText);
+      if (!split.matched) return false;
       const lead = String(split.lead || "");
       const body = String(split.body || chunkText);
       const msg = { role: "assistant", content: lead };
@@ -922,46 +996,104 @@ HTML = r"""<!doctype html>
       history = history.slice(-200);
       draw();
 
-      const parts = body.split(/(\s+)/).filter((p) => p.length > 0);
-      const wordCount = Math.max(1, parts.filter((p) => /\S/.test(p)).length);
-      const charsPerSec = 16;
-      const estMs = Math.max(1400, Math.min(90000, Math.round((Math.max(1, body.length) / charsPerSec) * 1000)));
-      const wordDelay = clampInt(Math.round(estMs / wordCount), 130, 50, 360);
+      if (readerLiveRenderState && !readerLiveRenderState.done) {
+        readerLiveRenderState.done = true;
+      }
       const baseOffset = clampInt(meta?.offset_chars, 0, 0, 5000000);
-      const renderId = ++readerLiveRenderId;
+	      const startedAtMs = Date.now();
+	      const cpsVoice = Math.max(12.0, Math.min(42.0, Number(readerVoiceCpsEstimate || 24.0)));
+	      const cpsSilent = 90.0;
+      const estRenderMs = clampInt(
+        Math.round((Math.max(1, body.length) / (voiceDriven ? cpsVoice : cpsSilent)) * 1000),
+        1800,
+        800,
+        12000,
+      );
+      if (!voiceDriven) {
+        // When VOZ is OFF, keep autopilot from jumping to next block before visual render completes.
+        readerLiveMinNextAtMs = Math.max(readerLiveMinNextAtMs, startedAtMs + estRenderMs + 260);
+      }
+      const liveState = { msg, lead, body, done: false };
+      readerLiveRenderState = liveState;
 
-      let pos = 0;
-      let rendered = "";
-      let lastProgressAt = 0;
-      const step = () => {
-        if (renderId !== readerLiveRenderId) return;
+	      let renderedLen = 0;
+	      let lastProgressAt = 0;
+	      let lastVoicePollAt = 0;
+	      let voiceState = null;
+	      let voicePlayAnchorMs = 0;
+	      let maxObservedVoiceMs = 0;
+
+      const step = async () => {
+        if (liveState.done || readerLiveRenderState !== liveState) return;
         if (!history.includes(msg)) return;
-        if (pos >= parts.length) {
-          msg.content = lead + rendered;
+        const nowMs = Date.now();
+        if (voiceDriven && ((nowMs - lastVoicePollAt) >= 180 || !voiceState)) {
+          lastVoicePollAt = nowMs;
+          voiceState = await fetchVoiceState();
+        }
+
+        let targetLen = renderedLen;
+	        if (voiceDriven) {
+	          const playing = !!voiceState?.tts_playing;
+	          const playingStreamId = clampInt(voiceState?.tts_playing_stream_id, 0, 0, 10000000);
+	          const elapsedVoiceMs = clampInt(voiceState?.tts_playback_elapsed_ms, 0, 0, 3600000);
+	          const last = voiceState?.last_status || {};
+	          const lastStreamId = clampInt(last?.stream_id, 0, 0, 10000000);
+	          const isStreamPlaying = playing && playingStreamId === streamId && elapsedVoiceMs > 0;
+	          if (isStreamPlaying) {
+	            if (!voicePlayAnchorMs) {
+	              voicePlayAnchorMs = Math.max(1, nowMs - Math.max(0, elapsedVoiceMs));
+	            }
+	            const driftElapsedMs = Math.max(0, nowMs - voicePlayAnchorMs);
+	            const liveElapsedMs = Math.max(elapsedVoiceMs, driftElapsedMs);
+	            maxObservedVoiceMs = Math.max(maxObservedVoiceMs, liveElapsedMs);
+	            targetLen = Math.max(targetLen, Math.floor((liveElapsedMs / 1000) * cpsVoice));
+	          }
+	          if (lastStreamId === streamId && last?.ok === true && !playing) {
+	            targetLen = body.length;
+	          }
+	          if (!isStreamPlaying && !(lastStreamId === streamId && last?.ok === true)) {
+            // Stream not started yet: avoid advancing text ahead of audio.
+            targetLen = Math.min(targetLen, renderedLen);
+          }
+        } else {
+          const elapsedMs = Math.max(0, nowMs - startedAtMs);
+          targetLen = Math.max(targetLen, Math.floor((elapsedMs / 1000) * cpsSilent));
+        }
+
+        if (renderedLen === 0 && !voiceDriven) targetLen = Math.max(targetLen, 1);
+        targetLen = Math.max(0, Math.min(body.length, targetLen));
+        if (targetLen > renderedLen) {
+          renderedLen = targetLen;
+          msg.content = lead + body.slice(0, renderedLen);
           draw();
-          const finalOffset = baseOffset + rendered.length;
-          postReaderProgress(meta, finalOffset, "ui_live_final");
-          saveServerHistory();
+        }
+
+	        if (renderedLen >= body.length) {
+	          msg.content = lead + body;
+	          draw();
+	          if (voiceDriven && maxObservedVoiceMs >= 1200 && body.length >= 60) {
+	            const observedCps = body.length / (maxObservedVoiceMs / 1000);
+	            if (Number.isFinite(observedCps) && observedCps > 4) {
+	              const bounded = Math.max(12.0, Math.min(42.0, observedCps));
+	              readerVoiceCpsEstimate = (readerVoiceCpsEstimate * 0.65) + (bounded * 0.35);
+	            }
+	          }
+	          const finalOffset = baseOffset + body.length;
+	          postReaderProgress(meta, finalOffset, "ui_live_final");
+	          saveServerHistory();
+	          liveState.done = true;
           return;
         }
-        const part = parts[pos++];
-        rendered += part;
-        msg.content = lead + rendered;
-        draw();
 
-        const isWord = /\S/.test(part);
-        if (isWord) {
-          const now = Date.now();
-          if ((now - lastProgressAt) >= 140 || pos >= parts.length) {
-            lastProgressAt = now;
-            const liveOffset = baseOffset + rendered.length;
-            postReaderProgress(meta, liveOffset, "ui_live");
-          }
+        if ((nowMs - lastProgressAt) >= 140) {
+          lastProgressAt = nowMs;
+          const liveOffset = baseOffset + renderedLen;
+          postReaderProgress(meta, liveOffset, voiceDriven ? "ui_live_voice" : "ui_live_silent");
         }
-        const delay = isWord ? wordDelay : 0;
-        setTimeout(step, delay);
+        setTimeout(() => { step(); }, voiceDriven ? 70 : 55);
       };
-      setTimeout(step, 0);
+      setTimeout(() => { step(); }, 0);
       return true;
     }
 
@@ -1102,11 +1234,21 @@ HTML = r"""<!doctype html>
 	      const ttsStreamId = clampInt(meta?.tts_wait_stream_id, 0, 0, 10000000);
 	      const ttsTimeoutMs = clampInt(meta?.tts_wait_timeout_ms, 15000, 1500, 120000);
 	      readerAutoActive = auto;
-	      readerAutoNextAtMs = auto ? (Date.now() + Math.max(nextAfterMs, readerAutoMinDelayMs)) : 0;
+	      if (auto) {
+	        const baseNextAt = Date.now() + Math.max(nextAfterMs, readerAutoMinDelayMs);
+	        readerAutoNextAtMs = Math.max(baseNextAt, readerLiveMinNextAtMs);
+	      } else {
+	        readerAutoNextAtMs = 0;
+	        readerLiveMinNextAtMs = 0;
+	      }
 	      readerAutoTtsGate = (auto && requiresTtsGate && ttsStreamId > 0)
 	        ? { streamId: ttsStreamId, timeoutMs: ttsTimeoutMs }
 	        : null;
 	      if (auto) {
+	        if (readerAutoTimer) {
+	          clearTimeout(readerAutoTimer);
+	          readerAutoTimer = null;
+	        }
 	        scheduleReaderAuto();
 	      } else {
 	        stopReaderAuto();
@@ -1128,6 +1270,7 @@ HTML = r"""<!doctype html>
 	      const sel = selectedModel();
 	      const payload = {
 	        message: "pausa lectura",
+	        source: "ui_auto_reader",
 	        model: sel.model || "openai-codex/gpt-5.1-codex-mini",
 	        model_backend: sel.model_backend || "cloud",
 	        history,
@@ -1221,13 +1364,11 @@ HTML = r"""<!doctype html>
 		        if (!gate?.ok) {
 		          stopReaderAuto();
 		          await pauseReaderContinuousSilently();
-		          if (gate?.pausedByVoice) {
-		            const gateDetail = String(gate?.detail || "").toLowerCase();
-		            const source = /typed_interrupt/.test(gateDetail)
-		              ? "typed"
-		              : (/barge_in|voice_any/.test(gateDetail) ? "voice_any" : "voice_cmd");
-		            await push("assistant", pauseAckBySource(source));
-		          } else {
+			          if (gate?.pausedByVoice) {
+			            const gateDetail = String(gate?.detail || "").toLowerCase();
+			            const hardStop = /\b(typed_interrupt|barge_in|voice_any|stop|deten|parar)\b/i.test(gateDetail);
+			            await push("assistant", hardStop ? "detenida" : "si como seguimos?");
+			          } else {
 		            const detail = String(gate?.detail || "tts_unavailable");
 		            await push("assistant", `voz no disponible (${detail}), usá 'modo manual on' o 'continuar' manual`);
 		          }
@@ -1245,6 +1386,7 @@ HTML = r"""<!doctype html>
 	        const sel = selectedModel();
 	        const payload = {
 	          message: "seguí",
+	          source: "ui_auto_reader",
 	          model: sel.model || "openai-codex/gpt-5.1-codex-mini",
 	          model_backend: sel.model_backend || "cloud",
           history,
@@ -1369,10 +1511,13 @@ HTML = r"""<!doctype html>
         return;
       }
 
-      const readerControl = isReaderControlMessage(text);
-      if (!readerControl) {
-        stopReaderAuto();
-      }
+	      const readerControl = isReaderControlMessage(text);
+	      if (!readerControl) {
+	        stopReaderAuto();
+	      }
+	      if (readerControl) {
+	        stopReaderLiveRender();
+	      }
 
       if (pendingAttachments.length) {
         text += "\n\nAdjuntos:\n" + pendingAttachments.map(a => `- ${a.name} (${a.type})`).join("\n");

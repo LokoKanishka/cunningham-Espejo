@@ -178,6 +178,20 @@ def _tts_is_playing() -> bool:
     return (time.monotonic() - _TTS_LAST_ACTIVITY_MONO) < _TTS_ECHO_GUARD_SEC
 
 
+def _tts_playback_state() -> dict:
+    now_mono = time.monotonic()
+    with _TTS_STREAM_LOCK:
+        stream_id = int(_TTS_PLAYING_STREAM_ID or 0)
+        started_mono = float(_TTS_PLAYBACK_MONO_BY_STREAM.get(stream_id, 0.0) or 0.0) if stream_id > 0 else 0.0
+    elapsed_ms = 0
+    if stream_id > 0 and started_mono > 0.0:
+        elapsed_ms = int(max(0.0, (now_mono - started_mono) * 1000.0))
+    return {
+        "tts_playing_stream_id": int(stream_id),
+        "tts_playback_elapsed_ms": int(elapsed_ms),
+    }
+
+
 def _bargein_status() -> dict:
     cfg = _bargein_config()
     with _BARGEIN_LOCK:
@@ -880,17 +894,18 @@ def _stt_voice_text_normalize(text: str) -> str:
 
 def _stt_segmentation_profile(chat_enabled: bool) -> dict:
     if bool(chat_enabled):
-        min_ms = max(150, _int_env("DIRECT_CHAT_STT_CHAT_MIN_SEGMENT_MS", 180))
+        # Chat profile tuned for lower end-to-end latency while keeping basic stability.
+        min_ms = max(120, _int_env("DIRECT_CHAT_STT_CHAT_MIN_SEGMENT_MS", 140))
         return {
             "min_speech_ms": int(min_ms),
             "chat_min_speech_ms": int(min_ms),
-            "max_silence_ms": int(max(300, _int_env("DIRECT_CHAT_STT_CHAT_MAX_SILENCE_MS", 700))),
-            "max_segment_s": float(max(2.6, _float_env("DIRECT_CHAT_STT_CHAT_MAX_SEGMENT_SEC", 4.8))),
+            "max_silence_ms": int(max(220, _int_env("DIRECT_CHAT_STT_CHAT_MAX_SILENCE_MS", 420))),
+            "max_segment_s": float(max(1.8, _float_env("DIRECT_CHAT_STT_CHAT_MAX_SEGMENT_SEC", 3.2))),
         }
     return {
-        "min_speech_ms": int(max(120, _int_env("DIRECT_CHAT_STT_MIN_SPEECH_MS", 220))),
-        "chat_min_speech_ms": int(max(120, _int_env("DIRECT_CHAT_STT_CHAT_MIN_SPEECH_MS", 180))),
-        "max_silence_ms": int(max(180, _int_env("DIRECT_CHAT_STT_MAX_SILENCE_MS", 350))),
+        "min_speech_ms": int(max(100, _int_env("DIRECT_CHAT_STT_MIN_SPEECH_MS", 180))),
+        "chat_min_speech_ms": int(max(100, _int_env("DIRECT_CHAT_STT_CHAT_MIN_SPEECH_MS", 140))),
+        "max_silence_ms": int(max(140, _int_env("DIRECT_CHAT_STT_MAX_SILENCE_MS", 280))),
         "max_segment_s": float(max(1.2, _float_env("DIRECT_CHAT_STT_MAX_SEGMENT_SEC", 1.8))),
     }
 
@@ -902,45 +917,43 @@ def _voice_command_kind(text: str) -> str:
     compact = re.sub(r"\s+", " ", n).strip()
     if compact:
         compact = re.sub(r"(.)\1{2,}", r"\1\1", compact)
-    compact_tokens = re.findall(r"[a-z0-9]+", compact)
-    if n in (
-        "detenete",
-        "detente",
-        "pausa",
-        "pauza",
-        "posa",
-        "poza",
-        "pausa lectura",
-        "pausar lectura",
-        "detener lectura",
-        "parar lectura",
-        "basta",
-        "stop",
-        "stop lectura",
-    ):
+    if not compact:
+        return ""
+
+    prefix = r"(?:\b(?:bueno|ok|dale|che|hola|luci|por favor|porfa|eh|ey)\b[\s,]*){0,3}"
+
+    def _matches(pattern: str) -> bool:
+        return bool(re.search(rf"^{prefix}(?:{pattern})\b", compact, flags=re.IGNORECASE))
+
+    if _matches(r"(detenete|detente|pausa(?:\s+lectura)?|pauza|posa|poza|pausar\s+lectura|detener\s+lectura|parar\s+lectura|basta|stop(?:\s+lectura)?)"):
         return "pause"
-    if any(tok in ("pauza", "posa", "poza") for tok in compact_tokens):
-        return "pause"
-    if any(k in compact for k in ("paus", "pauz", "deten", "parar", "alto", "basta", "stop")):
-        return "pause"
-    if re.search(
-        r"^(detenete|detente|pausa|pauza|posa|poza|pausa lectura|pausar lectura|detener lectura|parar lectura|basta|stop)\b",
-        n,
-        flags=re.IGNORECASE,
-    ):
-        return "pause"
-    if n in ("continuar", "segui", "seguir", "seguir leyendo", "continue", "resume"):
+    if _matches(r"(continuar|segui|seguir(?:\s+leyendo)?|continue|resume|reanuda(?:r)?)"):
         return "continue"
-    if any(k in compact for k in ("continu", "segui", "seguir", "reanuda", "resume")):
-        return "continue"
-    if re.search(r"^(continuar|segui|seguir|seguir leyendo|continue|resume)\b", n, flags=re.IGNORECASE):
-        return "continue"
-    if n in ("repetir", "repeti", "repeat"):
+    if _matches(r"(repetir|repeti|repeat)"):
         return "repeat"
-    if any(k in compact for k in ("repet", "repeat")):
-        return "repeat"
-    if re.search(r"^(repetir|repeti|repeat)\b", n, flags=re.IGNORECASE):
-        return "repeat"
+
+    # Fallback for clipped short utterances.
+    tokens = [tok for tok in re.findall(r"[a-z0-9]+", compact) if tok]
+    if len(tokens) <= 3:
+        joined = " ".join(tokens)
+        if joined in (
+            "detenete",
+            "detente",
+            "pausa",
+            "pauza",
+            "posa",
+            "poza",
+            "stop",
+            "basta",
+            "pausa lectura",
+            "detener lectura",
+            "parar lectura",
+        ):
+            return "pause"
+        if joined in ("continuar", "segui", "seguir", "continue", "resume", "reanudar"):
+            return "continue"
+        if joined in ("repetir", "repeti", "repeat"):
+            return "repeat"
     return ""
 
 
@@ -1355,7 +1368,7 @@ class STTManager:
             sample_rate=max(8000, self._env_int("DIRECT_CHAT_STT_SAMPLE_RATE", 16000)),
             channels=max(1, self._env_int("DIRECT_CHAT_STT_CHANNELS", 1)),
             device=selected_device,
-            frame_ms=max(10, min(30, self._env_int("DIRECT_CHAT_STT_FRAME_MS", 30))),
+            frame_ms=max(10, min(30, self._env_int("DIRECT_CHAT_STT_FRAME_MS", 20))),
             vad_mode=max(0, min(3, self._env_int("DIRECT_CHAT_STT_VAD_MODE", 1))),
             min_speech_ms=int(seg_profile.get("min_speech_ms", 220)),
             chat_min_speech_ms=int(seg_profile.get("chat_min_speech_ms", 180)),
@@ -1368,7 +1381,7 @@ class STTManager:
                 0.10,
                 min(0.95, self._env_float("DIRECT_CHAT_STT_SEGMENT_HYSTERESIS_OFF_RATIO", 0.65)),
             ),
-            segment_hangover_ms=max(0, self._env_int("DIRECT_CHAT_STT_SEGMENT_HANGOVER_MS", 250)),
+            segment_hangover_ms=max(0, self._env_int("DIRECT_CHAT_STT_SEGMENT_HANGOVER_MS", 140)),
             chat_mode=chat_mode_enabled,
             preamp_gain=float(preamp_gain),
             agc_enabled=bool(agc_enabled),
@@ -1559,7 +1572,7 @@ class STTManager:
         debug_enabled = self._debug_enabled()
         reader_active = bool(_reader_voice_any_barge_target_active(sid))
         barge_any_enabled = self._barge_any_enabled()
-        if (not tts_playing) and chat_enabled and (not reader_active):
+        if (not tts_playing) and chat_enabled:
             with self._lock:
                 pending_after_tts = dict(self._pending_chat_after_tts) if isinstance(self._pending_chat_after_tts, dict) else None
                 self._pending_chat_after_tts = None
@@ -1672,7 +1685,7 @@ class STTManager:
                         self._last_item_ts = max(self._last_item_ts, ts)
                     continue
                 if tts_playing and (not cmd):
-                    if chat_enabled and barge_any_enabled and (not reader_active):
+                    if chat_enabled:
                         drop_reason = _stt_chat_drop_reason(text, min_words_chat=chat_min_words)
                         if not drop_reason:
                             with self._lock:
@@ -2049,9 +2062,9 @@ def _voice_chat_pending_ready(session_id: str, pending: dict) -> bool:
     if not isinstance(pending, dict):
         return False
     now_mono = time.monotonic()
-    settle_ms = max(120, _int_env("DIRECT_CHAT_STT_BRIDGE_COMMIT_SETTLE_MS", 1200))
-    min_silence_ms = max(220, _int_env("DIRECT_CHAT_STT_BRIDGE_MIN_SILENCE_MS", 700))
-    max_wait_ms = max(settle_ms, _int_env("DIRECT_CHAT_STT_BRIDGE_MAX_WAIT_MS", 5200))
+    settle_ms = max(80, _int_env("DIRECT_CHAT_STT_BRIDGE_COMMIT_SETTLE_MS", 420))
+    min_silence_ms = max(140, _int_env("DIRECT_CHAT_STT_BRIDGE_MIN_SILENCE_MS", 320))
+    max_wait_ms = max(settle_ms, _int_env("DIRECT_CHAT_STT_BRIDGE_MAX_WAIT_MS", 2600))
     updated_mono = float(pending.get("updated_mono", now_mono) or now_mono)
     elapsed_ms = int(max(0.0, (now_mono - updated_mono) * 1000.0))
     pending_text = str(pending.get("text", "")).strip()
@@ -6651,6 +6664,66 @@ def _reader_meta(
     return out
 
 
+def _reader_active_chunk_snapshot(session_id: str) -> dict:
+    st_full = _READER_STORE.get_session(session_id, include_chunks=True)
+    if not st_full.get("ok"):
+        return {"ok": False, "error": "reader_session_not_found"}
+    chunks = st_full.get("chunks")
+    if not isinstance(chunks, list):
+        chunks = []
+    pending = st_full.get("pending") if isinstance(st_full.get("pending"), dict) else None
+    cursor = max(0, int(st_full.get("cursor", 0) or 0))
+    idx = -1
+    text = ""
+    if isinstance(pending, dict):
+        idx = int(pending.get("chunk_index", -1) or -1)
+        if 0 <= idx < len(chunks):
+            raw = chunks[idx] if isinstance(chunks[idx], dict) else {}
+            text = str(raw.get("text", "")).strip()
+        if not text:
+            text = str(pending.get("text", "")).strip()
+    if not text and chunks:
+        idx = min(max(0, cursor - 1), len(chunks) - 1)
+        raw = chunks[idx] if isinstance(chunks[idx], dict) else {}
+        text = str(raw.get("text", "")).strip()
+    if not text:
+        return {"ok": False, "error": "reader_no_chunk_for_comment"}
+    total_chunks = int(st_full.get("total_chunks", len(chunks)) or len(chunks) or 0)
+    if idx < 0:
+        idx = max(0, min(len(chunks) - 1, cursor - 1)) if chunks else 0
+    meta = st_full.get("metadata", {}) if isinstance(st_full.get("metadata"), dict) else {}
+    title = str(meta.get("title", "")).strip()
+    return {
+        "ok": True,
+        "chunk_index": int(idx),
+        "total_chunks": max(1, int(total_chunks or 1)),
+        "text": text,
+        "title": title,
+    }
+
+
+def _reader_block_summary(text: str, max_chars: int = 520) -> str:
+    clean = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not clean:
+        return ""
+    parts = [seg.strip() for seg in re.split(r"(?<=[.!?])\s+", clean) if seg.strip()]
+    picked: list[str] = []
+    used = 0
+    for seg in parts:
+        if picked and len(seg) < 18:
+            continue
+        picked.append(seg)
+        used += len(seg) + 1
+        if len(picked) >= 2 or used >= max_chars:
+            break
+    if not picked:
+        picked = [clean]
+    out = " ".join(picked).strip()
+    if len(out) > max_chars:
+        out = out[:max_chars].rstrip(" ,;:") + "..."
+    return out
+
+
 def _reader_voice_unavailable_detail() -> str:
     health = _alltalk_health_cached(force=False)
     if not bool(health.get("ok", False)):
@@ -7060,6 +7133,46 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
             "reader": _reader_meta(session_id, st_after, auto_continue=False),
         }
 
+    if any(
+        k in normalized
+        for k in (
+            "de que habla este bloque",
+            "de que habla el bloque",
+            "de que trata este bloque",
+            "de que trata el bloque",
+            "que dice este bloque",
+            "que dice el bloque",
+            "resumime este bloque",
+            "resumi este bloque",
+            "comentame este bloque",
+            "explicame este bloque",
+            "que leiste en este bloque",
+            "que leiste",
+        )
+    ):
+        snap = _reader_active_chunk_snapshot(session_id)
+        if not snap.get("ok"):
+            return {
+                "reply": "No tengo un bloque de lectura activo para comentar. Decí: leer libro <n>.",
+                "no_auto_tts": True,
+            }
+        _READER_STORE.set_continuous(session_id, False, reason="reader_comment_query")
+        _READER_STORE.set_reader_state(session_id, "commenting", reason="reader_comment_query")
+        st_after = _READER_STORE.get_session(session_id, include_chunks=False)
+        summary = _reader_block_summary(str(snap.get("text", "")))
+        block_idx = max(1, int(snap.get("chunk_index", 0) or 0) + 1)
+        total = max(block_idx, int(snap.get("total_chunks", block_idx) or block_idx))
+        title = str(snap.get("title", "")).strip()
+        header = f"Bloque {block_idx}/{total}"
+        if title:
+            header = f"{title} - {header}"
+        reply = f"{header}: {summary}" if summary else f"{header}: [sin texto legible]"
+        return {
+            "reply": reply,
+            "no_auto_tts": True,
+            "reader": _reader_meta(session_id, st_after, auto_continue=False),
+        }
+
     read_idx = _extract_reader_book_index(normalized)
     if read_idx is not None:
         out = _READER_LIBRARY.list_books()
@@ -7078,6 +7191,31 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         book_meta = loaded.get("book", {})
         title = str(book_meta.get("title", item.get("title", "libro"))).strip() if isinstance(book_meta, dict) else "libro"
         explicit_manual = bool(re.search(r"\bmanual\b", normalized, flags=re.IGNORECASE))
+        st_before = _READER_STORE.get_session(session_id, include_chunks=False)
+        if st_before.get("ok"):
+            meta_before = st_before.get("metadata", {}) if isinstance(st_before.get("metadata"), dict) else {}
+            same_book = str(meta_before.get("book_id", "")).strip() == book_id
+            state_before = str(st_before.get("reader_state", "")).strip().lower()
+            if same_book and state_before in ("reading", "paused", "commenting"):
+                if explicit_manual != bool(st_before.get("manual_mode", False)):
+                    _READER_STORE.set_manual_mode(session_id, explicit_manual, reason="reader_start_same_book_mode_toggle")
+                    _READER_STORE.set_continuous(
+                        session_id,
+                        not explicit_manual,
+                        reason="reader_start_same_book_manual_explicit" if explicit_manual else "reader_start_same_book_autopilot",
+                    )
+                    st_before = _READER_STORE.get_session(session_id, include_chunks=False)
+                has_more = (not bool(st_before.get("done", False))) and int(st_before.get("cursor", 0) or 0) < int(
+                    st_before.get("total_chunks", 0) or 0
+                )
+                return {
+                    "reply": (
+                        f"Ya estoy leyendo '{title}'."
+                        + (" Modo manual activo." if bool(st_before.get("manual_mode", False)) else " Autopiloto activo.")
+                    ),
+                    "no_auto_tts": True,
+                    "reader": _reader_meta(session_id, st_before, auto_continue=bool(st_before.get("continuous_enabled", False)) and has_more),
+                }
         started = _READER_STORE.start_session(
             session_id,
             chunks=[],
@@ -7152,16 +7290,17 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
             "stop lectura",
         )
     ):
+        is_hard_stop = any(k in normalized for k in ("detenete", "detente", "stop lectura", "detener lectura"))
         st = _READER_STORE.get_session(session_id, include_chunks=False)
         had_reader_session = bool(st.get("ok"))
         interrupted = _apply_voice_pause_interrupt(session_id, source="typed", keyword="detenete")
         if (not had_reader_session) and (not interrupted):
             return {"reply": "No hay sesión de lectura activa en este chat.", "no_auto_tts": True}
         if not had_reader_session:
-            return {"reply": "Pausado (texto).", "no_auto_tts": True}
+            return {"reply": ("detenida" if is_hard_stop else "si como seguimos?"), "no_auto_tts": True}
         st_after = _READER_STORE.get_session(session_id, include_chunks=False)
         return {
-            "reply": "Pausado (texto). Para retomar, decí: continuar",
+            "reply": ("detenida" if is_hard_stop else "si como seguimos?"),
             "no_auto_tts": True,
             "reader": _reader_meta(session_id, st_after, auto_continue=False),
         }
@@ -8423,6 +8562,7 @@ class Handler(BaseHTTPRequestHandler):
             "tts_diagnostic": _voice_diagnostics(),
             "tts_playing": bool(_tts_is_playing()),
             "last_status": _VOICE_LAST_STATUS,
+            **_tts_playback_state(),
             "ui_last_session_id": str(ui_last_sid or ""),
             "ui_last_seen_age_sec": (None if ui_last_age < 0.0 else float(ui_last_age)),
             **_bargein_status(),
@@ -9158,7 +9298,11 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     voice_item_ts = 0.0
             is_voice_origin = bool(source_tag.startswith("voice_") or voice_item_ts > 0.0)
-            user_msg_source = "stt_voice" if is_voice_origin else "ui_text"
+            if source_tag:
+                user_msg_source = source_tag
+            else:
+                user_msg_source = "stt_voice" if is_voice_origin else "ui_text"
+            record_chat_events = (not source_tag.startswith("ui_auto_"))
             if is_voice_origin and message and (not _voice_chat_should_process(session_id, message, ts=voice_item_ts)):
                 if self.path == "/api/chat/stream":
                     self.send_response(200)
@@ -9208,14 +9352,15 @@ class Handler(BaseHTTPRequestHandler):
                     merged_local.append({"role": "user", "content": message})
                     merged_local.append({"role": "assistant", "content": reply})
                     _save_history(session_id, merged_local, model=model, backend=requested_backend)
-                    _chat_events_append(
-                        session_id,
-                        role="user",
-                        content=message,
-                        source=user_msg_source,
-                        ts=voice_item_ts if is_voice_origin else time.time(),
-                    )
-                    _chat_events_append(session_id, role="assistant", content=reply, source="local_action", ts=time.time())
+                    if record_chat_events:
+                        _chat_events_append(
+                            session_id,
+                            role="user",
+                            content=message,
+                            source=user_msg_source,
+                            ts=voice_item_ts if is_voice_origin else time.time(),
+                        )
+                        _chat_events_append(session_id, role="assistant", content=reply, source="local_action", ts=time.time())
                     if self.path == "/api/chat/stream":
                         self.send_response(200)
                         self.send_header("Content-Type", "text/event-stream")
@@ -9267,14 +9412,15 @@ class Handler(BaseHTTPRequestHandler):
                 merged_local.append({"role": "user", "content": message})
                 merged_local.append({"role": "assistant", "content": reply})
                 _save_history(session_id, merged_local, model=model, backend=resolved_backend)
-                _chat_events_append(
-                    session_id,
-                    role="user",
-                    content=message,
-                    source=user_msg_source,
-                    ts=voice_item_ts if is_voice_origin else time.time(),
-                )
-                _chat_events_append(session_id, role="assistant", content=reply, source="local_action", ts=time.time())
+                if record_chat_events:
+                    _chat_events_append(
+                        session_id,
+                        role="user",
+                        content=message,
+                        source=user_msg_source,
+                        ts=voice_item_ts if is_voice_origin else time.time(),
+                    )
+                    _chat_events_append(session_id, role="assistant", content=reply, source="local_action", ts=time.time())
                 if self.path == "/api/chat/stream":
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream")
@@ -9387,14 +9533,15 @@ class Handler(BaseHTTPRequestHandler):
                 merged.append({"role": "user", "content": message})
                 merged.append({"role": "assistant", "content": full})
                 _save_history(session_id, merged, model=model, backend=resolved_backend)
-                _chat_events_append(
-                    session_id,
-                    role="user",
-                    content=message,
-                    source=user_msg_source,
-                    ts=voice_item_ts if is_voice_origin else time.time(),
-                )
-                _chat_events_append(session_id, role="assistant", content=full, source="model", ts=time.time())
+                if record_chat_events:
+                    _chat_events_append(
+                        session_id,
+                        role="user",
+                        content=message,
+                        source=user_msg_source,
+                        ts=voice_item_ts if is_voice_origin else time.time(),
+                    )
+                    _chat_events_append(session_id, role="assistant", content=full, source="model", ts=time.time())
                 _maybe_speak_reply(full, allowed_tools)
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
@@ -9443,14 +9590,15 @@ class Handler(BaseHTTPRequestHandler):
             merged.append({"role": "user", "content": message})
             merged.append({"role": "assistant", "content": reply})
             _save_history(session_id, merged, model=model, backend=resolved_backend)
-            _chat_events_append(
-                session_id,
-                role="user",
-                content=message,
-                source=user_msg_source,
-                ts=voice_item_ts if is_voice_origin else time.time(),
-            )
-            _chat_events_append(session_id, role="assistant", content=reply, source="model", ts=time.time())
+            if record_chat_events:
+                _chat_events_append(
+                    session_id,
+                    role="user",
+                    content=message,
+                    source=user_msg_source,
+                    ts=voice_item_ts if is_voice_origin else time.time(),
+                )
+                _chat_events_append(session_id, role="assistant", content=reply, source="model", ts=time.time())
 
             self._json(
                 200,

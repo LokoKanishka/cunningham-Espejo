@@ -107,6 +107,7 @@ Variables útiles (opcionales):
 - `DOCS/PLAN.md` — roadmap operativo vigente (DC + Espejo-de-Lucy).
 - `DOCS/VOICE_RUNBOOK.md` — runbook mínimo de operación/diagnóstico de voz.
 - `DOCS/READER_MODE.md` — contrato Reader Mode v0 y verificador reproducible.
+- `DOCS/DC_READER_GUARDRAILS_Y_BITACORA.md` — indice tecnico + reglas de no romper + bitacora viva de reader/voz/UI.
 - `docs/SECURITY_CHECKLIST.md` — checklist de seguridad.
 - `docs/INTEGRATIONS.md` — integraciones/pinning.
 - `DOCS/UX_SPANISH_VOICE.md` — guía de UX de voz.
