@@ -4,7 +4,7 @@
 
 - Purpose: freeze current audio/STT/UI state before implementing split Chat vs Reader screens.
 - Branch: `main`
-- Commit: `PENDING_COMMIT`
+- Commit: `4d3b9c4544f2a874a9fcfcb1f06108b34951c798`
 - Tag: `restore/pre-reader-split-20260227`
 - UTC: `2026-02-27T23:07:55Z`
 
