@@ -116,9 +116,15 @@ Variables útiles (opcionales):
 ## Scripts importantes
 - `scripts/test_smoke.sh` — validación mínima obligatoria.
 - `scripts/verify_reader_mode.sh` — botón rojo de Reader Mode v0 (cursor + persistencia + reinicio + barge-in).
+- `scripts/verify_stt_memory.sh` — guardarraíl de memoria STT (baseline de defaults + tests STT focalizados).
 - `scripts/model_router.sh` — selección y fallback de modelo.
 - `scripts/verify_all.sh` — verificación general legacy.
 - `scripts/host_audit_full.sh` — snapshot de host.
+
+## Memoria de ajustes STT
+- Workflow: `DOCS/STT_MEMORY_WORKFLOW.md`
+- Baseline vigente de defaults: `DOCS/STT_BASELINE_CURRENT.json`
+- Regenerar baseline (solo si el cambio es intencional): `python3 scripts/stt_memory_snapshot.py snapshot --write`
 
 ## Seguridad
 Por defecto, `exec`/`bash` deben mantenerse denegados en la política local de OpenClaw para evitar ejecución arbitraria.

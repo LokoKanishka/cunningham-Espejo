@@ -77,7 +77,9 @@ Este archivo es el punto unico a consultar **antes** de tocar:
 - `scripts/openclaw_direct_chat.py`
 3. Correr baseline rapido:
 - `pytest -q tests/test_reader_mode.py tests/test_reader_command_stress.py`
-4. Si tocaste reader/voz/UI:
+4. Si tocaste `stt_local.py` o valores de voz:
+- `./scripts/verify_stt_memory.sh`
+5. Si tocaste reader/voz/UI:
 - `node scripts/tmp_reader_human_sample.js`
 
 ## 5) Boton Rojo (post-cambio)
@@ -97,6 +99,11 @@ node scripts/tmp_reader_human_sample.js
 node scripts/tmp_reader_flow_3runs.js
 ```
 
+4. Si hubo cambios de parametros STT:
+```bash
+./scripts/verify_stt_memory.sh
+```
+
 ## 6) Bitacora de Estado (resumen vivo)
 
 ### 2026-02-27
@@ -108,6 +115,24 @@ node scripts/tmp_reader_flow_3runs.js
 - Fix: `source: ui_auto_reader` para pasos internos de autopilot.
 - Fix: comando local `de que habla este bloque?` con resumen del bloque activo.
 - Mejora: sincronizacion texto/voz en UI con CPS adaptativo y anclaje temporal.
+
+### 2026-02-27 (modo de voz estable/experimental)
+- Problema observado:
+  - alta fragilidad en flujo fluido de voz+tipeo (ajuste de STT/VAD/TTS rompe comportamientos ya estabilizados).
+- Causa raiz:
+  - acoplamiento fuerte entre barge-in, bridge STT->chat, render/tipeo UI y estado de sesion en tiempo real.
+- Cambio planificado:
+  - agregar selector explicito de perfil de voz en DC (`estable` vs `experimental`) con boton UI.
+  - `estable` prioriza robustez diaria (menos interrupciones agresivas y menos automatismos de chat por voz).
+  - `experimental` conserva flujo fluido actual para pruebas.
+- Criterio de exito:
+  - poder alternar perfil en un click y ver estado activo en UI sin reiniciar servicios.
+  - aislar pruebas de mejoras de voz sin romper el flujo diario.
+- Verificacion automatica:
+  - `pytest -q tests/test_reader_mode.py` -> OK (incluye test de `voice_mode_profile`).
+  - `python3 -m py_compile scripts/openclaw_direct_chat.py` -> OK.
+- Riesgo residual esperado:
+  - si usuario cambia manualmente umbrales sueltos, puede desalinear el perfil hasta volver a seleccionar modo.
 
 ### Riesgo conocido
 - Latencia de pausa puede variar por backend/player de audio (no siempre sub-segundo).
@@ -126,4 +151,3 @@ Copiar/pegar:
 - Verificacion humana:
 - Riesgo residual:
 ```
-

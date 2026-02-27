@@ -214,6 +214,7 @@ HTML = r"""<!doctype html>
           <span class="voice-dot"></span>
           <span id="sttChatToggleText">STT→CHAT ON</span>
         </button>
+        <button class="alt" id="voiceModeToggle" type="button">MODO EXPERIMENTAL</button>
       <span class="small">Slash: /new /escritorio /lib /rescan /read N /next /repeat /status /help reader</span>
     </div>
 
@@ -245,6 +246,7 @@ HTML = r"""<!doctype html>
 	    const voiceToggleTextEl = document.getElementById("voiceToggleText");
 	    const sttChatToggleEl = document.getElementById("sttChatToggle");
 	    const sttChatToggleTextEl = document.getElementById("sttChatToggleText");
+	    const voiceModeToggleEl = document.getElementById("voiceModeToggle");
 	    const attachEl = document.getElementById("attach");
 	    const attachInfoEl = document.getElementById("attachInfo");
 	    const meterEl = document.getElementById("meter");
@@ -258,6 +260,7 @@ HTML = r"""<!doctype html>
 	    let pendingAttachments = [];
       let voiceEnabled = true;
       let sttChatEnabled = true;
+      let voiceModeProfile = "experimental";
       let speakingTimer = null;
 	      let activeStreamController = null;
 	      let readerAutoTimer = null;
@@ -819,6 +822,27 @@ HTML = r"""<!doctype html>
       sttChatToggleTextEl.textContent = sttChatEnabled ? "STT→CHAT ON" : "STT→CHAT OFF";
 	    }
 
+    function setVoiceModeVisual(profile) {
+      voiceModeProfile = (String(profile || "").toLowerCase() === "stable") ? "stable" : "experimental";
+      voiceModeToggleEl.textContent = voiceModeProfile === "stable" ? "MODO ESTABLE" : "MODO EXPERIMENTAL";
+      voiceModeToggleEl.dataset.mode = voiceModeProfile;
+    }
+
+    async function setVoiceModeProfileServer(profile) {
+      const target = (String(profile || "").toLowerCase() === "stable") ? "stable" : "experimental";
+      setVoiceModeVisual(target);
+      try {
+        const r = await fetch("/api/voice", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ voice_mode_profile: target, session_id: sessionId }),
+        });
+        const j = await r.json();
+        setVoiceModeVisual(j?.voice_mode_profile || target);
+        setSttChatVisual(!!j?.stt_chat_enabled);
+      } catch {}
+    }
+
     function markSpeaking(active) {
       if (active) {
         voiceToggleEl.classList.add("speaking");
@@ -833,6 +857,7 @@ HTML = r"""<!doctype html>
 	        const j = await r.json();
 	        setVoiceVisual(!!j.enabled);
 	        setSttChatVisual(!!j.stt_chat_enabled);
+          setVoiceModeVisual(j?.voice_mode_profile || ((!!j?.stt_chat_enabled || !!j?.stt_barge_any) ? "experimental" : "stable"));
 	        setChatFeedEnabled(!!j.enabled && !!j.stt_server_chat_bridge_enabled);
 	        const owner = String(j.stt_owner_session_id || "").trim();
 	        if (j.enabled && sessionId !== "default" && owner !== sessionId) {
@@ -843,6 +868,7 @@ HTML = r"""<!doctype html>
       const ls = localStorage.getItem("molbot_voice_enabled");
       setVoiceVisual(ls !== "0");
       setSttChatVisual(true);
+      setVoiceModeVisual("experimental");
     }
 
     async function setVoiceStateServer(enabled) {
@@ -1680,6 +1706,12 @@ HTML = r"""<!doctype html>
 
     sttChatToggleEl.addEventListener("click", async () => {
       await setSttChatStateServer(!sttChatEnabled);
+      await syncVoiceState();
+    });
+
+    voiceModeToggleEl.addEventListener("click", async () => {
+      const next = voiceModeProfile === "stable" ? "experimental" : "stable";
+      await setVoiceModeProfileServer(next);
       await syncVoiceState();
     });
 

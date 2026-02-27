@@ -520,6 +520,56 @@ class TestReaderHttpEndpoints(unittest.TestCase):
         self.assertNotIn("no encontr", str(out.get("reply", "")).lower())
         self.assertIn("herida", str(out.get("reply", "")).lower())
 
+    def test_leer_libro_same_book_paused_resumes_next_block(self) -> None:
+        session_id = "same_book_resume_sess"
+        direct_chat._READER_STORE.start_session(
+            session_id,
+            chunks=["uno", "dos", "tres"],
+            reset=True,
+            metadata={"book_id": "book_same_1", "title": "Libro Prueba"},
+        )
+        first = direct_chat._READER_STORE.next_chunk(session_id)
+        first_chunk = first.get("chunk", {})
+        direct_chat._READER_STORE.commit(
+            session_id,
+            chunk_id=str(first_chunk.get("chunk_id", "")),
+            chunk_index=int(first_chunk.get("chunk_index", 0)),
+            reason="unit_setup_commit",
+        )
+        direct_chat._READER_STORE.set_continuous(session_id, False, reason="unit_setup_pause")
+        direct_chat._READER_STORE.set_reader_state(session_id, "paused", reason="unit_setup_pause")
+
+        prev_list = direct_chat._READER_LIBRARY.list_books
+        prev_get = direct_chat._READER_LIBRARY.get_book_text
+        direct_chat._READER_LIBRARY.list_books = lambda: {  # type: ignore[assignment]
+            "ok": True,
+            "books": [{"book_id": "book_same_1", "title": "Libro Prueba", "format": "txt"}],
+        }
+        direct_chat._READER_LIBRARY.get_book_text = lambda _book_id: {  # type: ignore[assignment]
+            "ok": True,
+            "text": "uno\ndos\ntres",
+            "book": {"book_id": "book_same_1", "title": "Libro Prueba", "format": "txt"},
+        }
+        try:
+            code, out = self._request(
+                "POST",
+                "/api/chat",
+                {
+                    "session_id": session_id,
+                    "message": "leer libro 1",
+                    "allowed_tools": [],
+                    "history": [],
+                },
+            )
+        finally:
+            direct_chat._READER_LIBRARY.list_books = prev_list  # type: ignore[assignment]
+            direct_chat._READER_LIBRARY.get_book_text = prev_get  # type: ignore[assignment]
+
+        self.assertEqual(code, 200)
+        reply = str(out.get("reply", "")).lower()
+        self.assertIn("bloque 2/3", reply)
+        self.assertNotIn("ya estoy leyendo", reply)
+
     def test_voice_payload_exposes_diagnostics(self) -> None:
         code, out = self._request("GET", "/api/voice")
         self.assertEqual(code, 200)
@@ -529,6 +579,35 @@ class TestReaderHttpEndpoints(unittest.TestCase):
         self.assertIn("tts_available", out)
         self.assertIn("stt_no_speech_detected", out)
         self.assertIn("stt_vad_true_ratio", out)
+
+    def test_voice_mode_profile_stable_applies_conservative_flags(self) -> None:
+        code, out = self._request(
+            "POST",
+            "/api/voice",
+            {
+                "session_id": "voice_mode_sess",
+                "voice_mode_profile": "stable",
+            },
+        )
+        self.assertEqual(code, 200)
+        self.assertTrue(bool(out.get("ok", False)))
+        self.assertEqual(str(out.get("voice_mode_profile", "")), "stable")
+        self.assertFalse(bool(out.get("stt_chat_enabled", True)))
+        self.assertFalse(bool(out.get("stt_barge_any", True)))
+
+        code2, out2 = self._request(
+            "POST",
+            "/api/voice",
+            {
+                "session_id": "voice_mode_sess",
+                "voice_mode_profile": "experimental",
+            },
+        )
+        self.assertEqual(code2, 200)
+        self.assertTrue(bool(out2.get("ok", False)))
+        self.assertEqual(str(out2.get("voice_mode_profile", "")), "experimental")
+        self.assertTrue(bool(out2.get("stt_chat_enabled", False)))
+        self.assertTrue(bool(out2.get("stt_barge_any", False)))
 
     def test_stt_level_endpoint_exposes_runtime_fields(self) -> None:
         code, out = self._request("GET", "/api/stt/level?session_id=default")

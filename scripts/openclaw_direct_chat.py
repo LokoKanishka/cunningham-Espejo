@@ -631,7 +631,7 @@ def _stt_barge_rms_threshold_from_state(state: dict | None = None) -> float:
 
 def _default_voice_state() -> dict:
     legacy_threshold = _stt_legacy_rms_threshold_from_state({})
-    return {
+    state = {
         "enabled": _env_flag("DIRECT_CHAT_TTS_ENABLED_DEFAULT", True),
         "speaker": str(os.environ.get("DIRECT_CHAT_TTS_SPEAKER", "Ana Florence")).strip() or "Ana Florence",
         "speaker_wav": str(os.environ.get("DIRECT_CHAT_TTS_SPEAKER_WAV", "")).strip(),
@@ -660,6 +660,46 @@ def _default_voice_state() -> dict:
         "stt_agc_enabled": _env_flag("DIRECT_CHAT_STT_AGC_ENABLED", True),
         "stt_agc_target_rms": max(0.01, min(0.30, float(os.environ.get("DIRECT_CHAT_STT_AGC_TARGET_RMS", "0.08") or 0.08))),
     }
+    profile = _normalize_voice_mode_profile(os.environ.get("DIRECT_CHAT_VOICE_MODE_PROFILE", "experimental"))
+    _apply_voice_mode_profile(state, profile)
+    state["voice_mode_profile"] = profile
+    return state
+
+
+def _normalize_voice_mode_profile(raw: object) -> str:
+    txt = str(raw or "").strip().lower()
+    return "stable" if txt == "stable" else "experimental"
+
+
+def _apply_voice_mode_profile(state: dict, profile: str) -> None:
+    if not isinstance(state, dict):
+        return
+    prof = _normalize_voice_mode_profile(profile)
+    if prof == "stable":
+        # Stable profile minimizes realtime coupling between STT, barge-in and chat bridge.
+        state["stt_chat_enabled"] = False
+        state["stt_barge_any"] = False
+        state["stt_barge_any_cooldown_ms"] = max(1200, int(state.get("stt_barge_any_cooldown_ms", 1800) or 1800))
+        state["stt_command_only"] = True
+        state["stt_min_chars"] = max(2, int(state.get("stt_min_chars", 2) or 2))
+    else:
+        state["stt_chat_enabled"] = True
+        state["stt_barge_any"] = True
+        state["stt_barge_any_cooldown_ms"] = max(300, int(state.get("stt_barge_any_cooldown_ms", 1200) or 1200))
+        state["stt_command_only"] = True
+        state["stt_min_chars"] = max(1, int(state.get("stt_min_chars", 2) or 2))
+    state["voice_mode_profile"] = prof
+
+
+def _voice_mode_profile_from_state(state: dict) -> str:
+    if not isinstance(state, dict):
+        return "experimental"
+    explicit = _normalize_voice_mode_profile(state.get("voice_mode_profile", ""))
+    if str(state.get("voice_mode_profile", "")).strip():
+        return explicit
+    if (not bool(state.get("stt_chat_enabled", True))) and (not bool(state.get("stt_barge_any", True))):
+        return "stable"
+    return "experimental"
 
 
 def _autotune_voice_capture_state(state: dict) -> dict:
@@ -773,6 +813,8 @@ def _load_voice_state() -> dict:
                     )
                 except Exception:
                     state["stt_agc_target_rms"] = max(0.01, min(0.30, float(state.get("stt_agc_target_rms", 0.06))))
+                if "voice_mode_profile" in raw:
+                    _apply_voice_mode_profile(state, str(raw.get("voice_mode_profile", "")))
     except Exception:
         pass
     state = _autotune_voice_capture_state(state)
@@ -780,6 +822,7 @@ def _load_voice_state() -> dict:
     state["stt_rms_threshold"] = _stt_legacy_rms_threshold_from_state(state)
     state["stt_segment_rms_threshold"] = _stt_segment_rms_threshold_from_state(state)
     state["stt_barge_rms_threshold"] = _stt_barge_rms_threshold_from_state(state)
+    state["voice_mode_profile"] = _voice_mode_profile_from_state(state)
     return state
 
 
@@ -7205,6 +7248,50 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
                         reason="reader_start_same_book_manual_explicit" if explicit_manual else "reader_start_same_book_autopilot",
                     )
                     st_before = _READER_STORE.get_session(session_id, include_chunks=False)
+                if state_before in ("paused", "commenting"):
+                    manual_mode = bool(st_before.get("manual_mode", False))
+                    _READER_STORE.set_continuous(
+                        session_id,
+                        not manual_mode,
+                        reason="reader_start_same_book_resume_autopilot" if (not manual_mode) else "reader_start_same_book_resume_manual",
+                    )
+                    _READER_STORE.set_reader_state(session_id, "reading", reason="reader_start_same_book_resume")
+                    out_resume = _READER_STORE.next_chunk(session_id)
+                    chunk_resume = out_resume.get("chunk") if isinstance(out_resume, dict) else None
+                    if out_resume.get("ok") and isinstance(chunk_resume, dict):
+                        tts_gate_required, tts_stream_id, _committed, tts_unavailable_detail = _reader_emit_chunk(
+                            session_id=session_id,
+                            chunk=chunk_resume,
+                            allowed_tools=allowed_tools,
+                            commit_reason="reader_start_same_book_resume_autocommit",
+                        )
+                        st_resume = _READER_STORE.get_session(session_id, include_chunks=False)
+                        has_more_resume = (not bool(st_resume.get("done", False))) and int(st_resume.get("cursor", 0) or 0) < int(
+                            st_resume.get("total_chunks", 0) or 0
+                        )
+                        reply_resume = _reader_chunk_reply(
+                            chunk_resume,
+                            total_chunks=int(st_resume.get("total_chunks", 0) or 0),
+                            title=title,
+                            prefix="Retomo lectura del libro activo.",
+                        )
+                        if tts_unavailable_detail:
+                            reply_resume = (
+                                f"Retomo lectura, pero voz no disponible ({tts_unavailable_detail}). "
+                                "Queda en manual estable.\n\n" + reply_resume
+                            )
+                        return {
+                            "reply": reply_resume,
+                            "no_auto_tts": True,
+                            "reader": _reader_meta(
+                                session_id,
+                                st_resume,
+                                chunk=chunk_resume,
+                                auto_continue=bool(st_resume.get("continuous_enabled", False)) and has_more_resume,
+                                tts_stream_id=tts_stream_id,
+                                tts_gate_required=tts_gate_required,
+                            ),
+                        }
                 has_more = (not bool(st_before.get("done", False))) and int(st_before.get("cursor", 0) or 0) < int(
                     st_before.get("total_chunks", 0) or 0
                 )
@@ -8532,6 +8619,7 @@ class Handler(BaseHTTPRequestHandler):
             stt_agc_target_rms = 0.06
         return {
             "enabled": enabled,
+            "voice_mode_profile": _voice_mode_profile_from_state(state),
             "speaker": str(state.get("speaker", "")),
             "speaker_wav": str(state.get("speaker_wav", "")),
             "stt_device": str(state.get("stt_device", "")),
@@ -9135,10 +9223,16 @@ class Handler(BaseHTTPRequestHandler):
                 payload = self._parse_payload()
                 state = _load_voice_state()
                 session_id = _safe_session_id(str(payload.get("session_id", "default")))
+                requested_profile = None
+                if "voice_mode_profile" in payload:
+                    requested_profile = str(payload.get("voice_mode_profile", ""))
+                    _apply_voice_mode_profile(state, requested_profile)
                 if "enabled" in payload:
                     requested_enabled = bool(payload.get("enabled"))
                     _set_voice_enabled(requested_enabled, session_id=session_id if requested_enabled else "")
                     state = _load_voice_state()
+                    if requested_profile is not None:
+                        _apply_voice_mode_profile(state, requested_profile)
                 elif bool(state.get("enabled", False) or state.get("stt_chat_enabled", False)) and session_id != "default":
                     _STT_MANAGER.enable(session_id=session_id)
 
@@ -9219,9 +9313,13 @@ class Handler(BaseHTTPRequestHandler):
                         )
                     except Exception:
                         pass
+                # Ensure requested profile wins over any partial runtime knobs.
+                if requested_profile is not None:
+                    _apply_voice_mode_profile(state, requested_profile)
                 state["stt_rms_threshold"] = _stt_legacy_rms_threshold_from_state(state)
                 state["stt_segment_rms_threshold"] = _stt_segment_rms_threshold_from_state(state)
                 state["stt_barge_rms_threshold"] = _stt_barge_rms_threshold_from_state(state)
+                state["voice_mode_profile"] = _voice_mode_profile_from_state(state)
                 _save_voice_state(state)
                 os.environ["DIRECT_CHAT_STT_DEVICE"] = str(state.get("stt_device", "")).strip()
                 should_run = bool(state.get("enabled", False) or state.get("stt_chat_enabled", False))
@@ -9243,6 +9341,7 @@ class Handler(BaseHTTPRequestHandler):
                     or "stt_preamp_gain" in payload
                     or "stt_agc_enabled" in payload
                     or "stt_agc_target_rms" in payload
+                    or "voice_mode_profile" in payload
                 ):
                     _STT_MANAGER.restart()
                 self._json(
