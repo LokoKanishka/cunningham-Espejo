@@ -215,6 +215,8 @@ HTML = r"""<!doctype html>
           <span id="sttChatToggleText">STT→CHAT ON</span>
         </button>
         <button class="alt" id="voiceModeToggle" type="button">MODO EXPERIMENTAL</button>
+        <button class="alt" id="openReaderMode" type="button">Modo lectura</button>
+        <span class="small" id="readerModeInfo"></span>
       <span class="small">Slash: /new /escritorio /lib /rescan /read N /next /repeat /status /help reader</span>
     </div>
 
@@ -247,6 +249,8 @@ HTML = r"""<!doctype html>
 	    const sttChatToggleEl = document.getElementById("sttChatToggle");
 	    const sttChatToggleTextEl = document.getElementById("sttChatToggleText");
 	    const voiceModeToggleEl = document.getElementById("voiceModeToggle");
+      const openReaderModeEl = document.getElementById("openReaderMode");
+      const readerModeInfoEl = document.getElementById("readerModeInfo");
 	    const attachEl = document.getElementById("attach");
 	    const attachInfoEl = document.getElementById("attachInfo");
 	    const meterEl = document.getElementById("meter");
@@ -261,6 +265,7 @@ HTML = r"""<!doctype html>
       let voiceEnabled = true;
       let sttChatEnabled = true;
       let voiceModeProfile = "experimental";
+      let chatVoiceLockedByReader = false;
       let speakingTimer = null;
 	      let activeStreamController = null;
 	      let readerAutoTimer = null;
@@ -791,7 +796,7 @@ HTML = r"""<!doctype html>
     }
 
     async function claimVoiceOwner() {
-      if (!voiceEnabled) return;
+      if (!voiceEnabled || chatVoiceLockedByReader) return;
       try {
         await fetch("/api/voice", {
           method: "POST",
@@ -828,6 +833,21 @@ HTML = r"""<!doctype html>
       voiceModeToggleEl.dataset.mode = voiceModeProfile;
     }
 
+    function setChatVoiceLockByReader(lockEnabled) {
+      chatVoiceLockedByReader = !!lockEnabled;
+      voiceToggleEl.disabled = chatVoiceLockedByReader;
+      sttChatToggleEl.disabled = chatVoiceLockedByReader;
+      voiceModeToggleEl.disabled = chatVoiceLockedByReader;
+      if (chatVoiceLockedByReader) {
+        readerModeInfoEl.textContent = "Lectura activa en /reader: chat en escritura-only.";
+        setVoiceVisual(false);
+        setSttChatVisual(false);
+        setChatFeedEnabled(false);
+      } else {
+        readerModeInfoEl.textContent = "";
+      }
+    }
+
     async function setVoiceModeProfileServer(profile) {
       const target = (String(profile || "").toLowerCase() === "stable") ? "stable" : "experimental";
       setVoiceModeVisual(target);
@@ -855,12 +875,19 @@ HTML = r"""<!doctype html>
 	      try {
 	        const r = await fetch("/api/voice");
 	        const j = await r.json();
+          const owner = String(j.voice_owner || "chat").toLowerCase();
+          const readerActive = !!j.reader_mode_active;
+          const lockByReader = readerActive && owner === "reader";
+          setChatVoiceLockByReader(lockByReader);
+          if (lockByReader) {
+            return;
+          }
 	        setVoiceVisual(!!j.enabled);
 	        setSttChatVisual(!!j.stt_chat_enabled);
           setVoiceModeVisual(j?.voice_mode_profile || ((!!j?.stt_chat_enabled || !!j?.stt_barge_any) ? "experimental" : "stable"));
 	        setChatFeedEnabled(!!j.enabled && !!j.stt_server_chat_bridge_enabled);
-	        const owner = String(j.stt_owner_session_id || "").trim();
-	        if (j.enabled && sessionId !== "default" && owner !== sessionId) {
+	        const sttOwner = String(j.stt_owner_session_id || "").trim();
+	        if (j.enabled && sessionId !== "default" && sttOwner !== sessionId) {
 	          await claimVoiceOwner();
 	        }
         return;
@@ -869,9 +896,11 @@ HTML = r"""<!doctype html>
       setVoiceVisual(ls !== "0");
       setSttChatVisual(true);
       setVoiceModeVisual("experimental");
+      setChatVoiceLockByReader(false);
     }
 
     async function setVoiceStateServer(enabled) {
+      if (chatVoiceLockedByReader) return;
       setVoiceVisual(enabled);
       try {
         await fetch("/api/voice", {
@@ -883,6 +912,7 @@ HTML = r"""<!doctype html>
     }
 
     async function setSttChatStateServer(enabled) {
+      if (chatVoiceLockedByReader) return;
       setSttChatVisual(enabled);
       try {
         await fetch("/api/voice", {
@@ -1710,8 +1740,27 @@ HTML = r"""<!doctype html>
     });
 
     voiceModeToggleEl.addEventListener("click", async () => {
+      if (chatVoiceLockedByReader) return;
       const next = voiceModeProfile === "stable" ? "experimental" : "stable";
       await setVoiceModeProfileServer(next);
+      await syncVoiceState();
+    });
+
+    openReaderModeEl.addEventListener("click", async () => {
+      try {
+        await fetch("/api/voice", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            session_id: sessionId,
+            voice_owner: "reader",
+            reader_mode_active: true,
+            enabled: true,
+            voice_mode_profile: "stable",
+          }),
+        });
+      } catch {}
+      window.open("/reader", "_blank", "noopener,noreferrer");
       await syncVoiceState();
     });
 

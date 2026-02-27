@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 import requests
 
 from molbot_direct_chat import desktop_ops, web_ask, web_search
+from molbot_direct_chat.reader_ui_html import READER_HTML
 from molbot_direct_chat.ui_html import HTML as UI_HTML
 from molbot_direct_chat.util import extract_url as _extract_url
 from molbot_direct_chat.util import normalize_text as _normalize_text
@@ -633,6 +634,8 @@ def _default_voice_state() -> dict:
     legacy_threshold = _stt_legacy_rms_threshold_from_state({})
     state = {
         "enabled": _env_flag("DIRECT_CHAT_TTS_ENABLED_DEFAULT", True),
+        "voice_owner": "chat",
+        "reader_mode_active": False,
         "speaker": str(os.environ.get("DIRECT_CHAT_TTS_SPEAKER", "Ana Florence")).strip() or "Ana Florence",
         "speaker_wav": str(os.environ.get("DIRECT_CHAT_TTS_SPEAKER_WAV", "")).strip(),
         "stt_device": str(os.environ.get("DIRECT_CHAT_STT_DEVICE", "")).strip(),
@@ -664,6 +667,13 @@ def _default_voice_state() -> dict:
     _apply_voice_mode_profile(state, profile)
     state["voice_mode_profile"] = profile
     return state
+
+
+def _normalize_voice_owner(raw: object) -> str:
+    txt = str(raw or "").strip().lower()
+    if txt in ("reader", "none"):
+        return txt
+    return "chat"
 
 
 def _normalize_voice_mode_profile(raw: object) -> str:
@@ -813,6 +823,10 @@ def _load_voice_state() -> dict:
                     )
                 except Exception:
                     state["stt_agc_target_rms"] = max(0.01, min(0.30, float(state.get("stt_agc_target_rms", 0.06))))
+                if "voice_owner" in raw:
+                    state["voice_owner"] = _normalize_voice_owner(raw.get("voice_owner"))
+                if "reader_mode_active" in raw:
+                    state["reader_mode_active"] = bool(raw.get("reader_mode_active"))
                 if "voice_mode_profile" in raw:
                     _apply_voice_mode_profile(state, str(raw.get("voice_mode_profile", "")))
     except Exception:
@@ -822,6 +836,8 @@ def _load_voice_state() -> dict:
     state["stt_rms_threshold"] = _stt_legacy_rms_threshold_from_state(state)
     state["stt_segment_rms_threshold"] = _stt_segment_rms_threshold_from_state(state)
     state["stt_barge_rms_threshold"] = _stt_barge_rms_threshold_from_state(state)
+    state["voice_owner"] = _normalize_voice_owner(state.get("voice_owner", "chat"))
+    state["reader_mode_active"] = bool(state.get("reader_mode_active", False))
     state["voice_mode_profile"] = _voice_mode_profile_from_state(state)
     return state
 
@@ -6184,6 +6200,65 @@ class ReaderSessionStore:
 
         return self._with_state(True, _write)
 
+    def jump_to_chunk(self, session_id: str, chunk_number: int) -> dict:
+        sid = _safe_session_id(session_id)
+        try:
+            requested = int(chunk_number)
+        except Exception:
+            requested = 0
+
+        def _write(state_obj: dict) -> dict:
+            sessions = state_obj.get("sessions", {})
+            if not isinstance(sessions, dict) or sid not in sessions or not isinstance(sessions.get(sid), dict):
+                return self._session_missing(sid)
+            sess = sessions[sid]
+            chunks = sess.get("chunks")
+            if not isinstance(chunks, list):
+                chunks = []
+                sess["chunks"] = chunks
+            total = len(chunks)
+            out = self._session_view(sid, sess, include_chunks=False)
+            if total <= 0:
+                out["ok"] = False
+                out["error"] = "reader_no_chunks"
+                return out
+            if requested < 1 or requested > total:
+                out["ok"] = False
+                out["error"] = "reader_chunk_out_of_range"
+                out["requested_chunk_number"] = int(requested)
+                out["total_chunks"] = int(total)
+                return out
+            idx = int(requested - 1)
+            raw = chunks[idx] if isinstance(chunks[idx], dict) else {}
+            chunk_id = str(raw.get("id", f"chunk_{idx + 1:03d}")).strip() or f"chunk_{idx + 1:03d}"
+            chunk_text = str(raw.get("text", "")).strip()
+            now = float(time.time())
+            pending = {
+                "chunk_index": idx,
+                "chunk_id": chunk_id[:80],
+                "text": chunk_text[:8000],
+                "offset_chars": 0,
+                "offset_quality": "jump",
+                "last_snippet": self._snippet_around(chunk_text[:8000], 0),
+                "deliveries": 0,
+                "last_delivery_ts": 0.0,
+                "last_barge_in_ts": 0.0,
+            }
+            sess["cursor"] = idx
+            sess["pending"] = pending
+            sess["bookmark"] = self._bookmark_from_pending(pending, now=now, quality_fallback="jump")
+            sess["reader_state"] = "reading"
+            sess["updated_ts"] = now
+            sess["last_event"] = "reader_jump_chunk"
+            out = self._session_view(sid, sess, include_chunks=False)
+            out["jumped"] = True
+            out["requested_chunk_number"] = int(requested)
+            out["target_chunk_number"] = int(idx + 1)
+            out["chunk"] = self._pending_view(pending)
+            return out
+
+        return self._with_state(True, _write)
+
     def is_continuous(self, session_id: str) -> bool:
         sid = _safe_session_id(session_id)
 
@@ -6615,6 +6690,9 @@ def _is_reader_control_command(message: str) -> bool:
             "next",
             "continuar",
             "continuar desde",
+            "ir al parrafo",
+            "ir al párrafo",
+            "ir al bloque",
             "volver una frase",
             "volver un parrafo",
             "volver un párrafo",
@@ -7077,6 +7155,7 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
                 "- segui\n"
                 "- continuar\n"
                 "- continuar desde \"<frase>\"\n"
+                "- ir al párrafo <n>\n"
                 "- volver una frase | volver un párrafo\n"
                 "- modo manual on|off\n"
                 "- continuo on|off (alias)\n"
@@ -7439,6 +7518,74 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         )
         auto_continue = bool(st_after.get("continuous_enabled", False)) and has_more
         prefix = f"Retomo desde: \"{phrase}\"."
+        if tts_unavailable_detail:
+            prefix += f" Voz no disponible ({tts_unavailable_detail}). Queda en manual estable."
+        return {
+            "reply": _reader_chunk_reply(
+                chunk,
+                total_chunks=int(st_after.get("total_chunks", 0) or 0),
+                title=str(meta_after.get("book_title", "")),
+                prefix=prefix,
+            ),
+            "no_auto_tts": True,
+            "reader": _reader_meta(
+                session_id,
+                st_after,
+                chunk=chunk,
+                auto_continue=auto_continue,
+                tts_stream_id=tts_stream_id,
+                tts_gate_required=tts_gate_required,
+            ),
+        }
+
+    m_jump_paragraph = re.search(
+        r"\b(?:ir(?:\s+a)?|anda|andá|salta|saltar|vamos)\s+(?:al\s+)?(?:parrafo|párrafo|bloque)\s+(\d+)\b",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if not m_jump_paragraph:
+        m_jump_paragraph = re.search(r"\b(?:parrafo|párrafo|bloque)\s+(\d+)\b", normalized, flags=re.IGNORECASE)
+    if m_jump_paragraph:
+        try:
+            target_paragraph = int(str(m_jump_paragraph.group(1) or "0").strip())
+        except Exception:
+            target_paragraph = 0
+        if target_paragraph <= 0:
+            return {"reply": "Indicá un párrafo válido. Ejemplo: ir al párrafo 12.", "no_auto_tts": True}
+        st_before = _READER_STORE.get_session(session_id, include_chunks=False)
+        if not st_before.get("ok"):
+            return {"reply": "No hay sesión de lectura activa. Usá 'biblioteca' y 'leer libro <n>'.", "no_auto_tts": True}
+        manual_mode = bool(st_before.get("manual_mode", False))
+        _READER_STORE.set_continuous(
+            session_id,
+            not manual_mode,
+            reason="reader_jump_paragraph_autopilot" if (not manual_mode) else "reader_jump_paragraph_manual_mode",
+        )
+        jumped = _READER_STORE.jump_to_chunk(session_id, target_paragraph)
+        if not jumped.get("ok"):
+            err = str(jumped.get("error", "")).strip()
+            if err == "reader_chunk_out_of_range":
+                total = int(jumped.get("total_chunks", 0) or 0)
+                return {"reply": f"Párrafo fuera de rango. Disponible: 1..{max(1, total)}.", "no_auto_tts": True}
+            return {"reply": f"No pude ir a ese párrafo ({err or 'reader_jump_failed'}).", "no_auto_tts": True}
+        chunk = jumped.get("chunk") if isinstance(jumped, dict) else None
+        if not isinstance(chunk, dict):
+            st_now = _READER_STORE.get_session(session_id, include_chunks=False)
+            return {"reply": "No pude preparar ese párrafo para lectura.", "no_auto_tts": True, "reader": _reader_meta(session_id, st_now)}
+        tts_gate_required, tts_stream_id, _committed, tts_unavailable_detail = _reader_emit_chunk(
+            session_id=session_id,
+            chunk=chunk,
+            allowed_tools=allowed_tools,
+            commit_reason="reader_jump_paragraph_autocommit",
+        )
+        st_after = _READER_STORE.get_session(session_id, include_chunks=False)
+        meta_after = st_after.get("metadata", {}) if isinstance(st_after.get("metadata"), dict) else {}
+        has_more = (not bool(st_after.get("done", False))) and int(st_after.get("cursor", 0) or 0) < int(
+            st_after.get("total_chunks", 0) or 0
+        )
+        auto_continue = bool(st_after.get("continuous_enabled", False)) and has_more
+        target_idx = int(chunk.get("chunk_index", 0) or 0) + 1
+        prefix = f"Salto al párrafo {target_idx}."
         if tts_unavailable_detail:
             prefix += f" Voz no disponible ({tts_unavailable_detail}). Queda en manual estable."
         return {
@@ -8619,6 +8766,8 @@ class Handler(BaseHTTPRequestHandler):
             stt_agc_target_rms = 0.06
         return {
             "enabled": enabled,
+            "voice_owner": _normalize_voice_owner(state.get("voice_owner", "chat")),
+            "reader_mode_active": bool(state.get("reader_mode_active", False)),
             "voice_mode_profile": _voice_mode_profile_from_state(state),
             "speaker": str(state.get("speaker", "")),
             "speaker_wav": str(state.get("speaker_wav", "")),
@@ -8663,6 +8812,15 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/":
             raw = HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+            return
+
+        if path == "/reader":
+            raw = READER_HTML.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(raw)))
@@ -9227,12 +9385,20 @@ class Handler(BaseHTTPRequestHandler):
                 if "voice_mode_profile" in payload:
                     requested_profile = str(payload.get("voice_mode_profile", ""))
                     _apply_voice_mode_profile(state, requested_profile)
+                if "voice_owner" in payload:
+                    state["voice_owner"] = _normalize_voice_owner(payload.get("voice_owner"))
+                if "reader_mode_active" in payload:
+                    state["reader_mode_active"] = bool(payload.get("reader_mode_active"))
                 if "enabled" in payload:
                     requested_enabled = bool(payload.get("enabled"))
                     _set_voice_enabled(requested_enabled, session_id=session_id if requested_enabled else "")
                     state = _load_voice_state()
                     if requested_profile is not None:
                         _apply_voice_mode_profile(state, requested_profile)
+                    if "voice_owner" in payload:
+                        state["voice_owner"] = _normalize_voice_owner(payload.get("voice_owner"))
+                    if "reader_mode_active" in payload:
+                        state["reader_mode_active"] = bool(payload.get("reader_mode_active"))
                 elif bool(state.get("enabled", False) or state.get("stt_chat_enabled", False)) and session_id != "default":
                     _STT_MANAGER.enable(session_id=session_id)
 
@@ -9319,6 +9485,8 @@ class Handler(BaseHTTPRequestHandler):
                 state["stt_rms_threshold"] = _stt_legacy_rms_threshold_from_state(state)
                 state["stt_segment_rms_threshold"] = _stt_segment_rms_threshold_from_state(state)
                 state["stt_barge_rms_threshold"] = _stt_barge_rms_threshold_from_state(state)
+                state["voice_owner"] = _normalize_voice_owner(state.get("voice_owner", "chat"))
+                state["reader_mode_active"] = bool(state.get("reader_mode_active", False))
                 state["voice_mode_profile"] = _voice_mode_profile_from_state(state)
                 _save_voice_state(state)
                 os.environ["DIRECT_CHAT_STT_DEVICE"] = str(state.get("stt_device", "")).strip()

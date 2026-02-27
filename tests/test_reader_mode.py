@@ -520,6 +520,33 @@ class TestReaderHttpEndpoints(unittest.TestCase):
         self.assertNotIn("no encontr", str(out.get("reply", "")).lower())
         self.assertIn("herida", str(out.get("reply", "")).lower())
 
+    def test_ir_al_parrafo_jumps_to_requested_block(self) -> None:
+        code, started = self._request(
+            "POST",
+            "/api/reader/session/start",
+            {
+                "session_id": "jump_paragraph_sess",
+                "chunks": ["uno", "dos", "tres"],
+                "reset": True,
+            },
+        )
+        self.assertEqual(code, 200)
+        self.assertTrue(started.get("ok"))
+        code2, out = self._request(
+            "POST",
+            "/api/chat",
+            {
+                "session_id": "jump_paragraph_sess",
+                "message": "ir al párrafo 3",
+                "allowed_tools": [],
+                "history": [],
+            },
+        )
+        self.assertEqual(code2, 200)
+        reply = str(out.get("reply", "")).lower()
+        self.assertIn("bloque 3/3", reply)
+        self.assertIn("tres", reply)
+
     def test_leer_libro_same_book_paused_resumes_next_block(self) -> None:
         session_id = "same_book_resume_sess"
         direct_chat._READER_STORE.start_session(
@@ -573,6 +600,8 @@ class TestReaderHttpEndpoints(unittest.TestCase):
     def test_voice_payload_exposes_diagnostics(self) -> None:
         code, out = self._request("GET", "/api/voice")
         self.assertEqual(code, 200)
+        self.assertIn("voice_owner", out)
+        self.assertIn("reader_mode_active", out)
         self.assertIn("tts_backend", out)
         self.assertIn("tts_health_url", out)
         self.assertIn("tts_health_timeout_sec", out)
@@ -608,6 +637,34 @@ class TestReaderHttpEndpoints(unittest.TestCase):
         self.assertEqual(str(out2.get("voice_mode_profile", "")), "experimental")
         self.assertTrue(bool(out2.get("stt_chat_enabled", False)))
         self.assertTrue(bool(out2.get("stt_barge_any", False)))
+
+    def test_voice_owner_reader_mode_fields_roundtrip(self) -> None:
+        code, out = self._request(
+            "POST",
+            "/api/voice",
+            {
+                "session_id": "voice_owner_sess",
+                "voice_owner": "reader",
+                "reader_mode_active": True,
+            },
+        )
+        self.assertEqual(code, 200)
+        self.assertTrue(bool(out.get("ok", False)))
+        self.assertEqual(str(out.get("voice_owner", "")), "reader")
+        self.assertTrue(bool(out.get("reader_mode_active", False)))
+
+        code2, out2 = self._request(
+            "POST",
+            "/api/voice",
+            {
+                "session_id": "voice_owner_sess",
+                "voice_owner": "chat",
+                "reader_mode_active": False,
+            },
+        )
+        self.assertEqual(code2, 200)
+        self.assertEqual(str(out2.get("voice_owner", "")), "chat")
+        self.assertFalse(bool(out2.get("reader_mode_active", True)))
 
     def test_stt_level_endpoint_exposes_runtime_fields(self) -> None:
         code, out = self._request("GET", "/api/stt/level?session_id=default")

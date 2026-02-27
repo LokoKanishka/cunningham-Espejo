@@ -134,6 +134,34 @@ node scripts/tmp_reader_flow_3runs.js
 - Riesgo residual esperado:
   - si usuario cambia manualmente umbrales sueltos, puede desalinear el perfil hasta volver a seleccionar modo.
 
+### 2026-02-27 (split chat vs reader en progreso)
+- Objetivo:
+  - separar pantalla principal de chat (escritura) y pantalla dedicada de lectura (`/reader`) para reducir interferencias de voz.
+- Cambio aplicado:
+  - backend: estado de voz extendido con `voice_owner` (`chat|reader|none`) y `reader_mode_active`.
+  - backend: nueva ruta `GET /reader` con UI dedicada de lectura.
+  - chat UI (`/`): boton `Modo lectura` que abre `/reader` y bloquea controles de voz en chat cuando lectura esta activa.
+  - reader UI (`/reader`): activa ownership de voz, envia comandos locales de lectura y permite volver a chat.
+- Verificacion automatica:
+  - `pytest -q tests/test_reader_mode.py` -> OK (27 passed).
+  - `python3 -m py_compile scripts/openclaw_direct_chat.py scripts/molbot_direct_chat/ui_html.py scripts/molbot_direct_chat/reader_ui_html.py` -> OK.
+  - smoke UI con playwright:
+    - al abrir `Modo lectura`, `/` muestra escritura-only y `voice_owner=reader`.
+    - `/reader` ejecuta `biblioteca` y responde correctamente.
+- Riesgo residual:
+  - falta terminar el handoff fino al cerrar multiples tabs de `/reader` para evitar carreras de ownership.
+
+### 2026-02-27 (controles de párrafo en reader)
+- Cambio aplicado:
+  - UI `/reader` agrega:
+    - `párrafo anterior`
+    - `párrafo siguiente`
+    - mini teclado numérico `párrafo #` + botón `ir`
+  - backend agrega comando local `ir al párrafo <n>` con salto directo al bloque solicitado.
+- Verificacion:
+  - `pytest -q tests/test_reader_mode.py` -> OK (28 passed).
+  - smoke UI `/reader`: jump + prev + next -> OK.
+
 ### Riesgo conocido
 - Latencia de pausa puede variar por backend/player de audio (no siempre sub-segundo).
 - El objetivo funcional se mantiene: pausa/detener cortan flujo y responden correcto.
