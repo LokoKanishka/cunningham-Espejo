@@ -6675,6 +6675,13 @@ def _is_reader_control_command(message: str) -> bool:
     normalized = _normalize_text(message)
     if not normalized:
         return False
+    if re.search(
+        r"\b(?:continuar|continua|contiuna|contionua|segui|seguir|sigue|continue|resume|reanuda(?:r)?)\s+"
+        r"(?:la\s+lectura\s+)?desde\b",
+        normalized,
+        flags=re.IGNORECASE,
+    ):
+        return True
     if any(
         k in normalized
         for k in (
@@ -7475,16 +7482,29 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
             "reader": _reader_meta(session_id, st_after, auto_continue=False),
         }
 
-    m_continue_from = re.search(r'continuar\s+desde\s+(?:la\s+)?frase\s+["“](.+?)["”]', message, flags=re.IGNORECASE)
-    if not m_continue_from:
-        m_continue_from = re.search(r'continuar\s+desde\s+["“](.+?)["”]', message, flags=re.IGNORECASE)
-    if not m_continue_from:
-        m_continue_from = re.search(r"continuar\s+desde\s+(?:la\s+)?frase\s+(.+)$", message, flags=re.IGNORECASE)
-    if not m_continue_from:
-        m_continue_from = re.search(r"continuar\s+desde\s+(.+)$", message, flags=re.IGNORECASE)
-    if m_continue_from:
-        phrase = str(m_continue_from.group(1) or "").strip()
-        phrase = re.sub(r"^(?:la\s+frase|frase)\s+", "", phrase, flags=re.IGNORECASE).strip()
+    continue_phrase_alias = r"(?:continuar|continua|contiuna|contionua|segui|seguir|sigue|continue|resume|reanuda(?:r)?)"
+    continue_from_patterns = (
+        rf"\b(?:ok\s+)?{continue_phrase_alias}\s+(?:la\s+lectura\s+)?desde\s+(?:la\s+)?frase\s+[\"“”'](.+?)[\"“”']\s*$",
+        rf"\b(?:ok\s+)?{continue_phrase_alias}\s+(?:la\s+lectura\s+)?desde\s+[\"“”'](.+?)[\"“”']\s*$",
+        rf"\b(?:ok\s+)?{continue_phrase_alias}\s+(?:la\s+lectura\s+)?desde\s+(?:la\s+)?frase\s+(.+)$",
+        rf"\b(?:ok\s+)?{continue_phrase_alias}\s+(?:la\s+lectura\s+)?desde\s+(.+)$",
+    )
+    continue_from_phrase = ""
+    for src in (message, normalized):
+        text_src = str(src or "").strip()
+        if not text_src:
+            continue
+        for pat in continue_from_patterns:
+            m_continue_from = re.search(pat, text_src, flags=re.IGNORECASE)
+            if not m_continue_from:
+                continue
+            continue_from_phrase = str(m_continue_from.group(1) or "").strip()
+            break
+        if continue_from_phrase:
+            break
+    if continue_from_phrase:
+        phrase = re.sub(r"^(?:la\s+lectura|lectura|la\s+frase|frase)\s+", "", continue_from_phrase, flags=re.IGNORECASE).strip()
+        phrase = phrase.strip(" \"'“”`.,;:!?-")
         if not phrase:
             return {"reply": "Indicá una frase para continuar. Ejemplo: continuar desde \"matriz\".", "no_auto_tts": True}
         st_before = _READER_STORE.get_session(session_id, include_chunks=False)
@@ -7787,7 +7807,10 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
             ),
         }
 
-    if any(k in normalized for k in ("segui", "siguiente", "continuar", "seguir leyendo", "sigas leyendo")) or bool(
+    if any(
+        k in normalized
+        for k in ("segui", "siguiente", "continuar", "continua", "contiuna", "contionua", "seguir leyendo", "sigas leyendo")
+    ) or bool(
         re.search(r"\bnext\b", normalized)
     ):
         st_before = _READER_STORE.get_session(session_id, include_chunks=False)
@@ -9650,19 +9673,27 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, {"reply": "", "deduped": True, "source": source_tag or "voice"})
                 return
             # allow_local_action_on_unknown_model
-            if message and (not _is_reader_control_command(message)):
+            reader_control_command = _is_reader_control_command(message) if message else False
+            if message:
                 st_reader = _READER_STORE.get_session(session_id, include_chunks=False)
                 reader_state = str(st_reader.get("reader_state", "")).strip().lower() if st_reader.get("ok") else ""
-                if _READER_STORE.is_continuous(session_id) or reader_state == "reading":
+                reader_active = bool(_READER_STORE.is_continuous(session_id) or reader_state == "reading")
+                if (not reader_control_command) and reader_active:
                     _READER_STORE.set_continuous(session_id, False, reason="reader_user_interrupt")
                     _READER_STORE.set_reader_state(session_id, "commenting", reason="reader_user_interrupt")
-                    if _tts_is_playing():
-                        _request_tts_stop(
-                            reason="reader_user_interrupt",
-                            keyword="typed_interrupt",
-                            detail="triggered:typed_interrupt",
-                            session_id=session_id,
-                        )
+                # Typed input should barge-in current TTS playback, even outside strict
+                # reader "reading" state (for example while commenting in /reader).
+                if (
+                    user_msg_source == "ui_text"
+                    and (not source_tag.startswith("ui_auto_"))
+                    and _tts_is_playing()
+                ):
+                    _request_tts_stop(
+                        reason=("reader_user_interrupt" if reader_active else "typed_interrupt"),
+                        keyword="typed_interrupt",
+                        detail="triggered:typed_interrupt",
+                        session_id=session_id,
+                    )
 
             model = str(payload.get("model", "openai-codex/gpt-5.1-codex-mini")).strip()
             requested_backend = str(payload.get("model_backend", "")).strip().lower()

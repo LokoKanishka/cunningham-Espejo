@@ -208,7 +208,16 @@ READER_HTML = r"""<!doctype html>
           }),
         });
         const j = await r.json();
-        push("assistant", String(j.reply || "[sin respuesta]"));
+        if (!r.ok) {
+          const detail = String(j.error || j.detail || `HTTP ${r.status}`);
+          push("assistant", `Error: ${detail}`);
+        } else if (typeof j.reply === "string" && j.reply.trim()) {
+          push("assistant", j.reply);
+        } else if (j && (j.error || j.detail)) {
+          push("assistant", `Error: ${String(j.error || j.detail)}`);
+        } else {
+          push("assistant", "[sin respuesta]");
+        }
       } catch (e) {
         push("assistant", "Error: " + String((e && e.message) || e));
       } finally {

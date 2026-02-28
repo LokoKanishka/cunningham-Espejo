@@ -212,6 +212,27 @@ node scripts/tmp_reader_flow_3runs.js
 - Riesgo residual:
   - cierre forzado del navegador/proceso puede no ejecutar `beforeunload`; en esos casos la liberación depende del siguiente ciclo de control o comando explícito.
 
+### 2026-02-28 18:05:00 -03 (sábado) / 21:05:00 UTC
+- Problema observado:
+  - comandos humanos tipo `ok continua la lectura desde "..."` (incluyendo typos `contiuna`/`contionua`) podían caer a modelo remoto y terminar en timeout/`[sin respuesta]`.
+  - al tipear durante TTS activo (sobre todo en estado `commenting`), no siempre se interrumpía reproducción en caliente.
+- Causa raíz:
+  - parser local de `continuar desde` demasiado estricto (solo variante `continuar ...`).
+  - interrupción por texto tipiado estaba acotada a estado reader `reading/continuous`.
+  - UI `/reader` mostraba fallback `[sin respuesta]` aunque la respuesta HTTP viniera con error explícito.
+- Cambio aplicado:
+  - parser reader robustecido para alias: `continua|contiuna|contionua` + `... la lectura desde ...` (con y sin comillas).
+  - `_is_reader_control_command(...)` ahora reconoce esas variantes para evitar ruta remota.
+  - typed barge-in: cualquier input `ui_text` interrumpe TTS activo (`typed_interrupt`), incluso fuera de `reading`.
+  - UI `/reader` muestra `Error: <detalle>` cuando `/api/chat` retorna error HTTP, en vez de caer en `[sin respuesta]` silencioso.
+- Verificación automatica:
+  - `pytest -q tests/test_reader_mode.py tests/test_reader_command_stress.py` -> OK (32 passed).
+  - smoke runtime:
+    - `ok contiuna/contionua/continua ... desde ...` -> respuesta local reader (sin `MODEL_TIMEOUT`).
+    - al tipear durante TTS activo -> `last_status.detail=typed_interrupt` y `tts_playing=false`.
+- Riesgo residual:
+  - si el modelo remoto se usa para consultas no-reader en paralelo con alta carga, puede seguir haber timeout remoto, pero ya no aplica al comando local de `continuar desde`.
+
 ### Riesgo conocido
 - Latencia de pausa puede variar por backend/player de audio (no siempre sub-segundo).
 - El objetivo funcional se mantiene: pausa/detener cortan flujo y responden correcto.

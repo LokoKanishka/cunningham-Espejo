@@ -520,6 +520,49 @@ class TestReaderHttpEndpoints(unittest.TestCase):
         self.assertNotIn("no encontr", str(out.get("reply", "")).lower())
         self.assertIn("herida", str(out.get("reply", "")).lower())
 
+    def test_continua_desde_typos_are_parsed(self) -> None:
+        variants = [
+            'ok continua la lectura desde "la herida no es"',
+            'ok contiuna la lectura desde "la herida no es"',
+            'ok contionua la lectura desde "la herida no es"',
+        ]
+        for i, message in enumerate(variants):
+            sid = f"alias_typo_{i}"
+            code, started = self._request(
+                "POST",
+                "/api/reader/session/start",
+                {"session_id": sid, "chunks": ["uno", "la herida no es escribe bien", "tres"], "reset": True},
+            )
+            self.assertEqual(code, 200)
+            self.assertTrue(started.get("ok"))
+            code, first = self._request("GET", f"/api/reader/session/next?session_id={sid}")
+            self.assertEqual(code, 200)
+            chunk = first.get("chunk", {})
+            code, committed = self._request(
+                "POST",
+                "/api/reader/session/commit",
+                {
+                    "session_id": sid,
+                    "chunk_id": str(chunk.get("chunk_id", "")),
+                    "chunk_index": int(chunk.get("chunk_index", 0)),
+                },
+            )
+            self.assertEqual(code, 200)
+            self.assertTrue(committed.get("ok"))
+            code, out = self._request(
+                "POST",
+                "/api/chat",
+                {
+                    "session_id": sid,
+                    "message": message,
+                    "allowed_tools": [],
+                    "history": [],
+                },
+            )
+            self.assertEqual(code, 200)
+            self.assertNotIn("no encontr", str(out.get("reply", "")).lower())
+            self.assertIn("herida", str(out.get("reply", "")).lower())
+
     def test_ir_al_parrafo_jumps_to_requested_block(self) -> None:
         code, started = self._request(
             "POST",
@@ -639,11 +682,13 @@ class TestReaderHttpEndpoints(unittest.TestCase):
         self.assertTrue(bool(out2.get("stt_barge_any", False)))
 
     def test_voice_owner_reader_mode_fields_roundtrip(self) -> None:
+        token = "voice_owner_token_roundtrip"
         code, out = self._request(
             "POST",
             "/api/voice",
             {
                 "session_id": "voice_owner_sess",
+                "reader_owner_token": token,
                 "voice_owner": "reader",
                 "reader_mode_active": True,
             },
@@ -652,12 +697,14 @@ class TestReaderHttpEndpoints(unittest.TestCase):
         self.assertTrue(bool(out.get("ok", False)))
         self.assertEqual(str(out.get("voice_owner", "")), "reader")
         self.assertTrue(bool(out.get("reader_mode_active", False)))
+        self.assertTrue(bool(out.get("reader_owner_token_set", False)))
 
         code2, out2 = self._request(
             "POST",
             "/api/voice",
             {
                 "session_id": "voice_owner_sess",
+                "reader_owner_token": token,
                 "voice_owner": "chat",
                 "reader_mode_active": False,
             },
@@ -665,6 +712,39 @@ class TestReaderHttpEndpoints(unittest.TestCase):
         self.assertEqual(code2, 200)
         self.assertEqual(str(out2.get("voice_owner", "")), "chat")
         self.assertFalse(bool(out2.get("reader_mode_active", True)))
+        self.assertFalse(bool(out2.get("reader_owner_token_set", True)))
+
+    def test_voice_owner_release_with_wrong_token_is_blocked(self) -> None:
+        code, out = self._request(
+            "POST",
+            "/api/voice",
+            {
+                "session_id": "voice_owner_conflict_sess",
+                "reader_owner_token": "token_a",
+                "voice_owner": "reader",
+                "reader_mode_active": True,
+                "enabled": True,
+            },
+        )
+        self.assertEqual(code, 200)
+        self.assertTrue(bool(out.get("ok", False)))
+        self.assertEqual(str(out.get("voice_owner", "")), "reader")
+
+        code2, out2 = self._request(
+            "POST",
+            "/api/voice",
+            {
+                "session_id": "voice_owner_conflict_sess",
+                "reader_owner_token": "token_b",
+                "voice_owner": "chat",
+                "reader_mode_active": False,
+                "enabled": False,
+            },
+        )
+        self.assertEqual(code2, 200)
+        self.assertTrue(bool(out2.get("ownership_conflict", False)))
+        self.assertEqual(str(out2.get("voice_owner", "")), "reader")
+        self.assertTrue(bool(out2.get("reader_mode_active", False)))
 
     def test_stt_level_endpoint_exposes_runtime_fields(self) -> None:
         code, out = self._request("GET", "/api/stt/level?session_id=default")
