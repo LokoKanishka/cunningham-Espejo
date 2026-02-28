@@ -212,9 +212,13 @@ class TestReaderHttpEndpoints(unittest.TestCase):
         base = Path(self._tmp.name)
         self._state_path = base / "reading_sessions.json"
         self._lock_path = base / ".reading_sessions.lock"
+        self._voice_state_path = base / "direct_chat_voice.json"
         self._prev_store = direct_chat._READER_STORE
+        self._prev_voice_state_path = direct_chat.VOICE_STATE_PATH
         self._prev_tts_dry_run = os.environ.get("DIRECT_CHAT_TTS_DRY_RUN")
         os.environ["DIRECT_CHAT_TTS_DRY_RUN"] = "1"
+        direct_chat.VOICE_STATE_PATH = self._voice_state_path
+        direct_chat._save_voice_state(direct_chat._default_voice_state())
         direct_chat._READER_STORE = direct_chat.ReaderSessionStore(
             state_path=self._state_path,
             lock_path=self._lock_path,
@@ -239,6 +243,7 @@ class TestReaderHttpEndpoints(unittest.TestCase):
                 os.environ.pop("DIRECT_CHAT_TTS_DRY_RUN", None)
             else:
                 os.environ["DIRECT_CHAT_TTS_DRY_RUN"] = self._prev_tts_dry_run
+            direct_chat.VOICE_STATE_PATH = self._prev_voice_state_path
             direct_chat._READER_STORE = self._prev_store
             self._tmp.cleanup()
 
@@ -620,6 +625,16 @@ class TestReaderHttpEndpoints(unittest.TestCase):
             "text": "uno\ndos\ntres",
             "book": {"book_id": "book_same_1", "title": "Libro Prueba", "format": "txt"},
         }
+        self._request(
+            "POST",
+            "/api/voice",
+            {
+                "session_id": session_id,
+                "reader_owner_token": "resume_token_same_book",
+                "voice_owner": "reader",
+                "reader_mode_active": True,
+            },
+        )
         try:
             code, out = self._request(
                 "POST",
@@ -639,6 +654,105 @@ class TestReaderHttpEndpoints(unittest.TestCase):
         reply = str(out.get("reply", "")).lower()
         self.assertIn("bloque 2/3", reply)
         self.assertNotIn("ya estoy leyendo", reply)
+
+    def test_leer_libro_same_book_with_reader_mode_off_starts_from_block_one(self) -> None:
+        session_id = "same_book_off_starts_from_one_sess"
+        direct_chat._READER_STORE.start_session(
+            session_id,
+            chunks=["uno", "dos", "tres"],
+            reset=True,
+            metadata={"book_id": "book_same_2", "title": "Libro Prueba Off"},
+        )
+        first = direct_chat._READER_STORE.next_chunk(session_id)
+        first_chunk = first.get("chunk", {})
+        direct_chat._READER_STORE.commit(
+            session_id,
+            chunk_id=str(first_chunk.get("chunk_id", "")),
+            chunk_index=int(first_chunk.get("chunk_index", 0)),
+            reason="unit_setup_commit",
+        )
+        direct_chat._READER_STORE.set_continuous(session_id, False, reason="unit_setup_pause")
+        direct_chat._READER_STORE.set_reader_state(session_id, "paused", reason="unit_setup_pause")
+
+        prev_list = direct_chat._READER_LIBRARY.list_books
+        prev_get = direct_chat._READER_LIBRARY.get_book_text
+        direct_chat._READER_LIBRARY.list_books = lambda: {  # type: ignore[assignment]
+            "ok": True,
+            "books": [{"book_id": "book_same_2", "title": "Libro Prueba Off", "format": "txt"}],
+        }
+        direct_chat._READER_LIBRARY.get_book_text = lambda _book_id: {  # type: ignore[assignment]
+            "ok": True,
+            "text": "uno\ndos\ntres",
+            "book": {"book_id": "book_same_2", "title": "Libro Prueba Off", "format": "txt"},
+        }
+        self._request(
+            "POST",
+            "/api/voice",
+            {
+                "session_id": session_id,
+                "reader_owner_token": "off_token_same_book",
+                "voice_owner": "reader",
+                "reader_mode_active": True,
+            },
+        )
+        self._request(
+            "POST",
+            "/api/voice",
+            {
+                "session_id": session_id,
+                "reader_owner_token": "off_token_same_book",
+                "voice_owner": "chat",
+                "reader_mode_active": False,
+                "enabled": False,
+            },
+        )
+        try:
+            code, out = self._request(
+                "POST",
+                "/api/chat",
+                {
+                    "session_id": session_id,
+                    "message": "leer libro 1",
+                    "allowed_tools": [],
+                    "history": [],
+                },
+            )
+        finally:
+            direct_chat._READER_LIBRARY.list_books = prev_list  # type: ignore[assignment]
+            direct_chat._READER_LIBRARY.get_book_text = prev_get  # type: ignore[assignment]
+
+        self.assertEqual(code, 200)
+        reply = str(out.get("reply", "")).lower()
+        self.assertIn("bloque 1/", reply)
+        self.assertIn("lectura iniciada", reply)
+        self.assertNotIn("retomo lectura", reply)
+
+    def test_continuar_desde_can_jump_to_unread_future_block(self) -> None:
+        sid = "continue_from_future_block_sess"
+        chunks = [f"bloque {i}" for i in range(1, 13)]
+        chunks[9] = "target phrase block ten exacta para salto"
+        code, started = self._request(
+            "POST",
+            "/api/reader/session/start",
+            {"session_id": sid, "chunks": chunks, "reset": True},
+        )
+        self.assertEqual(code, 200)
+        self.assertTrue(started.get("ok"))
+        self._request("GET", f"/api/reader/session/next?session_id={sid}")
+        code2, out = self._request(
+            "POST",
+            "/api/chat",
+            {
+                "session_id": sid,
+                "message": 'continuar desde "target phrase block ten exacta"',
+                "allowed_tools": [],
+                "history": [],
+            },
+        )
+        self.assertEqual(code2, 200)
+        reply = str(out.get("reply", "")).lower()
+        self.assertIn("bloque 10/12", reply)
+        self.assertIn("target phrase block ten exacta", reply)
 
     def test_voice_payload_exposes_diagnostics(self) -> None:
         code, out = self._request("GET", "/api/voice")

@@ -7324,12 +7324,19 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         book_meta = loaded.get("book", {})
         title = str(book_meta.get("title", item.get("title", "libro"))).strip() if isinstance(book_meta, dict) else "libro"
         explicit_manual = bool(re.search(r"\bmanual\b", normalized, flags=re.IGNORECASE))
+        voice_state_now = _load_voice_state()
+        reader_mode_live = bool(
+            _normalize_voice_owner(voice_state_now.get("voice_owner", "chat")) == "reader"
+            and bool(voice_state_now.get("reader_mode_active", False))
+        )
         st_before = _READER_STORE.get_session(session_id, include_chunks=False)
         if st_before.get("ok"):
             meta_before = st_before.get("metadata", {}) if isinstance(st_before.get("metadata"), dict) else {}
             same_book = str(meta_before.get("book_id", "")).strip() == book_id
             state_before = str(st_before.get("reader_state", "")).strip().lower()
-            if same_book and state_before in ("reading", "paused", "commenting"):
+            # Guardrail: only resume same-book cursor when reader mode ownership is live.
+            # If reader mode is OFF, "leer libro N" should be a fresh start from bloque 1.
+            if same_book and reader_mode_live and state_before in ("reading", "paused", "commenting"):
                 if explicit_manual != bool(st_before.get("manual_mode", False)):
                     _READER_STORE.set_manual_mode(session_id, explicit_manual, reason="reader_start_same_book_mode_toggle")
                     _READER_STORE.set_continuous(
