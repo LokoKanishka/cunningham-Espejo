@@ -233,6 +233,28 @@ node scripts/tmp_reader_flow_3runs.js
 - Riesgo residual:
   - si el modelo remoto se usa para consultas no-reader en paralelo con alta carga, puede seguir haber timeout remoto, pero ya no aplica al comando local de `continuar desde`.
 
+### 2026-02-28 18:39:16 -03 (sábado) / 21:39:16 UTC
+- Problema observado:
+  - al ejecutar `leer libro N` con `reader_mode` en OFF podía retomar cursor de una sesión vieja del mismo libro (por ejemplo empezar en bloque 5) en lugar de iniciar desde bloque 1.
+- Causa raíz:
+  - la rama de resume para mismo libro no verificaba ownership vivo de reader; bastaba estado previo `paused/commenting/reading` para retomar.
+- Cambio aplicado:
+  - guardrail en `scripts/openclaw_direct_chat.py`:
+    - `leer libro N` solo retoma sesión previa si `voice_owner=reader` y `reader_mode_active=true`.
+    - con reader OFF cae a `start_session(..., reset=True)` e inicia lectura nueva desde bloque 1.
+  - tests reforzados en `tests/test_reader_mode.py`:
+    - caso ON + mismo libro pausado retoma siguiente bloque.
+    - caso OFF + mismo libro inicia bloque 1 (sin `Retomo lectura`).
+    - `continuar desde "frase"` salta a bloque futuro no leído (ej. bloque 10).
+  - aislamiento de `VOICE_STATE_PATH` por test para evitar contaminación de estado entre corridas.
+- Verificación automatica:
+  - `pytest -q tests/test_reader_mode.py tests/test_reader_command_stress.py` -> OK (34 passed).
+  - `python3 -m py_compile scripts/openclaw_direct_chat.py tests/test_reader_mode.py` -> OK.
+- Commit/push:
+  - `59fb3e8` (`reader: avoid stale same-book resume when mode is off`) en `main` y subido a `origin/main`.
+- Riesgo residual:
+  - el chunking depende del parser del libro (`1/1` vs `1/3`), pero el contrato funcional queda estable: en OFF inicia lectura nueva y en ON retoma.
+
 ### Riesgo conocido
 - Latencia de pausa puede variar por backend/player de audio (no siempre sub-segundo).
 - El objetivo funcional se mantiene: pausa/detener cortan flujo y responden correcto.
