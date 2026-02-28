@@ -636,6 +636,7 @@ def _default_voice_state() -> dict:
         "enabled": _env_flag("DIRECT_CHAT_TTS_ENABLED_DEFAULT", True),
         "voice_owner": "chat",
         "reader_mode_active": False,
+        "reader_owner_token": "",
         "speaker": str(os.environ.get("DIRECT_CHAT_TTS_SPEAKER", "Ana Florence")).strip() or "Ana Florence",
         "speaker_wav": str(os.environ.get("DIRECT_CHAT_TTS_SPEAKER_WAV", "")).strip(),
         "stt_device": str(os.environ.get("DIRECT_CHAT_STT_DEVICE", "")).strip(),
@@ -827,6 +828,8 @@ def _load_voice_state() -> dict:
                     state["voice_owner"] = _normalize_voice_owner(raw.get("voice_owner"))
                 if "reader_mode_active" in raw:
                     state["reader_mode_active"] = bool(raw.get("reader_mode_active"))
+                if "reader_owner_token" in raw:
+                    state["reader_owner_token"] = str(raw.get("reader_owner_token", "")).strip()[:120]
                 if "voice_mode_profile" in raw:
                     _apply_voice_mode_profile(state, str(raw.get("voice_mode_profile", "")))
     except Exception:
@@ -838,6 +841,7 @@ def _load_voice_state() -> dict:
     state["stt_barge_rms_threshold"] = _stt_barge_rms_threshold_from_state(state)
     state["voice_owner"] = _normalize_voice_owner(state.get("voice_owner", "chat"))
     state["reader_mode_active"] = bool(state.get("reader_mode_active", False))
+    state["reader_owner_token"] = str(state.get("reader_owner_token", "")).strip()[:120]
     state["voice_mode_profile"] = _voice_mode_profile_from_state(state)
     return state
 
@@ -8768,6 +8772,7 @@ class Handler(BaseHTTPRequestHandler):
             "enabled": enabled,
             "voice_owner": _normalize_voice_owner(state.get("voice_owner", "chat")),
             "reader_mode_active": bool(state.get("reader_mode_active", False)),
+            "reader_owner_token_set": bool(str(state.get("reader_owner_token", "")).strip()),
             "voice_mode_profile": _voice_mode_profile_from_state(state),
             "speaker": str(state.get("speaker", "")),
             "speaker_wav": str(state.get("speaker_wav", "")),
@@ -9385,20 +9390,76 @@ class Handler(BaseHTTPRequestHandler):
                 if "voice_mode_profile" in payload:
                     requested_profile = str(payload.get("voice_mode_profile", ""))
                     _apply_voice_mode_profile(state, requested_profile)
+
+                requested_owner = None
                 if "voice_owner" in payload:
-                    state["voice_owner"] = _normalize_voice_owner(payload.get("voice_owner"))
+                    requested_owner = _normalize_voice_owner(payload.get("voice_owner"))
+                requested_reader_active = None
                 if "reader_mode_active" in payload:
-                    state["reader_mode_active"] = bool(payload.get("reader_mode_active"))
+                    requested_reader_active = bool(payload.get("reader_mode_active"))
+                requested_enabled = None
                 if "enabled" in payload:
                     requested_enabled = bool(payload.get("enabled"))
+                requested_owner_token = str(payload.get("reader_owner_token", "")).strip()[:120]
+
+                current_owner = _normalize_voice_owner(state.get("voice_owner", "chat"))
+                current_reader_active = bool(state.get("reader_mode_active", False))
+                current_owner_token = str(state.get("reader_owner_token", "")).strip()[:120]
+                ownership_locked = bool(current_owner == "reader" and current_reader_active and current_owner_token)
+                release_requested = bool(
+                    (requested_owner is not None and requested_owner != "reader")
+                    or (requested_reader_active is not None and (not requested_reader_active))
+                    or (requested_enabled is not None and (not requested_enabled))
+                )
+                token_matches = bool(
+                    requested_owner_token
+                    and current_owner_token
+                    and requested_owner_token == current_owner_token
+                )
+                ownership_conflict = False
+                if ownership_locked and release_requested and (not token_matches):
+                    ownership_conflict = True
+                    if requested_owner is not None and requested_owner != "reader":
+                        requested_owner = None
+                    if requested_reader_active is not None and not requested_reader_active:
+                        requested_reader_active = None
+                    if requested_enabled is not None and not requested_enabled:
+                        requested_enabled = None
+
+                if requested_owner is not None:
+                    state["voice_owner"] = requested_owner
+                if requested_reader_active is not None:
+                    state["reader_mode_active"] = requested_reader_active
+                reader_acquire_requested = bool((requested_owner == "reader") or (requested_reader_active is True))
+                if reader_acquire_requested and requested_owner_token:
+                    state["reader_owner_token"] = requested_owner_token
+                elif requested_owner is not None and requested_owner != "reader":
+                    state["reader_owner_token"] = ""
+                elif requested_reader_active is not None and not requested_reader_active:
+                    state["reader_owner_token"] = ""
+
+                if requested_enabled is not None:
+                    if (not requested_enabled) and _tts_is_playing():
+                        _request_tts_stop(
+                            reason="voice_disabled",
+                            keyword="voice_off",
+                            detail="triggered:voice_disabled",
+                            session_id=session_id,
+                        )
                     _set_voice_enabled(requested_enabled, session_id=session_id if requested_enabled else "")
                     state = _load_voice_state()
                     if requested_profile is not None:
                         _apply_voice_mode_profile(state, requested_profile)
-                    if "voice_owner" in payload:
-                        state["voice_owner"] = _normalize_voice_owner(payload.get("voice_owner"))
-                    if "reader_mode_active" in payload:
-                        state["reader_mode_active"] = bool(payload.get("reader_mode_active"))
+                    if requested_owner is not None:
+                        state["voice_owner"] = requested_owner
+                    if requested_reader_active is not None:
+                        state["reader_mode_active"] = requested_reader_active
+                    if reader_acquire_requested and requested_owner_token:
+                        state["reader_owner_token"] = requested_owner_token
+                    elif requested_owner is not None and requested_owner != "reader":
+                        state["reader_owner_token"] = ""
+                    elif requested_reader_active is not None and not requested_reader_active:
+                        state["reader_owner_token"] = ""
                 elif bool(state.get("enabled", False) or state.get("stt_chat_enabled", False)) and session_id != "default":
                     _STT_MANAGER.enable(session_id=session_id)
 
@@ -9487,6 +9548,7 @@ class Handler(BaseHTTPRequestHandler):
                 state["stt_barge_rms_threshold"] = _stt_barge_rms_threshold_from_state(state)
                 state["voice_owner"] = _normalize_voice_owner(state.get("voice_owner", "chat"))
                 state["reader_mode_active"] = bool(state.get("reader_mode_active", False))
+                state["reader_owner_token"] = str(state.get("reader_owner_token", "")).strip()[:120]
                 state["voice_mode_profile"] = _voice_mode_profile_from_state(state)
                 _save_voice_state(state)
                 os.environ["DIRECT_CHAT_STT_DEVICE"] = str(state.get("stt_device", "")).strip()
@@ -9516,6 +9578,7 @@ class Handler(BaseHTTPRequestHandler):
                     200,
                     {
                         "ok": True,
+                        "ownership_conflict": bool(ownership_conflict),
                         **self._voice_payload(state),
                     },
                 )

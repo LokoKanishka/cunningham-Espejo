@@ -126,8 +126,11 @@ READER_HTML = r"""<!doctype html>
     const jumpParagraphEl = document.getElementById("jumpParagraph");
     const jumpParagraphGoEl = document.getElementById("jumpParagraphGo");
     const SESSION_KEY = "molbot_reader_session_id";
+    const TAB_KEY = "molbot_reader_tab_id";
     const sessionId = localStorage.getItem(SESSION_KEY) || crypto.randomUUID();
+    const readerTabId = sessionStorage.getItem(TAB_KEY) || crypto.randomUUID();
     localStorage.setItem(SESSION_KEY, sessionId);
+    sessionStorage.setItem(TAB_KEY, readerTabId);
     let history = [];
 
     function draw() {
@@ -151,7 +154,7 @@ READER_HTML = r"""<!doctype html>
       const r = await fetch("/api/voice", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: sessionId, ...payload }),
+        body: JSON.stringify({ session_id: sessionId, reader_owner_token: readerTabId, ...payload }),
       });
       return await r.json();
     }
@@ -269,6 +272,7 @@ READER_HTML = r"""<!doctype html>
       try {
         const payload = JSON.stringify({
           session_id: sessionId,
+          reader_owner_token: readerTabId,
           voice_owner: "chat",
           reader_mode_active: false,
           enabled: false,

@@ -191,6 +191,27 @@ node scripts/tmp_reader_flow_3runs.js
   - endurecer handoff al cerrar múltiples pestañas `/reader` (evitar carreras de ownership).
   - opcional: lock por `session_id`/`tab_id` para liberar voz solo por dueño actual.
 
+### 2026-02-28 17:40:00 -03 (sábado) / 20:40:00 UTC
+- Problema observado:
+  - casos de lectura con texto visible pero voz no iniciada al coexistir acciones de cierre/ownership entre pestañas reader.
+- Causa raíz:
+  - release de voz sin identidad de pestaña (`beforeunload` podía competir con otra pestaña activa).
+- Cambio aplicado:
+  - `/reader` ahora envía `reader_owner_token` (token por pestaña) en `activate/release/beforeunload`.
+  - backend `/api/voice` agrega lock de ownership por token:
+    - ignora `enabled=false`/`voice_owner=chat`/`reader_mode_active=false` cuando el token no coincide con el dueño activo.
+    - responde `ownership_conflict=true` cuando bloquea esa liberación.
+  - al aceptar `enabled=false`, backend corta reproducción activa con `_request_tts_stop(reason=\"voice_disabled\")`.
+  - payload de estado agrega `reader_owner_token_set` para diagnóstico.
+- Verificación automatica:
+  - `python3 -m py_compile scripts/openclaw_direct_chat.py scripts/molbot_direct_chat/reader_ui_html.py` -> OK.
+  - `pytest -q tests/test_reader_mode.py` -> OK (28 passed).
+  - smoke API ownership:
+    - release con token incorrecto -> `ownership_conflict=true`, voz sigue `enabled=true`.
+    - release con token correcto -> libera owner y desactiva voz.
+- Riesgo residual:
+  - cierre forzado del navegador/proceso puede no ejecutar `beforeunload`; en esos casos la liberación depende del siguiente ciclo de control o comando explícito.
+
 ### Riesgo conocido
 - Latencia de pausa puede variar por backend/player de audio (no siempre sub-segundo).
 - El objetivo funcional se mantiene: pausa/detener cortan flujo y responden correcto.
