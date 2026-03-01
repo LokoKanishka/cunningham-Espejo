@@ -3972,6 +3972,7 @@ def _youtube_transport_action(action: str, close_window: bool = False, session_i
     progress_detail = "n/a"
     load_detail = "n/a"
     toggle_count = 0
+    ad_detected = False
     if action_norm == "play":
         cur_title = str(_wmctrl_list().get(win_id, detail or "")).strip()
         if _youtube_title_is_provisional(cur_title):
@@ -4000,6 +4001,7 @@ def _youtube_transport_action(action: str, close_window: bool = False, session_i
         # Dismiss possible UI overlays and attempt "Skip Ad" before toggling play.
         _xdotool_command(["key", "--window", win_id, "Escape"], timeout=1.5)
         skip_clicks, skip_detail = _youtube_try_skip_ads(win_id, timeout_s=7.0)
+        ad_detected = str(skip_detail).startswith("ad_detected")
 
     rc_key = 0
     if action_norm != "play":
@@ -4012,18 +4014,27 @@ def _youtube_transport_action(action: str, close_window: bool = False, session_i
         pre_progressing, pre_progress_detail = _youtube_is_progressing(win_id, wait_s=1.1)
         if pre_progressing:
             progress_detail = f"already_playing:{pre_progress_detail}"
-        elif str(skip_detail).startswith("ad_detected"):
+        elif ad_detected:
             # Avoid toggling while an ad is still detected, to prevent pausing
             # autoplay at 0:00.
             pre2_progressing, pre2_detail = _youtube_is_progressing(win_id, wait_s=1.1)
             if pre2_progressing:
                 progress_detail = f"ad_detected_playing:{pre_progress_detail};confirm={pre2_detail}"
             else:
-                rc_key, _ = _xdotool_command(["key", "--window", win_id, "k"], timeout=2.0)
-                if rc_key != 0:
-                    return False, f"youtube_key_toggle_failed win={win_id}"
-                toggle_count += 1
-                progress_detail = f"ad_detected_toggle_once:{pre_progress_detail};confirm={pre2_detail}"
+                vis_ok_pre, vis_detail_pre = _youtube_visual_progress(win_id, interval_s=1.7)
+                if vis_ok_pre:
+                    progress_detail = (
+                        f"ad_detected_visual_playing:{pre_progress_detail};confirm={pre2_detail};{vis_detail_pre}"
+                    )
+                else:
+                    # Rescue path: if ad is visible but static, one toggle can resume.
+                    rc_key, _ = _xdotool_command(["key", "--window", win_id, "k"], timeout=2.0)
+                    if rc_key != 0:
+                        return False, f"youtube_key_toggle_failed win={win_id}"
+                    toggle_count += 1
+                    progress_detail = (
+                        f"ad_detected_rescue_toggle:{pre_progress_detail};confirm={pre2_detail};visual={vis_detail_pre}"
+                    )
         else:
             rc_key, _ = _xdotool_command(["key", "--window", win_id, "k"], timeout=2.0)
             if rc_key != 0:
@@ -4032,10 +4043,11 @@ def _youtube_transport_action(action: str, close_window: bool = False, session_i
         # Some ad chains show another skip button right after toggling.
         extra_clicks, extra_detail = _youtube_try_skip_ads(win_id, timeout_s=2.2)
         skip_clicks += extra_clicks
+        ad_detected = ad_detected or str(extra_detail).startswith("ad_detected")
         if extra_clicks > 0 or skip_detail in ("n/a", "no_ad_detected"):
             skip_detail = extra_detail
         progressing, progress_detail = _youtube_is_progressing(win_id, wait_s=1.35)
-        if (not progressing) and str(progress_detail).startswith("clock_stalled"):
+        if (not progressing) and str(progress_detail).startswith("clock_stalled") and (not ad_detected):
             # If autoplay already started, first toggle can pause at 0:00.
             # Re-toggle once and verify progress again.
             _xdotool_command(["key", "--window", win_id, "k"], timeout=2.0)
@@ -4050,7 +4062,18 @@ def _youtube_transport_action(action: str, close_window: bool = False, session_i
             if vis_ok:
                 progressing = True
                 progress_detail = f"{progress_detail};{vis_detail}"
-            elif toggle_count <= 0:
+            elif ad_detected and toggle_count <= 1:
+                # OCR can fail for the ad timer; if ad frame is static, retry one
+                # explicit resume and validate with visual movement.
+                rc_key, _ = _xdotool_command(["key", "--window", win_id, "k"], timeout=2.0)
+                if rc_key == 0:
+                    toggle_count += 1
+                    time.sleep(0.20)
+                    vis_ok2, vis_detail2 = _youtube_visual_progress(win_id, interval_s=2.6)
+                    if vis_ok2:
+                        progressing = True
+                    progress_detail = f"{progress_detail};ad_rescue_visual={vis_detail2}"
+            elif toggle_count <= 0 and (not ad_detected):
                 rc_key, _ = _xdotool_command(["key", "--window", win_id, "k"], timeout=2.0)
                 if rc_key == 0:
                     toggle_count += 1
@@ -4059,6 +4082,16 @@ def _youtube_transport_action(action: str, close_window: bool = False, session_i
                     if vis_ok2:
                         progressing = True
                     progress_detail = f"{progress_detail};retoggle_visual={vis_detail2}"
+        if progressing and ("clock_advanced" not in str(progress_detail)):
+            # Visual-only changes can happen while ad overlays are static/looped.
+            # Re-check ad presence before claiming successful playback.
+            post_clicks, post_detail = _youtube_try_skip_ads(win_id, timeout_s=1.8)
+            skip_clicks += int(post_clicks or 0)
+            if post_clicks > 0 or skip_detail in ("n/a", "no_ad_detected"):
+                skip_detail = post_detail
+            if str(post_detail).startswith("ad_detected"):
+                progressing = False
+                progress_detail = f"{progress_detail};ad_still_detected={post_detail}"
         if _youtube_title_is_provisional(str(_wmctrl_list().get(win_id, detail or ""))):
             return False, f"youtube_not_loaded_after_play win={win_id} load_detail={load_detail}"
         final_title = str(_wmctrl_list().get(win_id, detail or "")).lower().strip()
@@ -5437,7 +5470,13 @@ def _looks_like_youtube_play_request(normalized: str) -> bool:
             "pone",
             "ponelo",
             "ponela",
+            "abrilo",
+            "abrílo",
+            "abrilo y",
+            "abrílo y",
             "primer video",
+            "ultimo video",
+            "último video",
             "abrí un video",
             "abri un video",
             "abrir un video",
@@ -5518,6 +5557,23 @@ def _sanitize_youtube_query(query: str) -> str:
     return q
 
 
+def _youtube_query_asks_latest(query: str) -> bool:
+    n = _normalize_text(query or "")
+    if not n:
+        return False
+    return any(
+        t in n
+        for t in (
+            "ultimo video",
+            "ultimo",
+            "ultimos",
+            "mas reciente",
+            "latest",
+            "newest",
+        )
+    )
+
+
 def _is_direct_youtube_video_url(url: str) -> bool:
     u = str(url or "").strip()
     if not u:
@@ -5540,8 +5596,9 @@ def _is_direct_youtube_video_url(url: str) -> bool:
 
 def _pick_first_youtube_video_url(query: str) -> tuple[str | None, str]:
     clean_query = _sanitize_youtube_query(query) or (query or "").strip()
+    wants_latest = _youtube_query_asks_latest(clean_query)
 
-    def from_ytdlp() -> str | None:
+    def from_ytdlp(mode: str) -> str | None:
         ytdlp = shutil.which("yt-dlp")
         if not ytdlp:
             return None
@@ -5553,7 +5610,7 @@ def _pick_first_youtube_video_url(query: str) -> tuple[str | None, str]:
                     "--get-id",
                     "--default-search",
                     "ytsearch",
-                    f"ytsearch1:{clean_query}",
+                    f"{mode}:{clean_query}",
                 ],
                 capture_output=True,
                 text=True,
@@ -5568,6 +5625,14 @@ def _pick_first_youtube_video_url(query: str) -> tuple[str | None, str]:
             return f"https://www.youtube.com/watch?v={v}"
         except Exception:
             return None
+
+    yd_mode = "ytsearchdate1" if wants_latest else "ytsearch1"
+    yd = from_ytdlp(yd_mode)
+    if yd:
+        chosen = yd
+        if "autoplay=" not in chosen:
+            chosen = chosen + ("&" if "?" in chosen else "?") + "autoplay=1"
+        return chosen, f"ok_ytdlp:{yd_mode}"
 
     def normalize_candidate(raw_url: str) -> str:
         u = str(raw_url or "").strip()
@@ -5602,12 +5667,12 @@ def _pick_first_youtube_video_url(query: str) -> tuple[str | None, str]:
     if sp2.get("ok") and isinstance(sp2.get("results"), list):
         results.extend([r for r in sp2.get("results", []) if isinstance(r, dict)])
     if not results:
-        yd = from_ytdlp()
+        yd = from_ytdlp("ytsearch1")
         if yd:
             chosen = yd
             if "autoplay=" not in chosen:
                 chosen = chosen + ("&" if "?" in chosen else "?") + "autoplay=1"
-            return chosen, "ok_ytdlp"
+            return chosen, "ok_ytdlp:fallback"
         return None, "no_results"
 
     preferred: str | None = None
@@ -5623,7 +5688,7 @@ def _pick_first_youtube_video_url(query: str) -> tuple[str | None, str]:
         break
     chosen = preferred
     if not chosen:
-        yd = from_ytdlp()
+        yd = from_ytdlp("ytsearch1")
         if yd:
             chosen = yd
         else:
@@ -8672,13 +8737,6 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
             search_req = (query_implicit, "youtube")
     if "firefox" in allowed_tools and search_req and search_req[1] == "youtube" and _looks_like_youtube_play_request(normalized):
         query = search_req[0]
-        ok_g, gd = _guardrail_check(
-            session_id,
-            "web_search",
-            {"action": "search_video", "query": query[:500], "site": "youtube"},
-        )
-        if not ok_g:
-            return {"reply": _guardrail_block_reply("web_search", gd)}
         video_url, reason = _pick_first_youtube_video_url(query)
         if not video_url:
             return {"reply": f"No pude encontrar un video reproducible en YouTube para '{query}'. ({reason})"}

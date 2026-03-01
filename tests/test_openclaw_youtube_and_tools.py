@@ -68,6 +68,24 @@ class TestOpenClawYoutubeAndTools(unittest.TestCase):
         self.assertIn("youtube.com/watch?v=abc123xyz", str(url))
         self.assertIn("autoplay=1", str(url))
 
+    @patch("openclaw_direct_chat.web_search.searxng_search")
+    @patch("openclaw_direct_chat.subprocess.run")
+    @patch("openclaw_direct_chat.shutil.which", return_value="/usr/bin/yt-dlp")
+    def test_pick_first_youtube_video_url_latest_prefers_ytdlp_date_mode(
+        self,
+        _mock_which,
+        mock_run,
+        mock_search,
+    ) -> None:
+        mock_run.return_value.stdout = "abc123xyz\n"
+        mock_run.return_value.returncode = 0
+        url, reason = direct_chat._pick_first_youtube_video_url("ultimo video de memorias de pez")
+        self.assertEqual(url, "https://www.youtube.com/watch?v=abc123xyz&autoplay=1")
+        self.assertEqual(reason, "ok_ytdlp:ytsearchdate1")
+        self.assertEqual(mock_search.call_count, 0)
+        called = [str(x) for x in (mock_run.call_args.args[0] if mock_run.call_args else [])]
+        self.assertIn("ytsearchdate1:ultimo video de memorias de pez", called)
+
     @patch("openclaw_direct_chat._autodetect_dc_anchor_for_current_workspace")
     @patch("openclaw_direct_chat._trusted_dc_anchor_for_current_workspace")
     @patch("openclaw_direct_chat._active_dc_anchor_for_current_workspace")
@@ -97,6 +115,10 @@ class TestOpenClawYoutubeAndTools(unittest.TestCase):
             "en youtube buscá musica focus y reproducí el primer video"
         )
         self.assertIsNone(req)
+
+    def test_looks_like_youtube_play_request_accepts_abrilo(self) -> None:
+        normalized = direct_chat._normalize_text("busca el ultimo video de memorias de pez en youtube y abrilo")
+        self.assertTrue(direct_chat._looks_like_youtube_play_request(normalized))
 
     @patch("openclaw_direct_chat._youtube_transport_action")
     @patch("openclaw_direct_chat._guardrail_check")
@@ -614,6 +636,29 @@ class TestOpenClawYoutubeAndTools(unittest.TestCase):
         )
         mock_play.assert_called_once_with("play", close_window=False, session_id="sess_test")
 
+    @patch("openclaw_direct_chat._guardrail_check", return_value=(True, "GUARDRAIL_OK"))
+    @patch("openclaw_direct_chat._pick_first_youtube_video_url", return_value=("https://www.youtube.com/watch?v=abc123xyz", "ok"))
+    @patch("openclaw_direct_chat._open_site_urls", return_value=(["https://www.youtube.com/watch?v=abc123xyz"], None))
+    @patch("openclaw_direct_chat._youtube_transport_action", return_value=(True, "ok action=play"))
+    def test_local_action_youtube_busca_abrilo_without_play_word_still_opens_and_plays(
+        self, mock_play, mock_open_urls, mock_pick_video, _mock_guardrail
+    ) -> None:
+        out = direct_chat._maybe_handle_local_action(
+            "busca el ultimo video de memorias de pez en youtube y abrilo",
+            {"firefox", "web_search", "web_ask", "desktop", "model"},
+            "sess_test",
+        )
+        self.assertIsNotNone(out)
+        reply = str(out.get("reply", "")).lower()
+        self.assertIn("reproduzco un video de youtube", reply)
+        q = str((mock_pick_video.call_args.args[0] if mock_pick_video.call_args else "")).lower()
+        self.assertIn("ultimo video de memorias de pez", q)
+        mock_open_urls.assert_called_once_with(
+            [("youtube", "https://www.youtube.com/watch?v=abc123xyz")],
+            session_id="sess_test",
+        )
+        mock_play.assert_called_once_with("play", close_window=False, session_id="sess_test")
+
     @patch("openclaw_direct_chat._youtube_try_skip_ads", side_effect=[(1, "ad_skipped"), (0, "no_ad_detected")])
     @patch("openclaw_direct_chat._youtube_is_progressing", side_effect=[(False, "clock_stalled_0_to_0"), (True, "clock_advanced_0_to_1")])
     @patch("openclaw_direct_chat._xdotool_command", return_value=(0, "ok"))
@@ -633,13 +678,71 @@ class TestOpenClawYoutubeAndTools(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("skip_clicks=1", detail)
         self.assertIn("progress_detail=", detail)
-        self.assertEqual(mock_skip_ads.call_count, 2)
+        self.assertGreaterEqual(mock_skip_ads.call_count, 2)
         self.assertEqual(mock_progress.call_count, 2)
         verbs = [str(c.args[0][0]) for c in mock_xdotool.call_args_list if c.args and c.args[0]]
         self.assertIn("windowactivate", verbs)
         self.assertIn("key", verbs)
         k_calls = [c.args[0] for c in mock_xdotool.call_args_list if c.args and c.args[0] and c.args[0][0] == "key" and "k" in c.args[0]]
         self.assertGreaterEqual(len(k_calls), 1)
+
+    @patch("openclaw_direct_chat._youtube_visual_progress", side_effect=[(False, "visual_static"), (True, "visual_changed")])
+    @patch(
+        "openclaw_direct_chat._youtube_try_skip_ads",
+        side_effect=[(0, "ad_detected_skip_not_available"), (0, "ad_detected_skip_not_available"), (0, "no_ad_detected")],
+    )
+    @patch(
+        "openclaw_direct_chat._youtube_is_progressing",
+        side_effect=[(False, "clock_unreadable_t1"), (False, "clock_unreadable_t1"), (False, "clock_unreadable_t1")],
+    )
+    @patch("openclaw_direct_chat._xdotool_command", return_value=(0, "ok"))
+    @patch("openclaw_direct_chat._wmctrl_current_desktop_site_windows", return_value=[("0xabc", "YouTube - Google Chrome")])
+    @patch("openclaw_direct_chat._pick_active_site_window_id", return_value=(None, "not_active"))
+    @patch("openclaw_direct_chat._expected_profile_directory_for_site", return_value="Profile 1")
+    def test_youtube_transport_play_ad_static_uses_rescue_toggle(
+        self,
+        _mock_profile,
+        _mock_pick_active,
+        _mock_ws_windows,
+        mock_xdotool,
+        _mock_progress,
+        _mock_skip_ads,
+        _mock_visual,
+    ) -> None:
+        ok, detail = direct_chat._youtube_transport_action("play", close_window=False, session_id="sess")
+        self.assertTrue(ok)
+        self.assertIn("toggle_count=1", detail)
+        self.assertIn("visual_changed", detail)
+        k_calls = [c.args[0] for c in mock_xdotool.call_args_list if c.args and c.args[0] and c.args[0][0] == "key" and "k" in c.args[0]]
+        self.assertGreaterEqual(len(k_calls), 1)
+
+    @patch("openclaw_direct_chat._youtube_visual_progress", return_value=(True, "visual_changed"))
+    @patch(
+        "openclaw_direct_chat._youtube_try_skip_ads",
+        side_effect=[(0, "no_ad_detected"), (0, "no_ad_detected"), (0, "ad_detected_skip_not_available")],
+    )
+    @patch(
+        "openclaw_direct_chat._youtube_is_progressing",
+        side_effect=[(False, "clock_unreadable_t1"), (False, "clock_unreadable_t1")],
+    )
+    @patch("openclaw_direct_chat._xdotool_command", return_value=(0, "ok"))
+    @patch("openclaw_direct_chat._wmctrl_current_desktop_site_windows", return_value=[("0xabc", "YouTube - Google Chrome")])
+    @patch("openclaw_direct_chat._pick_active_site_window_id", return_value=(None, "not_active"))
+    @patch("openclaw_direct_chat._expected_profile_directory_for_site", return_value="Profile 1")
+    def test_youtube_transport_visual_progress_rejected_when_ad_still_detected(
+        self,
+        _mock_profile,
+        _mock_pick_active,
+        _mock_ws_windows,
+        _mock_xdotool,
+        _mock_progress,
+        _mock_skip_ads,
+        _mock_visual,
+    ) -> None:
+        ok, detail = direct_chat._youtube_transport_action("play", close_window=False, session_id="sess")
+        self.assertFalse(ok)
+        self.assertIn("youtube_play_not_confirmed", detail)
+        self.assertIn("ad_still_detected", detail)
 
     @patch("openclaw_direct_chat._close_recorded_browser_windows", return_value=(1, []))
     def test_local_action_close_web_human_phrase_without_window_word(self, _mock_close) -> None:
