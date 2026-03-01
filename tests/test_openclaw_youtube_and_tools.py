@@ -1,7 +1,10 @@
 import os
+import sqlite3
 import sys
 import unittest
 from unittest.mock import patch
+import tempfile
+from pathlib import Path
 
 
 REPO_ROOT = os.path.dirname(os.path.dirname(__file__))
@@ -298,6 +301,158 @@ class TestOpenClawYoutubeAndTools(unittest.TestCase):
         )
         self.assertIsNotNone(out)
         self.assertNotIn("gemini_write deshabilitado", str(out.get("reply", "")).lower())
+
+    @patch("openclaw_direct_chat._open_gemini_client_flow", return_value=(["https://gemini.google.com/app"], None))
+    @patch("openclaw_direct_chat._open_url_with_site_context", return_value=None)
+    @patch("openclaw_direct_chat._load_browser_profile_config")
+    def test_open_site_urls_gemini_uses_firefox_when_configured(
+        self,
+        mock_cfg,
+        mock_open_url,
+        mock_gemini_flow,
+    ) -> None:
+        mock_cfg.return_value = {
+            "_default": {"browser": "chrome", "profile": "diego"},
+            "gemini": {"browser": "firefox", "profile": "Diego"},
+        }
+        opened, error = direct_chat._open_site_urls([("gemini", "https://gemini.google.com/app")], session_id="sess")
+        self.assertIsNone(error)
+        self.assertEqual(opened, ["https://gemini.google.com/app"])
+        mock_open_url.assert_called_once()
+        mock_gemini_flow.assert_not_called()
+
+    @patch("openclaw_direct_chat.subprocess.Popen")
+    @patch("openclaw_direct_chat._resolve_firefox_profile_name", return_value="Diego")
+    @patch("openclaw_direct_chat._load_browser_profile_config")
+    def test_open_url_with_site_context_firefox_uses_profile(
+        self,
+        mock_cfg,
+        _mock_profile,
+        mock_popen,
+    ) -> None:
+        mock_cfg.return_value = {
+            "_default": {"browser": "chrome", "profile": "diego"},
+            "gemini": {"browser": "firefox", "profile": "Diego"},
+        }
+        err = direct_chat._open_url_with_site_context("https://gemini.google.com/app", "gemini", session_id="sess")
+        self.assertIsNone(err)
+        argv = [str(x) for x in (mock_popen.call_args.args[0] if mock_popen.call_args else [])]
+        self.assertIn("firefox", argv[0] if argv else "")
+        self.assertIn("-P", argv)
+        self.assertIn("Diego", argv)
+        self.assertIn("--new-window", argv)
+
+    @patch("openclaw_direct_chat._guardrail_check", return_value=(True, "GUARDRAIL_OK"))
+    @patch("openclaw_direct_chat._open_site_urls", return_value=(["https://gemini.google.com/app"], None))
+    @patch("openclaw_direct_chat._open_gemini_client_flow", return_value=(["https://www.google.com/", "https://gemini.google.com/app"], None))
+    @patch("openclaw_direct_chat._load_browser_profile_config")
+    def test_local_action_open_gemini_respects_firefox_config(
+        self,
+        mock_cfg,
+        mock_gemini_flow,
+        mock_open_urls,
+        _mock_guardrail,
+    ) -> None:
+        mock_cfg.return_value = {
+            "_default": {"browser": "chrome", "profile": "diego"},
+            "gemini": {"browser": "firefox", "profile": "Diego"},
+        }
+        out = direct_chat._maybe_handle_local_action(
+            "abrí gemini",
+            {"firefox", "web_search", "web_ask", "desktop", "model"},
+            "sess_test",
+        )
+        self.assertIsNotNone(out)
+        self.assertIn("abrí gemini en firefox", str(out.get("reply", "")).lower())
+        mock_open_urls.assert_called_once()
+        mock_gemini_flow.assert_not_called()
+
+    @patch("openclaw_direct_chat._load_browser_profile_config")
+    def test_local_action_gemini_write_blocks_when_not_chrome(self, mock_cfg) -> None:
+        mock_cfg.return_value = {
+            "_default": {"browser": "chrome", "profile": "diego"},
+            "gemini": {"browser": "firefox", "profile": "Diego"},
+        }
+        out = direct_chat._maybe_handle_local_action(
+            "en gemini escribi hola equipo",
+            {"firefox", "web_search", "web_ask", "desktop", "model"},
+            "sess_test",
+        )
+        self.assertIsNotNone(out)
+        self.assertIn("requiere gemini en chrome", str(out.get("reply", "")).lower())
+
+    def test_resolve_firefox_profile_name_from_profile_groups(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            pg = root / "Profile Groups"
+            pg.mkdir(parents=True, exist_ok=True)
+            db = pg / "group.sqlite"
+            con = sqlite3.connect(str(db))
+            try:
+                con.execute(
+                    "CREATE TABLE Profiles (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, name TEXT NOT NULL, avatar TEXT NOT NULL, themeId TEXT NOT NULL, themeFg TEXT NOT NULL, themeBg TEXT NOT NULL)"
+                )
+                con.execute(
+                    "INSERT INTO Profiles (id, path, name, avatar, themeId, themeFg, themeBg) VALUES (1, ?, ?, 'a', 't', 'fg', 'bg')",
+                    ("STX7CwNy.Perfil 2", "Diego"),
+                )
+                con.commit()
+            finally:
+                con.close()
+            with patch("openclaw_direct_chat._firefox_profile_roots", return_value=[root]):
+                self.assertEqual(direct_chat._resolve_firefox_profile_name("Diego"), "Diego")
+                self.assertEqual(direct_chat._resolve_firefox_profile_name("STX7CwNy.Perfil 2"), "Diego")
+
+    @patch("openclaw_direct_chat._guardrail_check", return_value=(True, "GUARDRAIL_OK"))
+    @patch("openclaw_direct_chat._open_site_urls", return_value=(["https://www.google.com/search?q=mariposas"], None))
+    def test_local_action_google_search_open_page_routes_local(self, mock_open_urls, _mock_guardrail) -> None:
+        out = direct_chat._maybe_handle_local_action(
+            "busca en google sobre mariposas, abri la pagina de la busqueda",
+            {"firefox", "web_search", "web_ask", "desktop", "model"},
+            "sess_test",
+        )
+        self.assertIsNotNone(out)
+        reply = str(out.get("reply", "")).lower()
+        self.assertIn("resultados de google", reply)
+        self.assertIn("mariposas", reply)
+        self.assertIn("google.com/search?q=mariposas", reply)
+        mock_open_urls.assert_called_once()
+
+    @patch("openclaw_direct_chat._guardrail_check", return_value=(True, "GUARDRAIL_OK"))
+    @patch(
+        "openclaw_direct_chat.web_search.searxng_search",
+        return_value={
+            "ok": True,
+            "results": [
+                {
+                    "title": "Mariposa, California - Wikipedia",
+                    "url": "https://en.wikipedia.org/wiki/Mariposa,_California",
+                    "content": "Mariposa is a county seat in California.",
+                }
+            ],
+        },
+    )
+    @patch(
+        "openclaw_direct_chat._open_site_urls",
+        return_value=(["https://en.wikipedia.org/wiki/Mariposa,_California"], None),
+    )
+    def test_local_action_wikipedia_open_single_result_routes_local(
+        self, mock_open_urls, _mock_search, _mock_guardrail
+    ) -> None:
+        out = direct_chat._maybe_handle_local_action(
+            "busca en wikipedia mariposa, abri la pagina del resultado",
+            {"firefox", "web_search", "web_ask", "desktop", "model"},
+            "sess_test",
+        )
+        self.assertIsNotNone(out)
+        reply = str(out.get("reply", "")).lower()
+        self.assertIn("primer resultado", reply)
+        self.assertIn("mariposa", reply)
+        self.assertIn("en.wikipedia.org/wiki/mariposa,_california", reply)
+        mock_open_urls.assert_called_once_with(
+            [("wikipedia", "https://en.wikipedia.org/wiki/Mariposa,_California")],
+            session_id="sess_test",
+        )
 
 
 if __name__ == "__main__":

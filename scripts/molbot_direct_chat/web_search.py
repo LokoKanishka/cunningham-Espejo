@@ -12,12 +12,28 @@ SITE_DOMAIN_FILTERS = {
     "wikipedia": "wikipedia.org",
 }
 SEARCH_VERB_RE = r"(?:busca|buscá|buscar|investiga|investigar|search)"
-WEB_DEST_RE = r"(youtube|wikipedia|internet|la\s+red|web|la\s+web)"
+WEB_DEST_RE = r"(youtube|wikipedia|google|internet|la\s+red|web|la\s+web)"
+
+
+def _clean_query(raw: str) -> str:
+    q = (raw or "").strip().strip("\"'").strip()
+    if not q:
+        return ""
+    q = re.sub(r"^(?:sobre|acerca\s+de)\s+", "", q, flags=re.IGNORECASE).strip()
+    # Remove trailing operational directives ("abrí la página...", "open...", etc.).
+    q = re.sub(
+        r"(?:[,;:.]|\s+)(?:y\s+)?(?:abr\w*|open|mostr\w*|muestr\w*|pone\w*|pon[eé]\w*|reproduc\w*).*$",
+        "",
+        q,
+        flags=re.IGNORECASE,
+    ).strip()
+    q = re.sub(r"\s+", " ", q).strip(" ,.;:-")
+    return q
 
 
 def _site_key_from_where(where: str) -> str | None:
     norm = re.sub(r"\s+", " ", (where or "").strip().lower())
-    return norm if norm in ("youtube", "wikipedia") else None
+    return norm if norm in ("youtube", "wikipedia", "google") else None
 
 
 def extract_web_search_query(message: str) -> str | None:
@@ -37,7 +53,7 @@ def extract_web_search_query(message: str) -> str | None:
         m = re.search(pat, msg, flags=re.IGNORECASE | re.DOTALL)
         if not m:
             continue
-        q = (m.group(1) or "").strip().strip("\"'").strip()
+        q = _clean_query(m.group(1) or "")
         if q:
             return q[:400]
 
@@ -52,7 +68,7 @@ def extract_web_search_query(message: str) -> str | None:
         m = re.search(pat, msg, flags=re.IGNORECASE | re.DOTALL)
         if not m:
             continue
-        q = (m.group(1) or "").strip().strip("\"'").strip(" \t,.;:!?¡¿")
+        q = _clean_query((m.group(1) or "").strip(" \t,.;:!?¡¿"))
         if q:
             return q[:400]
 
@@ -70,7 +86,7 @@ def extract_web_search_query(message: str) -> str | None:
     timely = bool(re.search(r"\b(hoy|ahora|actual(?:idad|mente)?|reciente(?:s)?)\b", lowered, flags=re.IGNORECASE))
     if topical and timely:
         q = re.sub(r"^\s*(?:hoy|ahora|actualmente)\s*(?:de|del|sobre|acerca de)?\s*", "", msg, flags=re.IGNORECASE).strip()
-        q = q.strip("\"'").strip(" \t,.;:!?¡¿")
+        q = _clean_query(q.strip(" \t,.;:!?¡¿"))
         if q:
             return q[:400]
     return None
@@ -79,26 +95,26 @@ def extract_web_search_query(message: str) -> str | None:
 def extract_web_search_request(message: str) -> tuple[str, str | None] | None:
     """
     Returns (query, site_key) for explicit free-web search requests.
-    site_key is one of: None, "youtube", "wikipedia".
+    site_key is one of: None, "youtube", "wikipedia", "google".
     """
     msg = (message or "").strip()
     if not msg:
         return None
 
-    # "busca <tema> en youtube|wikipedia|internet|la red|web"
+    # "busca <tema> en youtube|wikipedia|google|internet|la red|web"
     m = re.search(
         rf"{SEARCH_VERB_RE}\s+(.+?)\s+en\s+{WEB_DEST_RE}\b",
         msg,
         flags=re.IGNORECASE | re.DOTALL,
     )
     if m:
-        q = (m.group(1) or "").strip().strip("\"'").strip()
+        q = _clean_query(m.group(1) or "")
         where = (m.group(2) or "").strip().lower()
         site_key = _site_key_from_where(where)
         if q:
             return q[:400], site_key
 
-    # "busca en youtube|wikipedia|internet|la red|web: <tema>"
+    # "busca en youtube|wikipedia|google|internet|la red|web: <tema>"
     m = re.search(
         rf"{SEARCH_VERB_RE}\s+en\s+{WEB_DEST_RE}\s*[:,-]?\s*(.+)$",
         msg,
@@ -106,32 +122,32 @@ def extract_web_search_request(message: str) -> tuple[str, str | None] | None:
     )
     if m:
         where = (m.group(1) or "").strip().lower()
-        q = (m.group(2) or "").strip().strip("\"'").strip()
+        q = _clean_query(m.group(2) or "")
         site_key = _site_key_from_where(where)
         if q:
             return q[:400], site_key
 
-    # "en youtube|wikipedia busca: <tema>"
+    # "en youtube|wikipedia|google busca: <tema>"
     m = re.search(
-        rf"en\s+(youtube|wikipedia)\s+{SEARCH_VERB_RE}\s*[:,-]?\s*(.+)$",
+        rf"en\s+(youtube|wikipedia|google)\s+{SEARCH_VERB_RE}\s*[:,-]?\s*(.+)$",
         msg,
         flags=re.IGNORECASE | re.DOTALL,
     )
     if m:
         where = (m.group(1) or "").strip().lower()
-        q = (m.group(2) or "").strip().strip("\"'").strip()
+        q = _clean_query(m.group(2) or "")
         if q:
             return q[:400], where
 
-    # "youtube|wikipedia busca: <tema>" (sin "en")
+    # "youtube|wikipedia|google busca: <tema>" (sin "en")
     m = re.search(
-        rf"(youtube|wikipedia)\s+{SEARCH_VERB_RE}\s*[:,-]?\s*(.+)$",
+        rf"(youtube|wikipedia|google)\s+{SEARCH_VERB_RE}\s*[:,-]?\s*(.+)$",
         msg,
         flags=re.IGNORECASE | re.DOTALL,
     )
     if m:
         where = (m.group(1) or "").strip().lower()
-        q = (m.group(2) or "").strip().strip("\"'").strip()
+        q = _clean_query(m.group(2) or "")
         if q:
             return q[:400], where
 
@@ -204,7 +220,7 @@ def format_results_for_prompt(search_payload: dict) -> str:
     if not isinstance(results, list):
         results = []
     site_key = str(search_payload.get("site_key", "")).strip()
-    where = f" en {site_key}" if site_key in ("youtube", "wikipedia") else ""
+    where = f" en {site_key}" if site_key in ("youtube", "wikipedia", "google") else ""
     lines = [f"Resultados SearXNG (local){where} para: {q}"]
     for i, r in enumerate(results[:8], 1):
         if not isinstance(r, dict):
@@ -224,7 +240,7 @@ def format_results_for_prompt(search_payload: dict) -> str:
 def format_results_for_user(search_payload: dict) -> str:
     q = str(search_payload.get("query", "")).strip()
     site_key = str(search_payload.get("site_key", "")).strip()
-    where = f" en {site_key}" if site_key in ("youtube", "wikipedia") else " en la web"
+    where = f" en {site_key}" if site_key in ("youtube", "wikipedia", "google") else " en la web"
     results = search_payload.get("results", [])
     if not isinstance(results, list):
         results = []

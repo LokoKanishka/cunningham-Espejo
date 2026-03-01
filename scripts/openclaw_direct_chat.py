@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import atexit
 import argparse
+import configparser
 import fcntl
 import hashlib
 import html
@@ -9,6 +10,7 @@ import os
 import queue
 import re
 import socket
+import sqlite3
 import shutil
 import subprocess
 import sys
@@ -46,6 +48,7 @@ SITE_ALIASES = {
     "chatgpt": "https://chatgpt.com/",
     "chat gpt": "https://chatgpt.com/",
     "gemini": "https://gemini.google.com/app",
+    "google": "https://www.google.com/",
     "youtube": "https://www.youtube.com/",
     "you tube": "https://www.youtube.com/",
     "wikipedia": "https://es.wikipedia.org/",
@@ -55,6 +58,7 @@ SITE_ALIASES = {
 }
 
 SITE_SEARCH_TEMPLATES = {
+    "google": "https://www.google.com/search?q={q}",
     "youtube": "https://www.youtube.com/results?search_query={q}",
     "wikipedia": "https://es.wikipedia.org/w/index.php?search={q}",
 }
@@ -63,6 +67,7 @@ SITE_CANONICAL_TOKENS = {
     # Include common typos so simple "open X" doesn't fall back to the model.
     "chatgpt": ["chatgpt", "chat gpt", "chatgtp", "chat gtp"],
     "gemini": ["gemini", "gemni", "geminy", "gemin"],
+    "google": ["google", "googl", "gugel"],
     "youtube": ["youtube", "you tube", "ytube", "yutub", "youtbe", "youtub"],
     "wikipedia": ["wikipedia", "wiki"],
     "gmail": ["gmail", "mail"],
@@ -74,6 +79,7 @@ DEFAULT_BROWSER_PROFILE_CONFIG = {
     # Keep ChatGPT/Gemini in the same logged-in Chrome profile by default.
     "chatgpt": {"browser": "chrome", "profile": "diego"},
     "gemini": {"browser": "chrome", "profile": "diego"},
+    "google": {"browser": "chrome", "profile": "diego"},
     "youtube": {"browser": "chrome", "profile": "diego"},
     "wikipedia": {"browser": "chrome", "profile": "diego"},
     "gmail": {"browser": "chrome", "profile": "diego"},
@@ -4631,12 +4637,18 @@ def _load_browser_profile_config() -> dict:
     return config
 
 
-def _expected_profile_directory_for_site(site_key: str | None) -> str:
+def _site_browser_profile_hint(site_key: str | None) -> tuple[str, str]:
     cfg = _load_browser_profile_config()
     site_cfg = cfg.get(site_key or "", {})
     if not site_cfg:
         site_cfg = cfg.get("_default", {})
-    hint = str(site_cfg.get("profile", "")).strip()
+    browser = str(site_cfg.get("browser", "")).lower().strip() or "chrome"
+    profile_hint = str(site_cfg.get("profile", "")).strip()
+    return browser, profile_hint
+
+
+def _expected_profile_directory_for_site(site_key: str | None) -> str:
+    _browser, hint = _site_browser_profile_hint(site_key)
     return _resolve_chrome_profile_directory(hint)
 
 
@@ -4772,13 +4784,89 @@ def _spawn_profiled_chrome_anchor_for_workspace(
     return win_id, "spawn_profiled_chrome_ok"
 
 
+def _firefox_profile_roots() -> list[Path]:
+    return [
+        Path.home() / ".mozilla" / "firefox",
+        Path.home() / "snap" / "firefox" / "common" / ".mozilla" / "firefox",
+        Path.home() / ".var" / "app" / "org.mozilla.firefox" / ".mozilla" / "firefox",
+    ]
+
+
+def _resolve_firefox_profile_from_profile_groups(profile_hint: str) -> str:
+    hint_norm = str(profile_hint or "").strip().lower()
+    if not hint_norm:
+        return ""
+    for root in _firefox_profile_roots():
+        pg_dir = root / "Profile Groups"
+        if not pg_dir.exists():
+            continue
+        for db_path in sorted(pg_dir.glob("*.sqlite")):
+            try:
+                con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+                try:
+                    rows = con.execute("SELECT path, name FROM Profiles").fetchall()
+                finally:
+                    con.close()
+            except Exception:
+                continue
+            for row in rows:
+                if not isinstance(row, (tuple, list)) or len(row) < 2:
+                    continue
+                raw_path = str(row[0] or "").strip()
+                raw_name = str(row[1] or "").strip()
+                if raw_name and raw_name.lower().strip() == hint_norm:
+                    return raw_name
+                if raw_path:
+                    path_norm = raw_path.lower().strip()
+                    path_leaf = Path(raw_path).name.lower().strip()
+                    if hint_norm in (path_norm, path_leaf):
+                        return raw_name or raw_path
+    return ""
+
+
+def _resolve_firefox_profile_name(profile_hint: str) -> str:
+    hint = str(profile_hint or "").strip()
+    if not hint:
+        return ""
+    from_groups = _resolve_firefox_profile_from_profile_groups(hint)
+    if from_groups:
+        return from_groups
+    ini_candidates = [
+        root / "profiles.ini" for root in _firefox_profile_roots()
+    ]
+    for ini in ini_candidates:
+        if not ini.exists():
+            continue
+        try:
+            cp = configparser.ConfigParser()
+            cp.read(str(ini), encoding="utf-8")
+            hint_norm = hint.lower().strip()
+            default_name = ""
+            for section in cp.sections():
+                if not section.lower().startswith("profile"):
+                    continue
+                name = str(cp.get(section, "Name", fallback="")).strip()
+                path = str(cp.get(section, "Path", fallback="")).strip()
+                if not default_name:
+                    is_default = str(cp.get(section, "Default", fallback="0")).strip().lower() in ("1", "true", "yes", "on")
+                    if is_default and name:
+                        default_name = name
+                if name and name.lower().strip() == hint_norm:
+                    return name
+                if path:
+                    path_leaf = Path(path).name.lower().strip()
+                    if path_leaf == hint_norm:
+                        return name or Path(path).name
+            if default_name:
+                return default_name
+        except Exception:
+            continue
+    return hint
+
+
 def _open_url_with_site_context(url: str, site_key: str | None, session_id: str | None = None) -> str | None:
-    cfg = _load_browser_profile_config()
-    site_cfg = cfg.get(site_key or "", {})
-    if not site_cfg:
-        site_cfg = cfg.get("_default", {})
-    browser = str(site_cfg.get("browser", "")).lower().strip()
-    profile = _expected_profile_directory_for_site(site_key)
+    browser, profile_hint = _site_browser_profile_hint(site_key)
+    profile = _resolve_chrome_profile_directory(profile_hint)
 
     if browser == "chrome":
         desk = _wmctrl_current_desktop()
@@ -4858,7 +4946,7 @@ def _open_url_with_site_context(url: str, site_key: str | None, session_id: str 
 
         terms: list[str] = []
         sk = str(site_key or "").strip().lower()
-        if sk in ("youtube", "gemini", "chatgpt", "wikipedia", "gmail"):
+        if sk in ("google", "youtube", "gemini", "chatgpt", "wikipedia", "gmail"):
             terms.append(sk)
         try:
             host = (urlparse(str(url or "")).netloc or "").lower().strip(".")
@@ -4885,29 +4973,40 @@ def _open_url_with_site_context(url: str, site_key: str | None, session_id: str 
             )
         return None
 
-    try:
-        subprocess.Popen(
-            ["firefox", "--new-tab", url],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        return None
-    except FileNotFoundError:
-        return "No pude abrir Firefox: comando no encontrado en el sistema."
-    except Exception as e:
-        return f"No pude abrir Firefox: {e}"
+    if browser == "firefox":
+        try:
+            ff_profile = _resolve_firefox_profile_name(profile_hint)
+            cmd = ["firefox"]
+            if ff_profile:
+                cmd.extend(["--new-instance", "-P", ff_profile, "--new-window", str(url)])
+            else:
+                cmd.extend(["--new-tab", str(url)])
+            subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            return None
+        except FileNotFoundError:
+            return "No pude abrir Firefox: comando no encontrado en el sistema."
+        except Exception as e:
+            return f"No pude abrir Firefox: {e}"
+
+    return f"Navegador no soportado en config para {site_key or 'site'}: {browser}"
 
 
 def _open_site_urls(entries: list[tuple[str | None, str]], session_id: str | None = None) -> tuple[list[str], str | None]:
     opened = []
     for site_key, url in entries:
         if site_key == "gemini":
-            gem_opened, gem_error = _open_gemini_client_flow(session_id=session_id)
-            if gem_error:
-                return opened, gem_error
-            opened.extend(gem_opened)
-            continue
+            browser_gemini, _profile_hint = _site_browser_profile_hint("gemini")
+            if browser_gemini == "chrome":
+                gem_opened, gem_error = _open_gemini_client_flow(session_id=session_id)
+                if gem_error:
+                    return opened, gem_error
+                opened.extend(gem_opened)
+                continue
         error = _open_url_with_site_context(url, site_key, session_id=session_id)
         if error:
             return opened, error
@@ -4936,6 +5035,8 @@ def _open_gemini_client_flow(session_id: str | None = None) -> tuple[list[str], 
 
 
 def _site_url(site_key: str) -> str:
+    if site_key == "google":
+        return SITE_ALIASES["google"]
     if site_key == "chatgpt":
         return SITE_ALIASES["chatgpt"]
     if site_key == "gemini":
@@ -4988,6 +5089,31 @@ def _looks_like_open_top_results_request(normalized: str) -> bool:
         return False
     wants_three = any(t in text for t in (" top 3", "top3", "3 resultados", "tres resultados", "primeros 3", "primeros tres"))
     return wants_three
+
+
+def _looks_like_open_first_result_request(normalized: str) -> bool:
+    text = str(normalized or "")
+    if not text:
+        return False
+    openish = any(t in text for t in ("abr", "open", "lanz", "inici"))
+    if not openish:
+        return False
+    refs_results = any(
+        t in text
+        for t in (
+            "resultado",
+            "resultados",
+            "link",
+            "links",
+            "primer resultado",
+            "resultado 1",
+            "resultado uno",
+        )
+    )
+    if not refs_results:
+        return False
+    asks_many = any(t in text for t in (" top 3", "top3", "3 resultados", "tres resultados", "primeros 3", "primeros tres"))
+    return not asks_many
 
 
 def _sanitize_youtube_query(query: str) -> str:
@@ -8052,6 +8178,14 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
     if gemini_write_text:
         if ("web_ask" not in allowed_tools) and ("firefox" not in allowed_tools):
             return {"reply": "La herramienta local 'gemini write' está deshabilitada en esta sesión."}
+        browser_gemini, _profile_hint = _site_browser_profile_hint("gemini")
+        if browser_gemini != "chrome":
+            return {
+                "reply": (
+                    "No pude ejecutar 'gemini write' automático: ese flujo hoy requiere Gemini en Chrome "
+                    f"(config actual: {browser_gemini})."
+                )
+            }
         ok_g, gd = _guardrail_check(
             session_id,
             "browser_vision",
@@ -8107,8 +8241,10 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
     wants_new_chat = any(k in normalized for k in ("chat nuevo", "nuevo chat", "iniciar una conversacion", "iniciar conversacion"))
     topic = _extract_topic(message)
 
-    # Hard rule: "open Gemini" (or close variants) always executes the same deterministic flow.
+    # "Open Gemini" uses deterministic Chrome flow when Gemini is configured on Chrome;
+    # otherwise it opens the configured browser/site URL directly.
     if "firefox" in allowed_tools and _looks_like_direct_gemini_open(normalized) and not wants_search and not wants_new_chat:
+        browser_gemini, _profile_hint = _site_browser_profile_hint("gemini")
         ok_g, gd = _guardrail_check(
             session_id,
             "browser_vision",
@@ -8116,10 +8252,15 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         )
         if not ok_g:
             return {"reply": _guardrail_block_reply("browser_vision", gd)}
-        opened, error = _open_gemini_client_flow(session_id=session_id)
+        if browser_gemini == "chrome":
+            opened, error = _open_gemini_client_flow(session_id=session_id)
+            if error:
+                return {"reply": error}
+            return {"reply": "Abrí Gemini en el cliente correcto con el flujo entrenado (Google -> Gemini)."}
+        opened, error = _open_site_urls([("gemini", _site_url("gemini"))], session_id=session_id)
         if error:
             return {"reply": error}
-        return {"reply": "Abrí Gemini en el cliente correcto con el flujo entrenado (Google -> Gemini)."}
+        return {"reply": f"Abrí Gemini en {browser_gemini} para esta sesión: {opened[0]}"}
 
     search_req = web_search.extract_web_search_request(message)
     if "firefox" in allowed_tools and search_req and search_req[1] == "youtube" and _looks_like_youtube_play_request(normalized):
@@ -8148,6 +8289,21 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
 
     if search_req and ("web_search" in allowed_tools):
         query, site_key = search_req
+        if "firefox" in allowed_tools and site_key == "google" and wants_open:
+            url = _build_site_search_url("google", query)
+            if not url:
+                return {"reply": "No pude construir la búsqueda en Google."}
+            ok_g2, gd2 = _guardrail_check(
+                session_id,
+                "browser_vision",
+                {"action": "open_site_search", "site": "google", "url": url},
+            )
+            if not ok_g2:
+                return {"reply": _guardrail_block_reply("browser_vision", gd2)}
+            opened, error = _open_site_urls([("google", url)], session_id=session_id)
+            if error:
+                return {"reply": error}
+            return {"reply": f"Abrí la página de resultados de Google para '{query}': {opened[0]}"}
         if "firefox" in allowed_tools and _looks_like_open_top_results_request(normalized):
             ok_g, gd = _guardrail_check(
                 session_id,
@@ -8190,6 +8346,43 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
                 url = str(item.get("url", "")).strip()
                 lines.append(f"{i}. {title} - {url}")
             return {"reply": "\n".join(lines)}
+        if "firefox" in allowed_tools and _looks_like_open_first_result_request(normalized):
+            ok_g, gd = _guardrail_check(
+                session_id,
+                "web_search",
+                {"action": "search_open_first_result", "query": query[:500], "site": (site_key or "")},
+            )
+            if not ok_g:
+                return {"reply": _guardrail_block_reply("web_search", gd)}
+            sp = web_search.searxng_search(query, site_key=site_key, max_results=6)
+            if not sp.get("ok"):
+                err = str(sp.get("error", "web_search_failed"))
+                return {"reply": f"No pude buscar en SearXNG local: {err}"}
+            results = sp.get("results", []) if isinstance(sp.get("results"), list) else []
+            first_item: dict | None = None
+            for item in results:
+                if not isinstance(item, dict):
+                    continue
+                url = str(item.get("url", "")).strip()
+                if not url:
+                    continue
+                first_item = item
+                break
+            if not first_item:
+                return {"reply": f"No encontré resultados útiles para abrir sobre: {query}"}
+            best_url = str(first_item.get("url", "")).strip()
+            ok_g2, gd2 = _guardrail_check(
+                session_id,
+                "browser_vision",
+                {"action": "open_search_result", "query": query[:500], "site": (site_key or ""), "url": best_url},
+            )
+            if not ok_g2:
+                return {"reply": _guardrail_block_reply("browser_vision", gd2)}
+            opened, error = _open_site_urls([(site_key, best_url)], session_id=session_id)
+            if error:
+                return {"reply": error}
+            title = str(first_item.get("title", "")).strip() or "(sin titulo)"
+            return {"reply": f"Abrí el primer resultado para '{query}': {title} - {opened[0]}"}
         ok_g, gd = _guardrail_check(
             session_id,
             "web_search",
