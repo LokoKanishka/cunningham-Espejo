@@ -292,6 +292,32 @@ class TestOpenClawYoutubeAndTools(unittest.TestCase):
         self.assertIsInstance(err, str)
         self.assertIn("no pude verificar apertura real", err.lower())
 
+    def test_open_url_with_context_spawned_window_retries_manual_navigation(self) -> None:
+        with (
+            patch("openclaw_direct_chat._load_browser_profile_config", return_value={"_default": {"browser": "chrome", "profile": "diego"}}),
+            patch("openclaw_direct_chat._expected_profile_directory_for_site", return_value="Profile 1"),
+            patch("openclaw_direct_chat._wmctrl_current_desktop", return_value=1),
+            patch("openclaw_direct_chat._wmctrl_windows_for_desktop", return_value=[]),
+            patch("openclaw_direct_chat._trusted_or_autodetected_dc_anchor", return_value=(None, "anchor_none")),
+            patch("openclaw_direct_chat._fallback_profiled_chrome_anchor_for_workspace", return_value=(None, "fallback_none")),
+            patch("openclaw_direct_chat._spawn_profiled_chrome_anchor_for_workspace", return_value=("0xnew", "spawn_profiled_chrome_ok")),
+            patch("openclaw_direct_chat._xdotool_command", return_value=(0, "ok")) as mock_xdotool,
+            patch(
+                "openclaw_direct_chat._wait_window_title_contains",
+                side_effect=[
+                    (False, "publico - google auth platform - consola de google cloud - google chrome"),
+                    (True, "youtube - google chrome"),
+                ],
+            ) as mock_wait_title,
+            patch("openclaw_direct_chat._wmctrl_list", return_value={"0xnew": "YouTube - Google Chrome"}),
+            patch("openclaw_direct_chat.time.sleep", return_value=None),
+        ):
+            err = direct_chat._open_url_with_site_context("https://www.youtube.com/", "youtube")
+        self.assertIsNone(err)
+        self.assertEqual(mock_wait_title.call_count, 2)
+        key_calls = [c.args[0] for c in mock_xdotool.call_args_list if c.args and c.args[0] and c.args[0][0] == "key"]
+        self.assertTrue(any("ctrl+l" in str(cmd) for cmd in key_calls))
+
     @patch.dict(os.environ, {"DIRECT_CHAT_ISOLATED_WORKSPACE": "1"}, clear=False)
     def test_gemini_write_not_blocked_in_isolated_workspace_mode(self) -> None:
         out = direct_chat._maybe_handle_local_action(

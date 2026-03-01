@@ -4928,7 +4928,7 @@ def _open_url_with_site_context(url: str, site_key: str | None, session_id: str 
             return f"No pude activar ventana objetivo. (win={target})"
         time.sleep(0.10)
 
-        if not skip_typing:
+        def _navigate_target_url() -> str | None:
             rc_l, _ = _xdotool_command(["key", "--window", target, "ctrl+l"], timeout=2.0)
             if rc_l != 0:
                 return f"No pude enfocar barra de direcciones. (win={target})"
@@ -4943,6 +4943,12 @@ def _open_url_with_site_context(url: str, site_key: str | None, session_id: str 
             rc_r, _ = _xdotool_command(["key", "--window", target, "Return"], timeout=2.0)
             if rc_r != 0:
                 return f"No pude enviar Enter. (win={target})"
+            return None
+
+        if not skip_typing:
+            nav_error = _navigate_target_url()
+            if nav_error:
+                return nav_error
 
         terms: list[str] = []
         sk = str(site_key or "").strip().lower()
@@ -4962,6 +4968,14 @@ def _open_url_with_site_context(url: str, site_key: str | None, session_id: str 
             terms = ["google", "youtube", "chatgpt", "gemini", "wikipedia", "gmail"]
         wait_timeout = 12.0 if skip_typing else 7.0
         ok_title, seen = _wait_window_title_contains(target, terms, timeout_s=wait_timeout)
+        if (not ok_title) and skip_typing:
+            # Some Chrome sessions restore a previous tab and ignore the spawn URL.
+            # Force explicit navigation in the same window before failing.
+            nav_error = _navigate_target_url()
+            if nav_error:
+                return nav_error
+            time.sleep(0.12)
+            ok_title, seen = _wait_window_title_contains(target, terms, timeout_s=8.0)
         if not ok_title:
             return f"No pude verificar apertura real (win={target}, seen_title={seen or '(none)'})."
 
