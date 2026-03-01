@@ -8263,6 +8263,12 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         return {"reply": f"Abrí Gemini en {browser_gemini} para esta sesión: {opened[0]}"}
 
     search_req = web_search.extract_web_search_request(message)
+    if search_req and search_req[1] is None:
+        query_implicit, _site_none = search_req
+        has_only_youtube_hint = ("youtube" in site_keys) and (not any(sk in site_keys for sk in ("google", "wikipedia", "chatgpt", "gemini", "gmail")))
+        youtube_intent = wants_search or wants_open or _looks_like_youtube_play_request(normalized)
+        if has_only_youtube_hint and youtube_intent:
+            search_req = (query_implicit, "youtube")
     if "firefox" in allowed_tools and search_req and search_req[1] == "youtube" and _looks_like_youtube_play_request(normalized):
         query = search_req[0]
         ok_g, gd = _guardrail_check(
