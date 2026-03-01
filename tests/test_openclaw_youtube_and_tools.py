@@ -231,6 +231,15 @@ class TestOpenClawYoutubeAndTools(unittest.TestCase):
         _mock_profile,
         _mock_cfg,
     ) -> None:
+        calls = {"n": 0}
+
+        def _wins(_desk_idx: int):
+            calls["n"] += 1
+            if calls["n"] <= 1:
+                return []
+            return [("0xnew", "101", "YouTube - Google Chrome")]
+
+        _mock_windows.side_effect = _wins
         err = direct_chat._open_url_with_site_context("https://www.youtube.com/", "youtube", session_id="sess")
         self.assertIsNone(err)
         verbs = [str(c.args[0][0]) for c in mock_xdotool.call_args_list if c.args and c.args[0]]
@@ -267,6 +276,29 @@ class TestOpenClawYoutubeAndTools(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("youtube_window_not_found_current_desktop", detail)
 
+    @patch("openclaw_direct_chat._xdotool_command", return_value=(0, "ok"))
+    @patch(
+        "openclaw_direct_chat._wmctrl_current_desktop_site_windows",
+        return_value=[
+            ("0xbad", "youtube.com/watch?v=abc123xyz - Google Chrome"),
+            ("0xgood", "TODO ES GEOPOLITICA - YouTube - Google Chrome"),
+        ],
+    )
+    @patch("openclaw_direct_chat._pick_active_site_window_id", return_value=(None, "not_active"))
+    @patch("openclaw_direct_chat._expected_profile_directory_for_site", return_value="Profile 1")
+    def test_youtube_transport_prefers_loaded_video_window_over_raw_url_title(
+        self,
+        _mock_profile,
+        _mock_pick_active,
+        _mock_ws_windows,
+        mock_xdotool,
+    ) -> None:
+        ok, detail = direct_chat._youtube_transport_action("pause", close_window=False, session_id="sess")
+        self.assertTrue(ok)
+        self.assertIn("win=0xgood", detail)
+        first_activate = next((c.args[0] for c in mock_xdotool.call_args_list if c.args and c.args[0] and c.args[0][0] == "windowactivate"), [])
+        self.assertIn("0xgood", first_activate)
+
     @patch("openclaw_direct_chat._load_browser_profile_config", return_value={"_default": {"browser": "chrome", "profile": "diego"}})
     @patch("openclaw_direct_chat._expected_profile_directory_for_site", return_value="Profile 1")
     @patch("openclaw_direct_chat._wmctrl_current_desktop", return_value=1)
@@ -288,6 +320,15 @@ class TestOpenClawYoutubeAndTools(unittest.TestCase):
         _mock_profile,
         _mock_cfg,
     ) -> None:
+        calls = {"n": 0}
+
+        def _wins(_desk_idx: int):
+            calls["n"] += 1
+            if calls["n"] <= 1:
+                return []
+            return [("0xnew", "101", "YouTube - Google Chrome")]
+
+        _mock_windows.side_effect = _wins
         err = direct_chat._open_url_with_site_context("https://www.youtube.com/", "youtube", session_id="sess")
         self.assertIsInstance(err, str)
         self.assertIn("no pude verificar apertura real", err.lower())
@@ -317,6 +358,88 @@ class TestOpenClawYoutubeAndTools(unittest.TestCase):
         self.assertEqual(mock_wait_title.call_count, 2)
         key_calls = [c.args[0] for c in mock_xdotool.call_args_list if c.args and c.args[0] and c.args[0][0] == "key"]
         self.assertTrue(any("ctrl+l" in str(cmd) for cmd in key_calls))
+
+    def test_open_url_with_context_does_not_reuse_dc_anchor_when_new_window_not_detected(self) -> None:
+        with (
+            patch("openclaw_direct_chat._load_browser_profile_config", return_value={"_default": {"browser": "chrome", "profile": "diego"}}),
+            patch("openclaw_direct_chat._expected_profile_directory_for_site", return_value="Profile 1"),
+            patch("openclaw_direct_chat._wmctrl_current_desktop", return_value=1),
+            patch("openclaw_direct_chat._wmctrl_windows_for_desktop", return_value=[]),
+            patch("openclaw_direct_chat._trusted_or_autodetected_dc_anchor", return_value=(None, "anchor_none")),
+            patch("openclaw_direct_chat._fallback_profiled_chrome_anchor_for_workspace", return_value=("0xabc", "fallback_ok")),
+            patch("openclaw_direct_chat._spawn_profiled_chrome_anchor_for_workspace", return_value=(None, "spawn_none")),
+            patch("openclaw_direct_chat._xdotool_command", return_value=(0, "ok")) as mock_xdotool,
+            patch("openclaw_direct_chat.time.sleep", return_value=None),
+        ):
+            err = direct_chat._open_url_with_site_context("https://www.youtube.com/watch?v=abc123xyz", "youtube")
+        self.assertIsInstance(err, str)
+        self.assertIn("nueva ventana segura", str(err).lower())
+        type_calls = [c.args[0] for c in mock_xdotool.call_args_list if c.args and c.args[0] and c.args[0][0] == "type"]
+        self.assertEqual(type_calls, [])
+
+    def test_site_title_looks_loaded_youtube_rejects_raw_watch_title(self) -> None:
+        self.assertFalse(
+            direct_chat._site_title_looks_loaded(
+                "youtube",
+                "https://www.youtube.com/watch?v=abc123xyz",
+                "youtube.com/watch?v=abc123xyz - Google Chrome",
+            )
+        )
+        self.assertTrue(
+            direct_chat._site_title_looks_loaded(
+                "youtube",
+                "https://www.youtube.com/watch?v=abc123xyz",
+                "Todo Es Geopolitica - YouTube - Google Chrome",
+            )
+        )
+
+    def test_open_url_with_context_spawned_window_provisional_title_forces_manual_navigation(self) -> None:
+        with (
+            patch("openclaw_direct_chat._load_browser_profile_config", return_value={"_default": {"browser": "chrome", "profile": "diego"}}),
+            patch("openclaw_direct_chat._expected_profile_directory_for_site", return_value="Profile 1"),
+            patch("openclaw_direct_chat._wmctrl_current_desktop", return_value=1),
+            patch("openclaw_direct_chat._wmctrl_windows_for_desktop", return_value=[]),
+            patch("openclaw_direct_chat._trusted_or_autodetected_dc_anchor", return_value=(None, "anchor_none")),
+            patch("openclaw_direct_chat._fallback_profiled_chrome_anchor_for_workspace", return_value=(None, "fallback_none")),
+            patch("openclaw_direct_chat._spawn_profiled_chrome_anchor_for_workspace", return_value=("0xnew", "spawn_profiled_chrome_ok")),
+            patch("openclaw_direct_chat._xdotool_command", return_value=(0, "ok")) as mock_xdotool,
+            patch(
+                "openclaw_direct_chat._wait_window_title_contains",
+                side_effect=[
+                    (True, "youtube.com/watch?v=abc123xyz - google chrome"),
+                    (True, "todo es geopolitica - youtube - google chrome"),
+                ],
+            ) as mock_wait_title,
+            patch("openclaw_direct_chat._wmctrl_list", return_value={"0xnew": "Todo Es Geopolitica - YouTube - Google Chrome"}),
+            patch("openclaw_direct_chat.time.sleep", return_value=None),
+        ):
+            err = direct_chat._open_url_with_site_context("https://www.youtube.com/watch?v=abc123xyz", "youtube")
+        self.assertIsNone(err)
+        self.assertEqual(mock_wait_title.call_count, 2)
+        key_calls = [c.args[0] for c in mock_xdotool.call_args_list if c.args and c.args[0] and c.args[0][0] == "key"]
+        self.assertTrue(any("ctrl+l" in str(cmd) for cmd in key_calls))
+
+    def test_open_url_with_context_youtube_provisional_title_is_soft_accepted(self) -> None:
+        with (
+            patch("openclaw_direct_chat._load_browser_profile_config", return_value={"_default": {"browser": "chrome", "profile": "diego"}}),
+            patch("openclaw_direct_chat._expected_profile_directory_for_site", return_value="Profile 1"),
+            patch("openclaw_direct_chat._wmctrl_current_desktop", return_value=1),
+            patch("openclaw_direct_chat._wmctrl_windows_for_desktop", return_value=[]),
+            patch("openclaw_direct_chat._trusted_or_autodetected_dc_anchor", return_value=(None, "anchor_none")),
+            patch("openclaw_direct_chat._fallback_profiled_chrome_anchor_for_workspace", return_value=(None, "fallback_none")),
+            patch("openclaw_direct_chat._spawn_profiled_chrome_anchor_for_workspace", return_value=("0xnew", "spawn_profiled_chrome_ok")),
+            patch("openclaw_direct_chat._xdotool_command", return_value=(0, "ok")),
+            patch(
+                "openclaw_direct_chat._wait_window_title_contains",
+                side_effect=[
+                    (False, "youtube.com/watch?v=abc123xyz - google chrome"),
+                    (False, "youtube.com/watch?v=abc123xyz - google chrome"),
+                ],
+            ),
+            patch("openclaw_direct_chat.time.sleep", return_value=None),
+        ):
+            err = direct_chat._open_url_with_site_context("https://www.youtube.com/watch?v=abc123xyz", "youtube")
+        self.assertIsNone(err)
 
     @patch.dict(os.environ, {"DIRECT_CHAT_ISOLATED_WORKSPACE": "1"}, clear=False)
     def test_gemini_write_not_blocked_in_isolated_workspace_mode(self) -> None:
@@ -447,8 +570,9 @@ class TestOpenClawYoutubeAndTools(unittest.TestCase):
     @patch("openclaw_direct_chat._guardrail_check", return_value=(True, "GUARDRAIL_OK"))
     @patch("openclaw_direct_chat._pick_first_youtube_video_url", return_value=("https://www.youtube.com/watch?v=abc123xyz", "ok"))
     @patch("openclaw_direct_chat._open_site_urls", return_value=(["https://www.youtube.com/watch?v=abc123xyz"], None))
+    @patch("openclaw_direct_chat._youtube_transport_action", return_value=(True, "ok action=play"))
     def test_local_action_youtube_natural_language_search_and_play(
-        self, mock_open_urls, mock_pick_video, _mock_guardrail
+        self, mock_play, mock_open_urls, mock_pick_video, _mock_guardrail
     ) -> None:
         out = direct_chat._maybe_handle_local_action(
             "abri youtube y busca noticias de geopolitica de hoy en español, abrilo y dale play",
@@ -465,12 +589,14 @@ class TestOpenClawYoutubeAndTools(unittest.TestCase):
             [("youtube", "https://www.youtube.com/watch?v=abc123xyz")],
             session_id="sess_test",
         )
+        mock_play.assert_called_once_with("play", close_window=False, session_id="sess_test")
 
     @patch("openclaw_direct_chat._guardrail_check", return_value=(True, "GUARDRAIL_OK"))
     @patch("openclaw_direct_chat._pick_first_youtube_video_url", return_value=("https://www.youtube.com/watch?v=abc123xyz", "ok"))
     @patch("openclaw_direct_chat._open_site_urls", return_value=(["https://www.youtube.com/watch?v=abc123xyz"], None))
+    @patch("openclaw_direct_chat._youtube_transport_action", return_value=(True, "ok action=play"))
     def test_local_action_youtube_encontra_video_with_play(
-        self, mock_open_urls, mock_pick_video, _mock_guardrail
+        self, mock_play, mock_open_urls, mock_pick_video, _mock_guardrail
     ) -> None:
         out = direct_chat._maybe_handle_local_action(
             "abrí youtube y encontrá un video de contexto geopolitico actual en espanol, ponelo en play",
@@ -486,6 +612,34 @@ class TestOpenClawYoutubeAndTools(unittest.TestCase):
             [("youtube", "https://www.youtube.com/watch?v=abc123xyz")],
             session_id="sess_test",
         )
+        mock_play.assert_called_once_with("play", close_window=False, session_id="sess_test")
+
+    @patch("openclaw_direct_chat._youtube_try_skip_ads", side_effect=[(1, "ad_skipped"), (0, "no_ad_detected")])
+    @patch("openclaw_direct_chat._youtube_is_progressing", side_effect=[(False, "clock_stalled_0_to_0"), (True, "clock_advanced_0_to_1")])
+    @patch("openclaw_direct_chat._xdotool_command", return_value=(0, "ok"))
+    @patch("openclaw_direct_chat._wmctrl_current_desktop_site_windows", return_value=[("0xabc", "YouTube - Google Chrome")])
+    @patch("openclaw_direct_chat._pick_active_site_window_id", return_value=(None, "not_active"))
+    @patch("openclaw_direct_chat._expected_profile_directory_for_site", return_value="Profile 1")
+    def test_youtube_transport_play_attempts_skip_ads_then_toggles(
+        self,
+        _mock_profile,
+        _mock_pick_active,
+        _mock_ws_windows,
+        mock_xdotool,
+        mock_progress,
+        mock_skip_ads,
+    ) -> None:
+        ok, detail = direct_chat._youtube_transport_action("play", close_window=False, session_id="sess")
+        self.assertTrue(ok)
+        self.assertIn("skip_clicks=1", detail)
+        self.assertIn("progress_detail=", detail)
+        self.assertEqual(mock_skip_ads.call_count, 2)
+        self.assertEqual(mock_progress.call_count, 2)
+        verbs = [str(c.args[0][0]) for c in mock_xdotool.call_args_list if c.args and c.args[0]]
+        self.assertIn("windowactivate", verbs)
+        self.assertIn("key", verbs)
+        k_calls = [c.args[0] for c in mock_xdotool.call_args_list if c.args and c.args[0] and c.args[0][0] == "key" and "k" in c.args[0]]
+        self.assertGreaterEqual(len(k_calls), 1)
 
     @patch("openclaw_direct_chat._close_recorded_browser_windows", return_value=(1, []))
     def test_local_action_close_web_human_phrase_without_window_word(self, _mock_close) -> None:

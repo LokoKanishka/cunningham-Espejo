@@ -3381,6 +3381,23 @@ def _wait_window_title_contains(win_id: str, terms: list[str], timeout_s: float 
     return False, last
 
 
+def _site_title_looks_loaded(site_key: str | None, url: str, title: str) -> bool:
+    sk = str(site_key or "").strip().lower()
+    t = str(title or "").lower().strip()
+    if not t:
+        return False
+    if any(tok in t for tok in ("about:blank", "new tab")):
+        return False
+    if sk == "youtube":
+        if "youtube" not in t:
+            return False
+        # Provisional title while the page did not really render yet.
+        if ("youtube.com/watch" in t or "youtube.com/results" in t) and (" - youtube" not in t):
+            return False
+        return True
+    return True
+
+
 def _find_new_profiled_chrome_window(
     before_ids: set[str], expected_profile: str | None, max_desktops: int = 16, timeout_s: float = 10.0
 ) -> tuple[str, int | None]:
@@ -3715,22 +3732,232 @@ def _pick_active_site_window_id(
     return None, "active_window_not_in_current_workspace"
 
 
+def _capture_window_snapshot(win_id: str, out_path: Path) -> bool:
+    import_bin = shutil.which("import")
+    if not import_bin:
+        return False
+    try:
+        subprocess.run(
+            [import_bin, "-window", win_id, str(out_path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=4,
+        )
+    except Exception:
+        return False
+    return out_path.exists()
+
+
+def _youtube_try_skip_ads(win_id: str, timeout_s: float = 7.0) -> tuple[int, str]:
+    geom = _xdotool_window_geometry(win_id)
+    if not geom:
+        return 0, "geometry_not_found"
+    gx, gy, gw, gh = geom
+    screen_dir = Path.home() / ".openclaw" / "logs" / "youtube_transport_screens"
+    screen_dir.mkdir(parents=True, exist_ok=True)
+
+    can_ocr = bool(shutil.which("tesseract")) and bool(shutil.which("import"))
+    if not can_ocr:
+        return 0, "skip_ocr_unavailable"
+
+    skip_clicks = 0
+    last_detail = "no_ad_detected"
+    deadline = time.time() + max(1.5, float(timeout_s))
+    loops = 0
+    while time.time() < deadline:
+        loops += 1
+        snap = screen_dir / f"youtube_transport_{int(time.time() * 1000)}.png"
+        if not _capture_window_snapshot(win_id, snap):
+            last_detail = "snapshot_failed"
+            break
+        txt = _ocr_read_text(snap)
+        txt_norm = str(txt or "").lower()
+        has_skip = any(
+            t in txt_norm
+            for t in (
+                "omitir anuncio",
+                "omitir",
+                "skip ad",
+                "skip ads",
+                "saltar anuncio",
+                "saltar",
+            )
+        )
+        has_ad_hint = any(t in txt_norm for t in ("patrocinado", "anuncio", "advertisement", "sponsored"))
+        if has_skip:
+            pt_rel = _ocr_find_phrase_center(
+                snap,
+                [
+                    "omitir anuncio",
+                    "omitir",
+                    "skip ad",
+                    "skip ads",
+                    "saltar anuncio",
+                ],
+            )
+            if pt_rel:
+                px_rel, py_rel = int(pt_rel[0]), int(pt_rel[1])
+                safe_x_min = int(gw * 0.62)
+                safe_y_min = int(gh * 0.28)
+                safe_y_max = int(gh * 0.82)
+                if px_rel >= safe_x_min and safe_y_min <= py_rel <= safe_y_max:
+                    px = gx + px_rel
+                    py = gy + py_rel
+                    _xdotool_command(["mousemove", str(px), str(py)], timeout=2.0)
+                    _xdotool_command(["click", "1"], timeout=2.0)
+                    skip_clicks += 1
+                    last_detail = "ad_detected_skip_clicked"
+                else:
+                    last_detail = "ad_detected_skip_outside_safe_zone"
+            else:
+                # Safety: detect skip-capable ad but avoid blind clicks that can open
+                # advertiser destinations in the active profile.
+                last_detail = "ad_detected_skip_available"
+            time.sleep(0.45)
+            continue
+
+        if skip_clicks > 0 and (not has_ad_hint):
+            return skip_clicks, "ad_skipped"
+        if (not has_ad_hint) and loops >= 2:
+            return skip_clicks, "no_ad_detected"
+        last_detail = "ad_detected_skip_not_available" if has_ad_hint else last_detail
+        time.sleep(0.45)
+    return skip_clicks, last_detail
+
+
+def _youtube_read_playback_second(win_id: str) -> int | None:
+    geom = _xdotool_window_geometry(win_id)
+    if geom:
+        gx, gy, gw, gh = geom
+        # Reveal player controls before OCR, without clicking.
+        mx = gx + max(42, int(gw * 0.18))
+        my = gy + max(42, int(gh * 0.86))
+        _xdotool_command(["mousemove", str(mx), str(my)], timeout=2.0)
+        time.sleep(0.10)
+    screen_dir = Path.home() / ".openclaw" / "logs" / "youtube_transport_screens"
+    screen_dir.mkdir(parents=True, exist_ok=True)
+    snap = screen_dir / f"youtube_clock_{int(time.time() * 1000)}.png"
+    if not _capture_window_snapshot(win_id, snap):
+        return None
+    txt = _ocr_read_text(snap)
+    if not txt:
+        return None
+    # Typical OCR match: "0:03 / 53:41".
+    m = re.search(r"\b(\d{1,2}):(\d{2})\s*/\s*\d{1,2}:\d{2}\b", txt)
+    if not m:
+        # Fallback: first mm:ss token seen in the controls.
+        m = re.search(r"\b(\d{1,2}):(\d{2})\b", txt)
+    if not m:
+        return None
+    try:
+        mm = int(m.group(1))
+        ss = int(m.group(2))
+    except Exception:
+        return None
+    if mm < 0 or ss < 0 or ss >= 60:
+        return None
+    return (mm * 60) + ss
+
+
+def _youtube_is_progressing(win_id: str, wait_s: float = 1.35) -> tuple[bool, str]:
+    t1 = _youtube_read_playback_second(win_id)
+    if t1 is None:
+        return False, "clock_unreadable_t1"
+    time.sleep(max(0.8, float(wait_s)))
+    t2 = _youtube_read_playback_second(win_id)
+    if t2 is None:
+        return False, "clock_unreadable_t2"
+    if t2 > t1:
+        return True, f"clock_advanced_{t1}_to_{t2}"
+    return False, f"clock_stalled_{t1}_to_{t2}"
+
+
+def _youtube_title_is_provisional(title: str) -> bool:
+    t = str(title or "").lower().strip()
+    if not t:
+        return True
+    if "about:blank" in t:
+        return True
+    if "youtube.com/watch" in t or "youtube.com/results" in t:
+        return True
+    return False
+
+
+def _youtube_wait_loaded_title(win_id: str, timeout_s: float = 16.0) -> tuple[bool, str]:
+    deadline = time.time() + max(1.0, float(timeout_s))
+    last = ""
+    while time.time() < deadline:
+        cur = str(_wmctrl_list().get(win_id, "")).strip()
+        if cur:
+            last = cur
+        if cur and ("youtube" in cur.lower()) and (not _youtube_title_is_provisional(cur)):
+            return True, cur
+        time.sleep(0.25)
+    return False, last
+
+
+def _youtube_visual_progress(win_id: str, interval_s: float = 2.8) -> tuple[bool, str]:
+    screen_dir = Path.home() / ".openclaw" / "logs" / "youtube_transport_screens"
+    screen_dir.mkdir(parents=True, exist_ok=True)
+    p1 = screen_dir / f"youtube_visual_{int(time.time() * 1000)}_a.png"
+    p2 = screen_dir / f"youtube_visual_{int(time.time() * 1000)}_b.png"
+    if not _capture_window_snapshot(win_id, p1):
+        return False, "visual_snap_a_failed"
+    time.sleep(max(1.2, float(interval_s)))
+    if not _capture_window_snapshot(win_id, p2):
+        return False, "visual_snap_b_failed"
+    try:
+        h1 = hashlib.sha256(p1.read_bytes()).hexdigest()
+        h2 = hashlib.sha256(p2.read_bytes()).hexdigest()
+    except Exception:
+        return False, "visual_hash_failed"
+    if h1 != h2:
+        return True, "visual_changed"
+    return False, "visual_static"
+
+
+def _best_youtube_window_candidate(wins: list[tuple[str, str]]) -> tuple[str, str] | None:
+    best: tuple[str, str] | None = None
+    best_score = -10**9
+    for idx, item in enumerate(wins):
+        try:
+            wid, title = item
+        except Exception:
+            continue
+        t = str(title or "").lower().strip()
+        # Slight bias to recent windows, but quality dominates.
+        score = idx
+        if " - youtube" in t:
+            score += 30
+        if "youtube - google chrome" in t:
+            score += 8
+        if "youtube.com/watch" in t:
+            # URL-title windows are often still loading/blank.
+            score -= 18
+        if "about:blank" in t:
+            score -= 30
+        if score > best_score:
+            best_score = score
+            best = (str(wid), str(title))
+    return best
+
+
 def _youtube_transport_action(action: str, close_window: bool = False, session_id: str | None = None) -> tuple[bool, str]:
     _ = session_id  # Reserved for future per-session telemetry.
     expected_profile = _expected_profile_directory_for_site("youtube")
     win_id, detail = _pick_active_site_window_id("youtube", expected_profile=expected_profile)
     if not win_id:
         wins = _wmctrl_current_desktop_site_windows("youtube", expected_profile=expected_profile)
-        if wins:
-            win_id = wins[-1][0]
-            detail = wins[-1][1]
+        picked = _best_youtube_window_candidate(wins) if wins else None
+        if picked:
+            win_id, detail = picked
     if not win_id:
         win_id, detail = _pick_active_site_window_id("youtube", expected_profile=None)
     if not win_id:
         wins = _wmctrl_current_desktop_site_windows("youtube", expected_profile=None)
-        if wins:
-            win_id = wins[-1][0]
-            detail = wins[-1][1]
+        picked = _best_youtube_window_candidate(wins) if wins else None
+        if picked:
+            win_id, detail = picked
     if not win_id:
         return False, f"youtube_window_not_found_current_desktop profile={expected_profile}"
 
@@ -3739,17 +3966,118 @@ def _youtube_transport_action(action: str, close_window: bool = False, session_i
         return False, f"window_activate_failed win={win_id}"
     time.sleep(0.16)
 
-    # YouTube keyboard control: 'k' toggles play/pause consistently across layouts.
-    rc_key, _ = _xdotool_command(["key", "--window", win_id, "k"], timeout=2.0)
-    if rc_key != 0:
-        return False, f"youtube_key_toggle_failed win={win_id}"
+    action_norm = str(action or "").strip().lower()
+    skip_clicks = 0
+    skip_detail = "n/a"
+    progress_detail = "n/a"
+    load_detail = "n/a"
+    toggle_count = 0
+    if action_norm == "play":
+        cur_title = str(_wmctrl_list().get(win_id, detail or "")).strip()
+        if _youtube_title_is_provisional(cur_title):
+            load_url = "https://www.youtube.com/"
+            m_watch = re.search(r"(youtube\.com/watch\?[^\s]+)", cur_title, flags=re.IGNORECASE)
+            if m_watch:
+                cand = str(m_watch.group(1) or "").strip().strip("'\"")
+                cand = cand.rstrip(")").rstrip("]").rstrip("}")
+                load_url = f"https://{cand}"
+            _xdotool_command(["key", "--window", win_id, "ctrl+l"], timeout=2.0)
+            time.sleep(0.08)
+            _xdotool_command(
+                ["type", "--delay", "14", "--clearmodifiers", "--window", win_id, load_url],
+                timeout=8.0,
+            )
+            time.sleep(0.08)
+            _xdotool_command(["key", "--window", win_id, "Return"], timeout=2.0)
+            ok_loaded, loaded_title = _youtube_wait_loaded_title(win_id, timeout_s=16.0)
+            if ok_loaded:
+                detail = loaded_title
+                load_detail = "forced_load_ok"
+            else:
+                load_detail = f"forced_load_failed:{loaded_title[:80]}"
+        else:
+            load_detail = "already_loaded"
+        # Dismiss possible UI overlays and attempt "Skip Ad" before toggling play.
+        _xdotool_command(["key", "--window", win_id, "Escape"], timeout=1.5)
+        skip_clicks, skip_detail = _youtube_try_skip_ads(win_id, timeout_s=7.0)
+
+    rc_key = 0
+    if action_norm != "play":
+        # YouTube keyboard control: 'k' toggles play/pause consistently across layouts.
+        rc_key, _ = _xdotool_command(["key", "--window", win_id, "k"], timeout=2.0)
+        if rc_key != 0:
+            return False, f"youtube_key_toggle_failed win={win_id}"
+
+    if action_norm == "play":
+        pre_progressing, pre_progress_detail = _youtube_is_progressing(win_id, wait_s=1.1)
+        if pre_progressing:
+            progress_detail = f"already_playing:{pre_progress_detail}"
+        elif str(skip_detail).startswith("ad_detected"):
+            # Avoid toggling while an ad is still detected, to prevent pausing
+            # autoplay at 0:00.
+            pre2_progressing, pre2_detail = _youtube_is_progressing(win_id, wait_s=1.1)
+            if pre2_progressing:
+                progress_detail = f"ad_detected_playing:{pre_progress_detail};confirm={pre2_detail}"
+            else:
+                rc_key, _ = _xdotool_command(["key", "--window", win_id, "k"], timeout=2.0)
+                if rc_key != 0:
+                    return False, f"youtube_key_toggle_failed win={win_id}"
+                toggle_count += 1
+                progress_detail = f"ad_detected_toggle_once:{pre_progress_detail};confirm={pre2_detail}"
+        else:
+            rc_key, _ = _xdotool_command(["key", "--window", win_id, "k"], timeout=2.0)
+            if rc_key != 0:
+                return False, f"youtube_key_toggle_failed win={win_id}"
+            toggle_count += 1
+        # Some ad chains show another skip button right after toggling.
+        extra_clicks, extra_detail = _youtube_try_skip_ads(win_id, timeout_s=2.2)
+        skip_clicks += extra_clicks
+        if extra_clicks > 0 or skip_detail in ("n/a", "no_ad_detected"):
+            skip_detail = extra_detail
+        progressing, progress_detail = _youtube_is_progressing(win_id, wait_s=1.35)
+        if (not progressing) and str(progress_detail).startswith("clock_stalled"):
+            # If autoplay already started, first toggle can pause at 0:00.
+            # Re-toggle once and verify progress again.
+            _xdotool_command(["key", "--window", win_id, "k"], timeout=2.0)
+            toggle_count += 1
+            time.sleep(0.20)
+            progressing2, progress_detail2 = _youtube_is_progressing(win_id, wait_s=1.35)
+            progress_detail = f"{progress_detail};retoggle={progress_detail2}"
+            if not progressing2:
+                _xdotool_command(["key", "--window", win_id, "Escape"], timeout=1.5)
+        if (not progressing) and str(progress_detail).startswith("clock_unreadable"):
+            vis_ok, vis_detail = _youtube_visual_progress(win_id, interval_s=2.6)
+            if vis_ok:
+                progressing = True
+                progress_detail = f"{progress_detail};{vis_detail}"
+            elif toggle_count <= 0:
+                rc_key, _ = _xdotool_command(["key", "--window", win_id, "k"], timeout=2.0)
+                if rc_key == 0:
+                    toggle_count += 1
+                    time.sleep(0.20)
+                    vis_ok2, vis_detail2 = _youtube_visual_progress(win_id, interval_s=2.6)
+                    if vis_ok2:
+                        progressing = True
+                    progress_detail = f"{progress_detail};retoggle_visual={vis_detail2}"
+        if _youtube_title_is_provisional(str(_wmctrl_list().get(win_id, detail or ""))):
+            return False, f"youtube_not_loaded_after_play win={win_id} load_detail={load_detail}"
+        final_title = str(_wmctrl_list().get(win_id, detail or "")).lower().strip()
+        if "youtube" not in final_title:
+            return False, f"youtube_navigation_lost win={win_id} title={final_title[:120]}"
+        if not progressing:
+            return False, f"youtube_play_not_confirmed win={win_id} detail={progress_detail}"
 
     if close_window:
         time.sleep(0.15)
         if not _wmctrl_close_window(win_id):
             return False, f"youtube_close_failed win={win_id}"
 
-    return True, f"ok action={action} close={int(close_window)} win={win_id} detail={detail[:120]}"
+    return (
+        True,
+        f"ok action={action_norm or action} close={int(close_window)} win={win_id} "
+        f"load_detail={load_detail} toggle_count={toggle_count} skip_clicks={skip_clicks} skip_detail={skip_detail} "
+        f"progress_detail={progress_detail} detail={detail[:120]}",
+    )
 
 
 def _extract_gemini_write_request(message: str) -> str | None:
@@ -4918,10 +5246,26 @@ def _open_url_with_site_context(url: str, site_key: str | None, session_id: str 
                     break
                 time.sleep(0.08)
             if not target:
-                target = anchor
+                retry_spawn = _spawn_profiled_chrome_anchor_for_workspace(desk, profile, initial_url=str(url))
+                retry_target = ""
+                if isinstance(retry_spawn, tuple) and len(retry_spawn) >= 2:
+                    retry_target = str(retry_spawn[0] or "").strip()
+                if retry_target:
+                    target = retry_target
+                    skip_typing = True
+                else:
+                    return (
+                        "No pude abrir nueva ventana segura para navegar URL "
+                        "(evité reutilizar la ventana de chat)."
+                    )
 
             _xdotool_command(["windowactivate", target], timeout=2.5)
             time.sleep(0.10)
+
+        if (not skip_typing) and target.lower() == anchor.lower():
+            anchor_title = str(_wmctrl_list().get(anchor, "")).lower().strip()
+            if "molbot direct chat" in anchor_title:
+                return "No pude abrir nueva ventana segura (evité escribir URL sobre Molbot Direct Chat)."
 
         rc_a, _ = _xdotool_command(["windowactivate", target], timeout=2.5)
         if rc_a != 0:
@@ -4968,6 +5312,8 @@ def _open_url_with_site_context(url: str, site_key: str | None, session_id: str 
             terms = ["google", "youtube", "chatgpt", "gemini", "wikipedia", "gmail"]
         wait_timeout = 12.0 if skip_typing else 7.0
         ok_title, seen = _wait_window_title_contains(target, terms, timeout_s=wait_timeout)
+        if ok_title and (not _site_title_looks_loaded(site_key, str(url), str(seen))):
+            ok_title = False
         if (not ok_title) and skip_typing:
             # Some Chrome sessions restore a previous tab and ignore the spawn URL.
             # Force explicit navigation in the same window before failing.
@@ -4975,7 +5321,16 @@ def _open_url_with_site_context(url: str, site_key: str | None, session_id: str 
             if nav_error:
                 return nav_error
             time.sleep(0.12)
-            ok_title, seen = _wait_window_title_contains(target, terms, timeout_s=8.0)
+            retry_timeout = 20.0 if sk == "youtube" else 8.0
+            ok_title, seen = _wait_window_title_contains(target, terms, timeout_s=retry_timeout)
+            if ok_title and (not _site_title_looks_loaded(site_key, str(url), str(seen))):
+                ok_title = False
+        if (not ok_title) and sk == "youtube":
+            seen_norm = str(seen or "").lower().strip()
+            if "youtube.com/watch" in seen_norm or "youtube.com/results" in seen_norm:
+                # Allow the downstream YouTube transport step to finish playback
+                # even when Chrome still reports a provisional URL-title.
+                ok_title = True
         if not ok_title:
             return f"No pude verificar apertura real (win={target}, seen_title={seen or '(none)'})."
 
@@ -8337,7 +8692,10 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         opened, error = _open_site_urls([("youtube", video_url)], session_id=session_id)
         if error:
             return {"reply": error}
-        return {"reply": f"Abrí y reproduzco un video de YouTube sobre '{query}': {opened[0]}"}
+        ok_play, play_detail = _youtube_transport_action("play", close_window=False, session_id=session_id)
+        if ok_play:
+            return {"reply": f"Abrí y reproduzco un video de YouTube sobre '{query}': {opened[0]}"}
+        return {"reply": f"Abrí el video de YouTube sobre '{query}', pero no pude confirmar play real. ({play_detail})"}
 
     if search_req and ("web_search" in allowed_tools):
         query, site_key = search_req
