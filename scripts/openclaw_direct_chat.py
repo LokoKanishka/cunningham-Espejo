@@ -5116,6 +5116,23 @@ def _looks_like_open_first_result_request(normalized: str) -> bool:
     return not asks_many
 
 
+def _extract_youtube_search_intent_query(message: str) -> str | None:
+    text = str(message or "").strip()
+    if not text:
+        return None
+    m = re.search(
+        r"(?:en\s+)?(?:you\s*tube|youtube)\b.*?(?:busca|buscá|buscar|investiga|investigar|search|encontra|encontrá|encontrar)\s+(.+)$",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not m:
+        return None
+    q = _sanitize_youtube_query(m.group(1) or "")
+    if not q:
+        return None
+    return q[:400]
+
+
 def _sanitize_youtube_query(query: str) -> str:
     q = (query or "").strip().strip("\"'").strip()
     if not q:
@@ -8044,12 +8061,21 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
             return {"reply": f"Listo: reanudé YouTube. ({detail})"}
         return {"reply": f"Listo: pausé YouTube. ({detail})"}
 
+    close_words = any(k in normalized for k in ("cerr", "close", "cierra"))
+    close_web_human_variant = bool(
+        re.search(r"\blo\s+que\s+abriste\b", normalized, flags=re.IGNORECASE)
+        or re.search(r"\babriste\s+reci[eé]n\b", normalized, flags=re.IGNORECASE)
+    )
+
     # Close browser windows opened by this system (tracked by session).
     # Examples:
     # - "cerrá las ventanas web que abriste"
     # - "reset ventanas web"
-    if any(k in normalized for k in ("web", "navegador", "browser")) and any(k in normalized for k in ("ventan", "windows")):
-        if any(k in normalized for k in ("cerr", "close", "cierra")):
+    if (
+        (any(k in normalized for k in ("web", "navegador", "browser")) and any(k in normalized for k in ("ventan", "windows")))
+        or (close_words and close_web_human_variant and any(k in normalized for k in ("web", "navegador", "browser")))
+    ):
+        if close_words:
             closed, errors = _close_recorded_browser_windows(session_id=session_id)
             if closed == 0 and not errors:
                 fallback_closed, _fallback_details = _close_known_site_windows_in_current_workspace(max_windows=12)
@@ -8237,7 +8263,9 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
 
     site_keys = _canonical_site_keys(message)
     wants_open = _looks_like_open_request(normalized)
-    wants_search = ("busc" in normalized) or any(k in normalized for k in ("search", "investiga", "investigar"))
+    wants_search = ("busc" in normalized) or any(
+        k in normalized for k in ("search", "investiga", "investigar", "encontra", "encontrá", "encontrar")
+    )
     wants_new_chat = any(k in normalized for k in ("chat nuevo", "nuevo chat", "iniciar una conversacion", "iniciar conversacion"))
     topic = _extract_topic(message)
 
@@ -8263,6 +8291,10 @@ def _maybe_handle_local_action(message: str, allowed_tools: set[str], session_id
         return {"reply": f"Abrí Gemini en {browser_gemini} para esta sesión: {opened[0]}"}
 
     search_req = web_search.extract_web_search_request(message)
+    if not search_req and ("youtube" in site_keys) and _looks_like_youtube_play_request(normalized):
+        yt_query = _extract_youtube_search_intent_query(message)
+        if yt_query:
+            search_req = (yt_query, "youtube")
     if search_req and search_req[1] is None:
         query_implicit, _site_none = search_req
         has_only_youtube_hint = ("youtube" in site_keys) and (not any(sk in site_keys for sk in ("google", "wikipedia", "chatgpt", "gemini", "gmail")))

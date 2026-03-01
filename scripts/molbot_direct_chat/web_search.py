@@ -11,7 +11,7 @@ SITE_DOMAIN_FILTERS = {
     "youtube": "youtube.com",
     "wikipedia": "wikipedia.org",
 }
-SEARCH_VERB_RE = r"(?:busca|buscá|buscar|investiga|investigar|search)"
+SEARCH_VERB_RE = r"(?:busca|buscá|buscar|investiga|investigar|search|encontra|encontrá|encontrar)"
 WEB_DEST_RE = r"(youtube|wikipedia|google|internet|la\s+red|web|la\s+web)"
 
 
@@ -140,8 +140,9 @@ def extract_web_search_request(message: str) -> tuple[str, str | None] | None:
             return q[:400], where
 
     # "youtube|wikipedia|google busca: <tema>" (sin "en")
+    # also accepts punctuation after site key: "youtube: busca <tema>"
     m = re.search(
-        rf"(youtube|wikipedia|google)\s+{SEARCH_VERB_RE}\s*[:,-]?\s*(.+)$",
+        rf"(youtube|wikipedia|google)\s*[:,-]?\s+{SEARCH_VERB_RE}\s*[:,-]?\s*(.+)$",
         msg,
         flags=re.IGNORECASE | re.DOTALL,
     )

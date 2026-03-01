@@ -441,6 +441,38 @@ class TestOpenClawYoutubeAndTools(unittest.TestCase):
         )
 
     @patch("openclaw_direct_chat._guardrail_check", return_value=(True, "GUARDRAIL_OK"))
+    @patch("openclaw_direct_chat._pick_first_youtube_video_url", return_value=("https://www.youtube.com/watch?v=abc123xyz", "ok"))
+    @patch("openclaw_direct_chat._open_site_urls", return_value=(["https://www.youtube.com/watch?v=abc123xyz"], None))
+    def test_local_action_youtube_encontra_video_with_play(
+        self, mock_open_urls, mock_pick_video, _mock_guardrail
+    ) -> None:
+        out = direct_chat._maybe_handle_local_action(
+            "abrí youtube y encontrá un video de contexto geopolitico actual en espanol, ponelo en play",
+            {"firefox", "web_search", "web_ask", "desktop", "model"},
+            "sess_test",
+        )
+        self.assertIsNotNone(out)
+        reply = str(out.get("reply", "")).lower()
+        self.assertIn("reproduzco un video de youtube", reply)
+        q = str((mock_pick_video.call_args.args[0] if mock_pick_video.call_args else "")).lower()
+        self.assertIn("contexto geopolitico actual en espanol", q)
+        mock_open_urls.assert_called_once_with(
+            [("youtube", "https://www.youtube.com/watch?v=abc123xyz")],
+            session_id="sess_test",
+        )
+
+    @patch("openclaw_direct_chat._close_recorded_browser_windows", return_value=(1, []))
+    def test_local_action_close_web_human_phrase_without_window_word(self, _mock_close) -> None:
+        out = direct_chat._maybe_handle_local_action(
+            "cerrá lo que abriste recién en la web",
+            {"firefox", "web_search", "web_ask", "desktop", "model"},
+            "sess_test",
+        )
+        self.assertIsNotNone(out)
+        reply = str(out.get("reply", "")).lower()
+        self.assertIn("cerré 1 ventana", reply)
+
+    @patch("openclaw_direct_chat._guardrail_check", return_value=(True, "GUARDRAIL_OK"))
     @patch(
         "openclaw_direct_chat.web_search.searxng_search",
         return_value={

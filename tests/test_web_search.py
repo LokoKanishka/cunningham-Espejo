@@ -41,6 +41,20 @@ class TestWebSearchExtraction(unittest.TestCase):
         self.assertEqual(site, "google")
         self.assertEqual(q, "fotosintesis")
 
+    def test_extract_web_search_request_youtube_site_first_with_colon(self) -> None:
+        req = web_search.extract_web_search_request("youtube: busca debate geopolitica hoy en espanol")
+        self.assertIsNotNone(req)
+        q, site = req  # type: ignore[misc]
+        self.assertEqual(site, "youtube")
+        self.assertEqual(q, "debate geopolitica hoy en espanol")
+
+    def test_extract_web_search_request_en_youtube_encontra(self) -> None:
+        req = web_search.extract_web_search_request("en youtube encontra resumen geopolitico de hoy")
+        self.assertIsNotNone(req)
+        q, site = req  # type: ignore[misc]
+        self.assertEqual(site, "youtube")
+        self.assertEqual(q, "resumen geopolitico de hoy")
+
 
 if __name__ == "__main__":
     unittest.main()
