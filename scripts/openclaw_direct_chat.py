@@ -964,16 +964,16 @@ def _stt_voice_text_normalize(text: str) -> str:
 def _stt_segmentation_profile(chat_enabled: bool) -> dict:
     if bool(chat_enabled):
         # Chat profile tuned for lower end-to-end latency while keeping basic stability.
-        min_ms = max(120, _int_env("DIRECT_CHAT_STT_CHAT_MIN_SEGMENT_MS", 140))
+        min_ms = max(120, _int_env("DIRECT_CHAT_STT_CHAT_MIN_SEGMENT_MS", 180))
         return {
             "min_speech_ms": int(min_ms),
             "chat_min_speech_ms": int(min_ms),
-            "max_silence_ms": int(max(220, _int_env("DIRECT_CHAT_STT_CHAT_MAX_SILENCE_MS", 420))),
+            "max_silence_ms": int(max(220, _int_env("DIRECT_CHAT_STT_CHAT_MAX_SILENCE_MS", 450))),
             "max_segment_s": float(max(1.8, _float_env("DIRECT_CHAT_STT_CHAT_MAX_SEGMENT_SEC", 3.2))),
         }
     return {
         "min_speech_ms": int(max(100, _int_env("DIRECT_CHAT_STT_MIN_SPEECH_MS", 180))),
-        "chat_min_speech_ms": int(max(100, _int_env("DIRECT_CHAT_STT_CHAT_MIN_SPEECH_MS", 140))),
+        "chat_min_speech_ms": int(max(100, _int_env("DIRECT_CHAT_STT_CHAT_MIN_SPEECH_MS", 180))),
         "max_silence_ms": int(max(140, _int_env("DIRECT_CHAT_STT_MAX_SILENCE_MS", 280))),
         "max_segment_s": float(max(1.2, _float_env("DIRECT_CHAT_STT_MAX_SEGMENT_SEC", 1.8))),
     }
