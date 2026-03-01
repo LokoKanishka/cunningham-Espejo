@@ -20,6 +20,16 @@ When the user says "como humano en el chat" (or equivalent), this is mandatory:
 4. Prefer real UI input/send behavior over internal shortcuts/APIs.
 5. This mode is used specifically to test real interface behavior and detect UI failures.
 
+# Lucy Validation Rule (Permanent)
+
+When the goal is to verify whether **Lucy** can perform an action in `dc` (for example search/open/play flows), this is mandatory:
+
+1. Do **not** execute the target chat command yourself as the agent.
+2. Ask Lucy to run the command in `Molbot Direct Chat`.
+3. Use Lucy's real outcome (success/failure) as the source of truth for debugging.
+4. After Lucy runs it, you may inspect logs/history/events/windows to diagnose and fix issues.
+5. Only run the command yourself if the user explicitly asks for an agent-run control test; otherwise first ask permission and explain briefly why.
+
 # User Aliases (Permanent)
 
 Interpret these aliases as fixed terms in this repository:
