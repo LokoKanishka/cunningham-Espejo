@@ -13,5 +13,5 @@ echo
 echo "== infra (key services) =="
 ./scripts/compose_infra.sh ps | awk '
 NR==1 { print; next }
-/lucy_brain_n8n|lucy_brain_runners|lucy_hands_antigravity|lucy_eyes_searxng|lucy_manos_runner|lucy_ui_panel/ { print }
+/lucy_brain_n8n|lucy_brain_runners|lucy_hands_codex_runner|lucy_eyes_searxng|lucy_manos_runner|lucy_ui_panel/ { print }
 '

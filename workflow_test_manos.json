@@ -38,8 +38,8 @@
         450,
         200
       ],
-      "id": "antigravity",
-      "name": "Antigravity (C\u00e1lculo)"
+      "id": "codex-runner",
+      "name": "Codex Runner (C\u00e1lculo)"
     },
     {
       "parameters": {
@@ -107,7 +107,7 @@
       "main": [
         [
           {
-            "node": "Antigravity (C\u00e1lculo)",
+            "node": "Codex Runner (C\u00e1lculo)",
             "type": "main",
             "index": 0
           },

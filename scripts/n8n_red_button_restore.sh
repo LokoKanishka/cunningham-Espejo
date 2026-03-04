@@ -65,7 +65,7 @@ PY
     docker exec -u node "$CONTAINER" n8n update:workflow --id="$wid" --active=true >/dev/null || true
   done
 
-  URL_MODE=hardcoded ANTIGRAVITY_TARGET_URL="http://127.0.0.1:5000/execute" ./scripts/n8n_set_antigravity_url.sh >/dev/null || true
+  URL_MODE=hardcoded CODEX_RUNNER_TARGET_URL="http://127.0.0.1:5000/execute" ./scripts/n8n_set_codex_runner_url.sh >/dev/null || true
   docker restart "$CONTAINER" >/dev/null
 }
 

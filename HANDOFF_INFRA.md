@@ -98,12 +98,12 @@
 - Full DR drill (backup -> simulated wipe -> restore -> smoke):
   - `./scripts/dr_drill.sh`
 
-## Antigravity URL in Test_Manos
+## Codex Runner URL in Test_Manos
 - Normalization script:
-  - `./scripts/n8n_set_antigravity_url.sh`
+  - `./scripts/n8n_set_codex_runner_url.sh`
 - Default mode uses hardcoded URL (`http://127.0.0.1:5000/execute`) to avoid blocked env access in node expressions.
 - Optional env mode:
-  - `URL_MODE=env ./scripts/n8n_set_antigravity_url.sh`
+  - `URL_MODE=env ./scripts/n8n_set_codex_runner_url.sh`
 
 ## Automated daily backup (systemd user timer)
 - Install/update timer:

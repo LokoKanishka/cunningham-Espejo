@@ -4,8 +4,8 @@ set -euo pipefail
 DB_PATH="${DB_PATH:-data/n8n/database.sqlite}"
 WORKFLOW_NAME="${WORKFLOW_NAME:-Test_Manos}"
 URL_MODE="${URL_MODE:-hardcoded}" # hardcoded | env
-ANTIGRAVITY_TARGET_URL="${ANTIGRAVITY_TARGET_URL:-http://127.0.0.1:5000/execute}"
-export DB_PATH WORKFLOW_NAME URL_MODE ANTIGRAVITY_TARGET_URL
+CODEX_RUNNER_TARGET_URL="${CODEX_RUNNER_TARGET_URL:-http://127.0.0.1:5000/execute}"
+export DB_PATH WORKFLOW_NAME URL_MODE CODEX_RUNNER_TARGET_URL
 
 python3 - <<'PY'
 import json
@@ -24,15 +24,19 @@ if not row:
 nodes=json.loads(row['nodes'])
 changed=0
 if os.environ['URL_MODE'] == 'env':
-    target_url='={{$env.ANTIGRAVITY_URL}}/execute'
+    target_url='={{$env.CODEX_RUNNER_URL}}/execute'
 else:
-    target_url=os.environ['ANTIGRAVITY_TARGET_URL']
+    target_url=os.environ['CODEX_RUNNER_TARGET_URL']
 for n in nodes:
     if n.get('type')!='n8n-nodes-base.httpRequest':
         continue
     params=n.get('parameters') or {}
     url=params.get('url')
-    if isinstance(url,str) and ('127.0.0.1:5000/execute' in url or 'antigravity' in url.lower() or '{{$env.ANTIGRAVITY_URL}}' in url):
+    if isinstance(url,str) and (
+        '127.0.0.1:5000/execute' in url or
+        'codex_runner' in url.lower() or
+        '{{$env.CODEX_RUNNER_URL}}' in url
+    ):
         params['url']=target_url
         n['parameters']=params
         changed+=1

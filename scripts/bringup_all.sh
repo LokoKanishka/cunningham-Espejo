@@ -3,7 +3,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 RUN_STRESS="${RUN_STRESS:-false}"
-SERVICES="${SERVICES:-n8n antigravity searxng}"
+SERVICES="${SERVICES:-n8n codex_runner searxng}"
 APPLY_GATEWAY_PATCH="${APPLY_GATEWAY_PATCH:-true}"
 
 echo "[bringup] init IPC layout"
@@ -30,7 +30,7 @@ wait_http() {
 }
 
 wait_http "n8n" "http://127.0.0.1:5678/healthz"
-wait_http "antigravity" "http://127.0.0.1:5000/healthz"
+wait_http "codex_runner" "http://127.0.0.1:5000/healthz"
 wait_http "searxng" "http://127.0.0.1:8080/"
 
 if [[ "$APPLY_GATEWAY_PATCH" == "true" ]]; then
@@ -38,7 +38,7 @@ if [[ "$APPLY_GATEWAY_PATCH" == "true" ]]; then
   ./scripts/n8n_patch_lucy_gateway_v1.sh
   echo "[bringup] applying Lucy Outbox v1 patch"
   ./scripts/n8n_patch_lucy_outbox_v1.sh
-  URL_MODE=hardcoded ANTIGRAVITY_TARGET_URL="http://127.0.0.1:5000/execute" ./scripts/n8n_set_antigravity_url.sh >/dev/null || true
+  URL_MODE=hardcoded CODEX_RUNNER_TARGET_URL="http://127.0.0.1:5000/execute" ./scripts/n8n_set_codex_runner_url.sh >/dev/null || true
   ./scripts/compose_infra.sh restart n8n >/dev/null
   wait_http "n8n-post-patch" "http://127.0.0.1:5678/healthz"
 fi
@@ -48,7 +48,7 @@ if ! ./scripts/webhook_smoke.sh; then
   echo "[bringup] smoke failed, diagnostics:"
   ./scripts/compose_infra.sh ps
   docker logs --tail 120 lucy_brain_n8n || true
-  docker logs --tail 120 lucy_hands_antigravity || true
+  docker logs --tail 120 lucy_hands_codex_runner || true
   exit 1
 fi
 

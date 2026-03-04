@@ -56,7 +56,7 @@ services:
       - N8N_PYTHON_ENABLED=false
       - GENERIC_TIMEZONE=America/Argentina/Buenos_Aires
       - N8N_RESTRICT_FILE_ACCESS_TO=/data/lucy_ipc;/home/node/.n8n-files
-      - ANTIGRAVITY_URL=http://127.0.0.1:5000
+      - CODEX_RUNNER_URL=http://127.0.0.1:5000
       - LUCY_IPC_INBOX=/data/lucy_ipc/inbox
       - LUCY_IPC_DEADLETTER=/data/lucy_ipc/deadletter
       - NODE_FUNCTION_ALLOW_BUILTIN=fs,path,crypto
@@ -64,7 +64,7 @@ services:
       # (Se puede ajustar PUID/PGID si es necesario, pero host mode simplifica esto)
     volumes:
       - ./data/n8n:/home/node/.n8n
-      - ./workspace:/data/workspace:rw # Intercambio con Antigravity
+      - ./workspace:/data/workspace:rw # Intercambio con Codex Runner
       - ./ipc:/data/lucy_ipc:rw # RAM Disk para IPC
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:5678/healthz || exit 1"]
@@ -145,18 +145,18 @@ services:
       - SETUID
 
   # ----------------------------------------------------------------
-  # MANOS (VIRTUALES): Antigravity (Sandbox de Ejecución)
+  # MANOS (VIRTUALES): Codex Runner (Sandbox de Ejecución)
   # Modo: Isolated Bridge (Sin internet)
-  # Nota: Usamos una imagen local construida desde ./antigravity
+  # Nota: Usamos una imagen local construida desde ./codex_runner
   # ----------------------------------------------------------------
-  antigravity:
-    build: ./antigravity
-    image: lucy_antigravity:local
-    container_name: lucy_hands_antigravity
+  codex_runner:
+    build: ./codex_runner
+    image: lucy_codex_runner:local
+    container_name: lucy_hands_codex_runner
     user: "0:0"
     networks:
-      - antigravity_isolated
-      - antigravity_host
+      - codex_runner_isolated
+      - codex_runner_host
     ports:
       - "127.0.0.1:5000:5000" # API accesible solo desde host (n8n)
     read_only: true
@@ -167,8 +167,8 @@ services:
     cap_drop:
       - ALL
     environment:
-      - ANTIGRAVITY_DEFAULT_TIMEOUT_S=30
-      - ANTIGRAVITY_MAX_TIMEOUT_S=30
+      - CODEX_RUNNER_DEFAULT_TIMEOUT_S=30
+      - CODEX_RUNNER_MAX_TIMEOUT_S=30
     volumes:
       - ./workspace:/workspace:rw # Volumen compartido para entregar artefactos
     deploy:
@@ -231,10 +231,10 @@ services:
 networks:
   lucy_internal:
     driver: bridge
-  antigravity_isolated:
+  codex_runner_isolated:
     driver: bridge
     internal: true # Bloqueo total de salida a internet
-  antigravity_host:
+  codex_runner_host:
     driver: bridge
     driver_opts:
       com.docker.network.bridge.enable_ip_masquerade: "false"

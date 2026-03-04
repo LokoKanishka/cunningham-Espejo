@@ -11,10 +11,10 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 
-app = FastAPI(title="Antigravity Sandbox")
+app = FastAPI(title="Codex Runner Sandbox")
 
-WORKSPACE_ROOT = Path(os.environ.get("ANTIGRAVITY_WORKSPACE", "/workspace"))
-RUNS_DIR = WORKSPACE_ROOT / "antigravity_runs"
+WORKSPACE_ROOT = Path(os.environ.get("CODEX_RUNNER_WORKSPACE", "/workspace"))
+RUNS_DIR = WORKSPACE_ROOT / "codex_runner_runs"
 
 
 def _env_int(name: str, default: int) -> int:
@@ -27,8 +27,8 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-DEFAULT_TIMEOUT_S = _env_int("ANTIGRAVITY_DEFAULT_TIMEOUT_S", 30)
-MAX_TIMEOUT_S = _env_int("ANTIGRAVITY_MAX_TIMEOUT_S", 30)
+DEFAULT_TIMEOUT_S = _env_int("CODEX_RUNNER_DEFAULT_TIMEOUT_S", 30)
+MAX_TIMEOUT_S = _env_int("CODEX_RUNNER_MAX_TIMEOUT_S", 30)
 
 
 @app.get("/healthz")

@@ -12,6 +12,7 @@ backups/
 node_modules/
 output_playwright_*.png
 output/
+runtime/
 
 # Secrets / local config
 .env

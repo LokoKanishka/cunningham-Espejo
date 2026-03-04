@@ -38,10 +38,25 @@ _VRAM_CACHE = {"ts": 0.0, "data": None}
 _MODEL_CATALOG_CACHE = {"ts": 0.0, "data": None}
 
 
-HISTORY_DIR = Path.home() / ".openclaw" / "direct_chat_histories"
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+PROJECT_RUNTIME_DIR = Path(os.environ.get("OPENCLAW_RUNTIME_DIR", str(PROJECT_ROOT / "runtime"))).expanduser()
+PROJECT_STATE_DIR = Path(os.environ.get("OPENCLAW_STATE_DIR", str(PROJECT_RUNTIME_DIR / "openclaw"))).expanduser()
+
+
+def _state_path(env_name: str, default_name: str) -> Path:
+    raw = str(os.environ.get(env_name, "")).strip()
+    if raw:
+        return Path(raw).expanduser()
+    return PROJECT_STATE_DIR / default_name
+
+
+HISTORY_DIR = _state_path("DIRECT_CHAT_HISTORY_DIR", "direct_chat_histories")
 HISTORY_DIR.mkdir(parents=True, exist_ok=True)
-PROFILE_CONFIG_PATH = Path.home() / ".openclaw" / "direct_chat_browser_profiles.json"
-DIRECT_CHAT_ENV_PATH = Path(os.environ.get("OPENCLAW_DIRECT_CHAT_ENV", str(Path.home() / ".openclaw" / "direct_chat.env")))
+PROFILE_CONFIG_PATH = _state_path("DIRECT_CHAT_PROFILE_CONFIG_PATH", "direct_chat_browser_profiles.json")
+DIRECT_CHAT_ENV_PATH = Path(
+    os.environ.get("OPENCLAW_DIRECT_CHAT_ENV", str(PROJECT_RUNTIME_DIR / "direct_chat.env"))
+).expanduser()
 GUARDRAIL_SCRIPT_PATH = Path(__file__).resolve().parent / "guardrail_check.sh"
 
 SITE_ALIASES = {
@@ -73,7 +88,7 @@ SITE_CANONICAL_TOKENS = {
     "gmail": ["gmail", "mail"],
 }
 
-# Defaults can be overridden in ~/.openclaw/direct_chat_browser_profiles.json
+# Defaults can be overridden via DIRECT_CHAT_PROFILE_CONFIG_PATH.
 DEFAULT_BROWSER_PROFILE_CONFIG = {
     "_default": {"browser": "chrome", "profile": "diego"},
     # Keep ChatGPT/Gemini in the same logged-in Chrome profile by default.
@@ -90,26 +105,38 @@ HTML = UI_HTML
 # NOTE: UI HTML moved to scripts/molbot_direct_chat/ui_html.py
 # Keeping the content embedded here made this file too large to maintain.
 
-BROWSER_WINDOWS_PATH = Path.home() / ".openclaw" / "direct_chat_opened_browser_windows.json"
-BROWSER_WINDOWS_LOCK_PATH = Path.home() / ".openclaw" / ".direct_chat_opened_browser_windows.lock"
-TRUSTED_DC_ANCHOR_PATH = Path.home() / ".openclaw" / "direct_chat_trusted_anchor.json"
-VOICE_STATE_PATH = Path.home() / ".openclaw" / "direct_chat_voice.json"
+BROWSER_WINDOWS_PATH = _state_path("DIRECT_CHAT_BROWSER_WINDOWS_PATH", "direct_chat_opened_browser_windows.json")
+BROWSER_WINDOWS_LOCK_PATH = _state_path("DIRECT_CHAT_BROWSER_WINDOWS_LOCK_PATH", ".direct_chat_opened_browser_windows.lock")
+TRUSTED_DC_ANCHOR_PATH = _state_path("DIRECT_CHAT_TRUSTED_ANCHOR_PATH", "direct_chat_trusted_anchor.json")
+VOICE_STATE_PATH = _state_path("DIRECT_CHAT_VOICE_STATE_PATH", "direct_chat_voice.json")
 READER_STATE_PATH = Path(
-    os.environ.get("DIRECT_CHAT_READER_STATE_PATH", str(Path.home() / ".openclaw" / "reading_sessions.json"))
+    os.environ.get("DIRECT_CHAT_READER_STATE_PATH", str(PROJECT_STATE_DIR / "reading_sessions.json"))
 )
 READER_LOCK_PATH = Path(
-    os.environ.get("DIRECT_CHAT_READER_LOCK_PATH", str(Path.home() / ".openclaw" / ".reading_sessions.lock"))
+    os.environ.get(
+        "DIRECT_CHAT_READER_LOCK_PATH",
+        str(PROJECT_STATE_DIR / ".reading_sessions.lock"),
+    )
 )
-READER_LIBRARY_DIR = Path(os.environ.get("LUCY_LIBRARY_DIR", str(Path.home() / "Lucy_Library")))
+READER_LIBRARY_DIR = Path(os.environ.get("LUCY_LIBRARY_DIR", str(PROJECT_RUNTIME_DIR / "reader_library")))
 READER_LIBRARY_INDEX_PATH = Path(
-    os.environ.get("DIRECT_CHAT_READER_LIBRARY_INDEX_PATH", str(Path.home() / ".openclaw" / "reader_library_index.json"))
+    os.environ.get(
+        "DIRECT_CHAT_READER_LIBRARY_INDEX_PATH",
+        str(PROJECT_STATE_DIR / "reader_library_index.json"),
+    )
 )
 READER_LIBRARY_LOCK_PATH = Path(
-    os.environ.get("DIRECT_CHAT_READER_LIBRARY_LOCK_PATH", str(Path.home() / ".openclaw" / ".reader_library_index.lock"))
+    os.environ.get(
+        "DIRECT_CHAT_READER_LIBRARY_LOCK_PATH",
+        str(PROJECT_STATE_DIR / ".reader_library_index.lock"),
+    )
 )
 READER_CACHE_DIR = Path(
-    os.environ.get("DIRECT_CHAT_READER_CACHE_DIR", str(Path.home() / ".openclaw" / "reader_cache"))
+    os.environ.get("DIRECT_CHAT_READER_CACHE_DIR", str(PROJECT_STATE_DIR / "reader_cache"))
 )
+PROJECT_STATE_DIR.mkdir(parents=True, exist_ok=True)
+READER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+READER_LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
 
 _VOICE_LOCK = threading.Lock()
 _VOICE_LAST_STATUS = {"ok": None, "detail": "not_started", "ts": 0.0, "stream_id": 0}

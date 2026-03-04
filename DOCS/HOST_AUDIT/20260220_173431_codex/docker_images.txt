@@ -10,8 +10,8 @@ ghcr.io/open-webui/open-webui:latest   23f47d28bfc3       4.65GB             0B 
 ghcr.io/open-webui/open-webui:main     23f47d28bfc3       4.65GB             0B   U    
 grafana/grafana-oss:latest             aa786575ad94        747MB             0B   U    
 louislam/dockge:1                      e85d511b2a8b        755MB             0B   U    
-lucy_antigravity:latest                4935bfed0627        281MB             0B   U    
-lucy_antigravity:local                 770f86737d3d        373MB             0B   U    
+lucy_codex_runner:latest                4935bfed0627        281MB             0B   U    
+lucy_codex_runner:local                 770f86737d3d        373MB             0B   U    
 lucy_ui_panel:local                    9f686432a102        449MB             0B   U    
 n8nio/n8n:2.4.4                        f5b36596919f        961MB             0B   U    
 n8nio/n8n:latest                       f5b36596919f        961MB             0B   U    

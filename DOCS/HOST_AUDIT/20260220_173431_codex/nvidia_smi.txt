@@ -25,7 +25,7 @@ Fri Feb 20 17:34:31 2026
 |    0   N/A  N/A            5145      C   /usr/bin/python3                       3770MiB |
 |    0   N/A  N/A            5992      G   ...rack-uuid=3190708988185955192        131MiB |
 |    0   N/A  N/A            9750      G   /usr/share/code/code                     56MiB |
-|    0   N/A  N/A           71014      G   ...share/antigravity/antigravity         68MiB |
-|    0   N/A  N/A           71865      G   ...share/antigravity/antigravity         90MiB |
-|    0   N/A  N/A          149731      G   ...share/antigravity/antigravity        110MiB |
+|    0   N/A  N/A           71014      G   ...share/codex_runner/codex_runner         68MiB |
+|    0   N/A  N/A           71865      G   ...share/codex_runner/codex_runner         90MiB |
+|    0   N/A  N/A          149731      G   ...share/codex_runner/codex_runner        110MiB |
 +-----------------------------------------------------------------------------------------+

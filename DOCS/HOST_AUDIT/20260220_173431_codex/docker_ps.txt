@@ -5,7 +5,7 @@
 CONTAINER ID   IMAGE                                  COMMAND                  CREATED       STATUS                       PORTS                                                   NAMES
 f325fdd8d7cc   alltalk-alltalk                        "sh -c ./launch.sh"      2 days ago    Up 2 hours                   0.0.0.0:7851->7851/tcp, [::]:7851->7851/tcp             lucy_voice_alltalk
 e7aaefdfd679   n8nio/n8n:latest                       "tini -- /docker-ent…"   2 days ago    Created                                                                              n8n-lucy
-1efc4e979121   lucy_antigravity:local                 "uvicorn app:app --h…"   3 days ago    Exited (0) 3 days ago                                                                lucy_hands_antigravity
+1efc4e979121   lucy_codex_runner:local                 "uvicorn app:app --h…"   3 days ago    Exited (0) 3 days ago                                                                lucy_hands_codex_runner
 5c5166e9f83c   n8nio/runners                          "tini -- /usr/local/…"   3 days ago    Up 2 hours (healthy)                                                                 lucy_brain_runners
 6908625b1832   n8nio/n8n:2.4.4                        "tini -- /docker-ent…"   3 days ago    Up 2 hours (healthy)                                                                 lucy_brain_n8n
 3cd731cb7287   tecnativa/docker-socket-proxy:latest   "docker-entrypoint.s…"   3 days ago    Up 2 hours                   127.0.0.1:2375->2375/tcp                                lucy_docker_socket_proxy
@@ -19,4 +19,4 @@ c7c493c3ccd0   prom/prometheus:latest                 "/bin/prometheus --c…"  
 e0af7dd8b3eb   redis:alpine                           "docker-entrypoint.s…"   2 weeks ago   Up 2 hours                   0.0.0.0:6379->6379/tcp, [::]:6379->6379/tcp             sales_assist_redis
 d2955ae3713a   quay.io/keycloak/keycloak:24.0.1       "/opt/keycloak/bin/k…"   3 weeks ago   Up About an hour (healthy)   8443/tcp, 0.0.0.0:8081->8080/tcp, [::]:8081->8080/tcp   sales_assist_auth
 2cd215f27bda   pgvector/pgvector:pg16                 "docker-entrypoint.s…"   3 weeks ago   Up 2 hours (healthy)         0.0.0.0:5432->5432/tcp, [::]:5432->5432/tcp             sales_assist_db
-c98191eccc6f   lucy_antigravity                       "uvicorn app:app --h…"   4 weeks ago   Exited (0) 4 weeks ago                                                               antigravity_container
+c98191eccc6f   lucy_codex_runner                       "uvicorn app:app --h…"   4 weeks ago   Exited (0) 4 weeks ago                                                               codex_runner_container
